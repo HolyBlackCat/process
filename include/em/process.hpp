@@ -2,9 +2,11 @@
 
 #include <cassert>
 #include <map>
+#include <optional>
 #include <string_view>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #ifdef _WIN32
@@ -21,15 +23,23 @@
 #endif
 
 // Changes here relative to SDL:
-// * Fix bug: https://github.com/libsdl-org/SDL/issues/16188
+// * Better error reporting from starting background processes. See: https://github.com/libsdl-org/SDL/issues/16188
 // * Use return values instead of `errno` in a few places. But it seems in glibc those functions do set errno, even though it's not documented in the manual, so I'm not sure this ever matters.
 // * Don't bother with android-specific code to obtain extra env variables from the application manifest, whatever that is.
+// * Refuse to use `kill(pid, 0)` to wait for background processes. Since PIDs can be recycled, this seems unreliable.
+// * Added "have core dump" check when a process stops due to a signal.
 
 namespace em::Proc
 {
-    #ifndef _WIN32
     namespace detail
     {
+        template <typename ...P>
+        struct Overload : P... {using P::operator()...;};
+        template <typename ...P>
+        Overload(P...) -> Overload<P...>; // Keep this for older compilers, just in case.
+
+        #ifndef _WIN32
+
         #ifndef __APPLE__
         extern "C" char **environ;
         #endif
@@ -44,8 +54,8 @@ namespace em::Proc
             return environ;
             #endif
         }
+        #endif
     }
-    #endif
 
     // A list of environment variables.
     using EnvMap = std::map<std::string, std::string, std::less<>>;
@@ -53,7 +63,7 @@ namespace em::Proc
 
     // Take a snapshot of the current environment variables.
     // It might be a good idea to only do this once and save the result somewhere.
-    [[nodiscard]] static EnvMap Current()
+    [[nodiscard]] inline EnvMap CurrentEnv()
     {
         EnvMap ret;
 
@@ -82,174 +92,81 @@ namespace em::Proc
         return ret;
     }
 
+    struct ExitReason
+    {
+        [[nodiscard]] bool Success() const
+        {
+            return ExitedWithCode(0);
+        }
+
+        [[nodiscard]] bool ExitedWithCode(int code) const
+        {
+            auto value = std::get_if<Code>(&var);
+            return value && value->code == code;
+        }
+
+        [[nodiscard]] std::string ToString() const
+        {
+            return std::visit(detail::Overload{
+                [](const Background &) -> std::string {return "Detached background process.";},
+                [](const Code &elem)   -> std::string {return "Exited with code " + std::to_string(elem.code) + ".";},
+                [](const Signal &elem) -> std::string {std::string ret = "Exited due to signal " + std::to_string(elem.signal) + "."; if (elem.core_dumped) ret += " Core dumped."; return ret;},
+                [](const Other &elem)  -> std::string {return "Exited for an unknown reason: " + std::to_string(elem.status) + ".";},
+                [](const Error &)      -> std::string {return "Library error.";},
+            }, var);
+        }
+
+
+        // Exited normally with code.
+        struct Code
+        {
+            int code = 0;
+            friend auto operator<=>(Code, Code) = default; // Don't strictly need those operators on the variant members, but just in case.
+        };
+
+        // Terminated by a signal.
+        struct Signal
+        {
+            int signal = 0;
+            bool core_dumped = false; // Do we have a core dump?
+            friend auto operator<=>(Signal, Signal) = default;
+        };
+
+        // Exited for another reason.
+        struct Other
+        {
+            #ifndef _WIN32
+            // This value is straight from `waitpid()`.
+            int status = 0;
+            #endif
+            friend auto operator<=>(Other, Other) = default;
+        };
+
+        // Don't know if exited or not, this is a background process.
+        struct Background
+        {
+            friend auto operator<=>(Background, Background) = default;
+        };
+
+        // Something is wrong with our library. No error message here, check `Process::ErrorMessage()` for more details.
+        struct Error
+        {
+            friend auto operator<=>(Error, Error) = default;
+        };
+
+        using Var = std::variant<Background, Code, Signal, Other, Error>; // `Background` is listed first because of the dumb default constructibility checks failing for nested classes with member initializers.
+        Var var;
+
+        ExitReason() : var(Code{0}) {} // I guess this is a good default value?
+        ExitReason(Var var) : var(std::move(var)) {}
+    };
+
     class Params
     {
       public:
-        // Adds a command line argument. The first of those is the process to run.
-        // This is mutually exclusive with `RawCmdline()`, mixing them will erase the previous command line.
-        Params &Arg(std::string arg)
+        Params() noexcept
         {
-            argv_raw = nullptr;
-            argv_vec.push_back(std::move(arg));
-            return *this;
-        }
-
-        // A faster alternative to `Arg()`.
-        // Sets the entire cmdline as `argv`. There must be a null pointer at the end of this array. `argc` is determined by counting non-null pointers.
-        // This doesn't copy the array! You must ensure it outlives this `Params` and `BakedParams`.
-        // This is mutually exclusive with `Arg()`, mixing them will erase the previous command line.
-        Params &RawCmdline(const char *const *argv)
-        {
-            argv_raw = argv;
-            argv_vec = {};
-            return *this;
-        }
-
-
-        // If specified, this acts as the executable path, replacing that specified by the first `Arg()` or by `RawCmdline()`.
-        // But the first `Arg()` or the first element of `RawCmdline()` is still passed as `argv[0]` to the new process. (TODO WINDOWS - still supported there?)
-        Params &ExePath(std::string path)
-        {
-            exe_path_raw = nullptr;
-            exe_path_str = std::move(path);
-            return *this;
-        }
-        // This version doesn't copy the string! You must ensure it outlives this `Params` and `BakedParams`.
-        Params &ExePathRaw(const char *path)
-        {
-            exe_path_raw = path;
-            exe_path_str = {};
-            return *this;
-        }
-
-
-        // Sets all environment variables for the new process. Anything not listed here will be propagated.
-        // The default behavior is to copy the existing variables right when starting the process (not even when baking the parameters).
-        Params &Env(EnvMap env)
-        {
-            use_raw_env = false;
-            env_raw = nullptr;
-            env_map = std::move(env);
-            return *this;
-        }
-        // This version doesn't copy the array! You must ensure it outlives this `Params` and `BakedParams`.
-        // This is mutually exclusive with `Env()`, mixing them will erase the previous environment.
-        // Passing null to this restores the default behavior of obtaining the environment when starting the process.
-        Params &EnvRaw(const char *const *env)
-        {
-            use_raw_env = true;
-            env_raw = env;
-            env_map = {};
-            return *this;
-        }
-
-
-        // Only has effect on POSIX, not on Windows.
-        // Detaches the new process from this one, among other things ensuring that the current terminal doesn't get attached to the new process if this one dies before it.
-        //
-        // This is also called "double forking" of "daemonizing" the new process, see this for more details: https://stackoverflow.com/q/881388/2752075
-        // In turn you can no longer get the process exit code.
-        // You can still wait for its completion since we know its PID, but enabling this theoretically makes it not reliable anymore, since something could've reused it, I think?
-        Params &Background(bool enable = true)
-        {
-            #ifdef _WIN32
-            (void)enable;
-            #else
-            background = enable;
-            #endif
-            return *this;
-        }
-
-      private:
-        // If argv is specified using `SetRawCmdline()`, this is it.
-        const char *const *argv_raw = nullptr;
-        // If argv is specified using `AddArg()`, this is it.
-        std::vector<std::string> argv_vec;
-
-        const char *exe_path_raw = nullptr;
-        std::string exe_path_str;
-
-        bool use_raw_env = true; // We need a flag because `env_raw == nullptr` is valid too (and means obtaining the env variables right when starting the process).
-        const char *const *env_raw = nullptr;
-        EnvMap env_map;
-
-        #ifndef _WIN32
-        bool background = false;
-        #endif
-
-        friend class BakedParams;
-    };
-
-    class BakedParams
-    {
-      public:
-        // Creates a null instance.
-        BakedParams() {}
-        BakedParams(Params &&params)
-            : BakedParams() // Run the destructor on throw.
-        {
-            // Check that some form of command line is provided.
-            if (!params.argv_raw && params.argv_vec.empty())
-            {
-                state.error = "No command line specified.";
-                return;
-            }
-            // Bake `argv`.
-            if (params.argv_raw)
-            {
-                state.argv = params.argv_raw;
-            }
-            else
-            {
-                // If the command line is not specified as a raw `argv`, assemble `argv` ourselves.
-                state.argv_storage = std::move(params.argv_vec);
-                std::size_t argc = state.argv_storage.size();
-                // A direct resize should be faster than reserve?
-                state.argv_ptrs_storage.resize(argc + 1); // +1 for the terminating null pointer.
-                for (std::size_t i = 0; i < argc; i++)
-                    state.argv_ptrs_storage[i] = state.argv_storage[i].c_str();
-                state.argv = state.argv_ptrs_storage.data();
-            }
-
-            // Bake `exe_path`.
-            if (params.exe_path_raw)
-            {
-                state.exe_path = params.exe_path_raw;
-            }
-            else if (!params.exe_path_str.empty())
-            {
-                state.exe_path_storage = std::move(params.exe_path_str);
-                state.exe_path = state.exe_path_storage.c_str();
-            }
-            else
-            {
-                state.exe_path = state.argv[0];
-            }
-
-            // Bake environment variables.
-            if (params.use_raw_env)
-            {
-                state.env = params.env_raw;
-            }
-            else
-            {
-                std::size_t count = params.env_map.size();
-
-                state.env_storage.reserve(count);
-                for (const auto &elem : params.env_map)
-                    state.env_storage.push_back(elem.first + '=' + elem.second);
-
-                // A direct resize should be faster than reserve?
-                state.env_ptrs_storage.resize(count + 1); // +1 for the terminating null pointer.
-                for (std::size_t i = 0; i < count; i++)
-                    state.env_ptrs_storage[i] = state.env_storage[i].c_str();
-
-                state.env = state.env_ptrs_storage.data();
-            }
-
-            #ifdef _WIN32
-
-            #else
+            // Those are dirt cheap to initialize, so no separate constructor.
 
             if (int spawn_res = posix_spawnattr_init(&state.spawn_attr))
             {
@@ -268,14 +185,13 @@ namespace em::Proc
                 return;
             }
             state.spawn_fa_alive = true;
-            #endif
         }
 
         // Non-movable for now, this is simpler to implement.
-        BakedParams(const BakedParams &) = delete;
-        BakedParams &operator=(const BakedParams &) = delete;
+        Params(const Params &) = delete;
+        Params &operator=(const Params &) = delete;
 
-        ~BakedParams()
+        ~Params()
         {
             #ifdef _WIN32
 
@@ -287,6 +203,76 @@ namespace em::Proc
             #endif
         }
 
+        // Set the command to execute, and its arguments.
+        // If `custom_argv0` is specified, it replaces `argv[0]` as the program to execute. The original `argv[0]` is then only passed to the program's `main`.
+        Params &Command(std::vector<std::string> argv, std::string custom_argv0 = "")
+        {
+            bool have_custom_argv0 = !custom_argv0.empty() && !argv.empty(); // Empty argv is invalid anyway, but check for it, because we're going to swap with it.
+            if (have_custom_argv0)
+                std::swap(argv[0], custom_argv0);
+
+            command.argv_storage = std::move(argv);
+            std::size_t argc = command.argv_storage.size();
+            // A direct resize should be faster than reserve?
+            command.argv_ptrs_storage.resize(argc + 1); // +1 for the terminating null pointer.
+            for (std::size_t i = 0; i < argc; i++)
+                command.argv_ptrs_storage[i] = command.argv_storage[i].c_str();
+            command.argv_ptrs_storage.back() = nullptr; // Zero explicitly in case the vector wasn't empty before.
+            command.argv = command.argv_ptrs_storage.data();
+
+            if (have_custom_argv0)
+            {
+                command.exe_path_storage = std::move(custom_argv0);
+                command.exe_path = command.exe_path_storage.c_str();
+            }
+            else
+            {
+                command.exe_path_storage = {};
+                command.exe_path = nullptr;
+            }
+            return *this;
+        }
+        // This version doesn't copy the strings, so make sure they don't dangle.
+        // Note: For this version, the meaning of `argv[0]` and the second parameter is inverted relative to the overload above.
+        Params &CommandArgv(const char *const *argv, const char *executable = nullptr)
+        {
+            command = {};
+            command.argv = argv;
+            command.exe_path = executable;
+            return *this;
+        }
+
+
+        // Set the environment variables. This overrides all variables. Use `CurrentEnv()` to get the variables of the current process, if you only want to modify some.
+        // If this is not called, the default behavior is to use the variables of the current process, reading them right when starting the new process (not when constructing `Params`).
+        Params &Env(EnvMap env_vars)
+        {
+            std::size_t count = env_vars.size();
+
+            env.storage.reserve(count);
+            for (const auto &elem : env_vars)
+                env.storage.push_back(elem.first + '=' + elem.second);
+
+            // A direct resize should be faster than reserve?
+            env.ptrs_storage.resize(count + 1); // +1 for the terminating null pointer.
+            for (std::size_t i = 0; i < count; i++)
+                env.ptrs_storage[i] = env.storage[i].c_str();
+            env.ptrs_storage.back() = nullptr; // Zero explicitly in case the vector wasn't empty before.
+
+            env.ptr = env.ptrs_storage.data();
+
+            return *this;
+        }
+        // This version doesn't copy the strings, so make sure they don't dangle.
+        // This can't be named `Env()` because then `Env({})` would call this overload.
+        Params &EnvPtr(const char *const *env_vars)
+        {
+            env = {};
+            env.ptr = env_vars;
+            return *this;
+        }
+
+
         // Returns true on a non-null instance.
         [[nodiscard]] explicit operator bool() const
         {
@@ -297,27 +283,38 @@ namespace em::Proc
             #endif
         }
 
+
+        // Some fields are left public just in case, but you don't need to touch them if you assign to them using the setters above.
+
+        struct CommandState
+        {
+            const char *const *argv = nullptr; // Non-owning.
+            std::vector<std::string> argv_storage;
+            std::vector<const char *> argv_ptrs_storage;
+
+            const char *exe_path = nullptr; // Non-owning.
+            std::string exe_path_storage; // This right there is why `Params` is not movable.
+        };
+        CommandState command;
+
+        struct EnvState
+        {
+            const char *const *ptr = nullptr; // Non-owning.
+            std::vector<std::string> storage;
+            std::vector<const char *> ptrs_storage;
+        };
+        EnvState env;
+
       private:
         struct State
         {
-            // This struct isn't strictly necessary anymore. Leaving it in case we decide to make this movable later.
+            // Having those in a struct isn't strictly necessary anymore. Leaving it in case we decide to make this movable later.
 
             // If this is non-empty, the object is in an error state.
             // When we assign to this, we don't immediately destroy the resources we already created.
             // This is easier to implement, and also lets the user check for errors faster.
             std::string error;
 
-
-            const char *const *argv = nullptr; // Non-owning.
-            std::vector<std::string> argv_storage;
-            std::vector<const char *> argv_ptrs_storage;
-
-            const char *exe_path = nullptr; // Non-owning.
-            std::string exe_path_storage; // This right there is why `BakedParams` is not movable.
-
-            const char *const *env = nullptr; // Non-owning.
-            std::vector<std::string> env_storage;
-            std::vector<const char *> env_ptrs_storage;
 
             #ifdef _WIN32
 
@@ -340,21 +337,31 @@ namespace em::Proc
       public:
         Process() {}
 
-        Process(const BakedParams &params)
+        Process(const Params &params)
             : Process() // Run the destructor on throw.
         {
+            // Mark as background process before doing anything else, so that this information is not lost on error.
+            if (params.state.background)
+                state.exit_reason = Proc::ExitReason(Proc::ExitReason::Background{});
+
             #ifdef _WIN32
 
             #else
             if (!params.state.error.empty())
             {
-                state.error = params.state.error;
+                state.error = "Error in parameters: " + params.state.error;
+                return;
+            }
+
+            if (!params.command.argv)
+            {
+                state.error = "Null `argv` specified for process.";
                 return;
             }
 
             if (!params)
             {
-                state.error = "Trying to create a process from a null params struct.";
+                state.error = "Trying to create a process from a null params struct. Was it moved from?";
                 return;
             }
 
@@ -362,7 +369,8 @@ namespace em::Proc
 
             // Note the `const_cast` here and on `argv` below. It's needed because the POSIX API takes `char *const *` instead of `const char *const *`, because the C pointer conversion rules are more strict than the C++ ones,
             //   and they figured it would be more convenient. They don't actually modify those strings.
-            char *const *env_ptr = const_cast<char *const *>(params.state.env ? params.state.env : detail::GetEnviron());
+            char *const *env_ptr = const_cast<char *const *>(params.env.ptr ? params.env.ptr : detail::GetEnviron());
+            char *exe_path = const_cast<char *>(params.command.exe_path ? params.command.exe_path : params.command.argv[0]);
 
             if (params.state.background)
             {
@@ -398,7 +406,7 @@ namespace em::Proc
                     // Note the `const_cast` here and on `env_ptr` above. It's needed because the POSIX API takes `char *const *` instead of `const char *const *`, because the C pointer conversion rules are more strict than the C++ ones,
                     //   and they figured it would be more convenient. They don't actually modify those strings.
 
-                    if (int error = posix_spawnp(&state.pid, params.state.exe_path, &params.state.spawn_fa, &params.state.spawn_attr, const_cast<char **>(params.state.argv), env_ptr))
+                    if (int error = posix_spawnp(&state.pid, exe_path, &params.state.spawn_fa, &params.state.spawn_attr, const_cast<char **>(params.command.argv), env_ptr))
                         _exit(error);
                     else
                         _exit(0);
@@ -438,7 +446,7 @@ namespace em::Proc
                 // Note the `const_cast` here and on `env_ptr` above. It's needed because the POSIX API takes `char *const *` instead of `const char *const *`, because the C pointer conversion rules are more strict than the C++ ones,
                 //   and they figured it would be more convenient. They don't actually modify those strings.
 
-                if (int error = posix_spawnp(&state.pid, params.state.exe_path, &params.state.spawn_fa, &params.state.spawn_attr, const_cast<char **>(params.state.argv), env_ptr))
+                if (int error = posix_spawnp(&state.pid, exe_path, &params.state.spawn_fa, &params.state.spawn_attr, const_cast<char **>(params.command.argv), env_ptr))
                 {
                     state.error = std::string("`posix_spawnp` failed: ") + std::strerror(error);
                     return;
@@ -457,11 +465,19 @@ namespace em::Proc
         // We have to wait to clean up the process, otherwise it remains as a "zombie", because we never consumed its exit status.
         ~Process()
         {
-            #error need to implement waiting for the process to finish, probably in a separate function
+            // Not checking `HasError()`, it shouldn't stop us from calling `waitpid()` to clean up the process.
+            // Checking `operator bool` though, since `CheckOrWait()` asserts on that.
+            if (*this)
+                CheckOrWait(true);
         }
 
         // Returns false if this is a null instance that never held a process.
         [[nodiscard]] explicit operator bool() const {return state.pid;}
+
+        // Returns true if this instance is an error state, due to the underlying API failing.
+        [[nodiscard]] bool HasError() const {return !state.error.empty();}
+        // Returns the error message. If `HasError() == false`, then always returns an empty string.
+        [[nodiscard]] const std::string ErrorMessage() const {return state.error;}
 
         // This is zero for null processes.
         [[nodiscard]] pid_t Pid() const {return state.pid;}
@@ -471,20 +487,95 @@ namespace em::Proc
         {
             #ifdef _WIN32
             return false;
+            #error do we need the special case?
             #else
-            return state.is_background;
+            return state.exit_reason && std::holds_alternative<Proc::ExitReason::Background>(state.exit_reason->var);
             #endif
         }
 
+        // Update the process state. Check `ExitReason()` and `HasError()` after this.
+        void UpdateState()
+        {
+            CheckOrWait(false);
+        }
+
+        // Wait until the process exits.
+        // Note! This can deadlock if you have pipes open to this process, because you need to be manually poking those pipes.
+        void BlockUntilExit()
+        {
+            CheckOrWait(true);
+        }
+
+        // Returns the exit reason of the process, or false if it's not known to be exited.
+        [[nodiscard]] const std::optional<Proc::ExitReason> &ExitReason() const
+        {
+            return state.exit_reason;
+        }
+
       private:
+        void CheckOrWait(bool wait)
+        {
+            // Do nothing when already exited. This rejects background processes too.
+            if (state.exit_reason)
+                return;
+
+            // Intentionally don't check `HasError()`. If something random has failed, we should still be able to `waitpid()` the process to clean it up.
+
+            // Complain about null instances.
+            if (state.pid == 0)
+            {
+                // Assert instead of writing to `state.error`, this makes more sense to me.
+                assert(false && "Attempt to wait for a null instance.");
+                return;
+            }
+
+            int status = 0;
+            int wait_result = waitpid(state.pid, &status, wait ? 0 : WNOHANG);
+            // If wait errored...
+            // It returns `-1` on error.
+            if (wait_result < 0)
+            {
+                state.error = std::string("`waitpid` failed: ") + std::strerror(errno);
+                // Mark the process as exited, I guess.
+                // So that nothing gets blocked on the user side, waiting for it to exit.
+                state.exit_reason = Proc::ExitReason(Proc::ExitReason::Error{});
+            }
+            // If wait says the process is still running....
+            if (wait_result == 0)
+            {
+                assert(wait); // Should only be possible if `wait == true`.
+                return;
+            }
+
+            // At this point we know the process has exited, but why?
+            if (WIFEXITED(status))
+            {
+                state.exit_reason = Proc::ExitReason(Proc::ExitReason::Code{WEXITSTATUS(status)});
+                return;
+            }
+            if (WIFSIGNALED(status))
+            {
+                state.exit_reason = Proc::ExitReason(Proc::ExitReason::Signal{
+                    WTERMSIG(status),
+                    #ifdef WCOREDUMP // Manual says to ifdef this: https://linux.die.net/man/2/waitpid
+                    bool(WCOREDUMP(status))
+                    #endif
+                });
+                return;
+            }
+
+            // Some unknown reason.
+            state.exit_reason = Proc::ExitReason(Proc::ExitReason::Other{status});
+        }
+
         struct State
         {
+            // I considered merging this into `ExitReason`, but since I also merged `Background` into that, I'm worried that we'd lose information if the error message replaced that.
             std::string error;
 
             pid_t pid = 0;
-            #ifndef _WIN32
-            bool is_background = false;
-            #endif
+
+            std::optional<Proc::ExitReason> exit_reason;
         };
         State state;
     };
