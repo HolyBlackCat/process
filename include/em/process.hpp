@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cassert>
+#include <functional>
 #include <map>
 #include <optional>
 #include <string_view>
@@ -35,6 +36,7 @@
 // * Don't bother with android-specific code to obtain extra env variables from the application manifest, whatever that is.
 // * Refuse to use `kill(pid, 0)` to wait for background processes. Since PIDs can be recycled, this seems unreliable.
 // * Added "have core dump" check when a process stops due to a signal.
+// * On Windows, the `CREATE_NO_WINDOW` flag that disables console allocation is not implied by process background-ness. It doesn't seem terribly useful, and we expose the flags directly on Windows.
 
 // Differences to reproc:
 // * We don't try to use sockets as pipes as reproc does on Windows. Seems hacky, and they have several suspicious bug reports that look like they could be caused by those, that they didn't respond to.
@@ -46,10 +48,10 @@
 // Makes a string literal wide on Windows, and returns it as is on other platforms.
 #define EM_PROC_NATIVE(x) L"" x ""
 #else
+// Usage: `EM_PROC_NATIVE("blah")`.
+// Makes a string literal wide on Windows, and returns it as is on other platforms.
 #define EM_PROC_NATIVE(x) "" x ""
 #endif
-
-auto x = L"foo" "";
 
 namespace em::Proc
 {
@@ -57,6 +59,13 @@ namespace em::Proc
     using NativeChar = wchar_t;
     #else
     using NativeChar = char;
+    #endif
+
+    // This is always some integer type.
+    #ifdef _WIN32
+    using Pid = DWORD;
+    #else
+    using Pid = pid_t;
     #endif
 
     #ifdef _WIN32
@@ -67,8 +76,10 @@ namespace em::Proc
     template <typename Char>
     [[nodiscard]] std::basic_string<std::conditional_t<std::is_same_v<Char, char>, wchar_t, char>> ConvertString_Win(std::basic_string_view<Char> in, bool *success = nullptr)
     {
+        using RetChar = std::conditional_t<std::is_same_v<Char, char>, wchar_t, char>;
+
         // Put this here for NVRO purposes.
-        std::basic_string<std::conditional_t<std::is_same_v<Char, char>, wchar_t, char>> ret;
+        std::basic_string<RetChar> ret;
 
         if (in.empty())
         {
@@ -80,12 +91,12 @@ namespace em::Proc
 
         const DWORD flags = success ? MB_ERR_INVALID_CHARS : 0;
 
-        auto Convert = [&](const char *out, int out_size) -> int
+        auto Convert = [&](RetChar *out, int out_size) -> int
         {
             if constexpr (std::is_same_v<Char, wchar_t>)
-                return WideCharToMultiByte(CP_UTF8, flags, in.data(), in.size(), out, out_size, nullptr, nullptr);
+                return WideCharToMultiByte(CP_UTF8, flags, in.data(), (int)in.size(), out, out_size, nullptr, nullptr);
             else
-                return MultiByteToWideChar(CP_UTF8, flags, in.data(), in.size(), out, out_size);
+                return MultiByteToWideChar(CP_UTF8, flags, in.data(), (int)in.size(), out, out_size);
         };
 
         int expected_size = Convert(nullptr, 0);
@@ -99,7 +110,7 @@ namespace em::Proc
             return ret;
         }
 
-        ret.resize(expected_size); // `expected_size` only includes space for null-terminator if the input size included it, so not in our case.
+        ret.resize(std::size_t(expected_size)); // `expected_size` only includes space for null-terminator if the input size included it, so not in our case.
 
         int actual_size = Convert(ret.data(), expected_size);
         if (actual_size == 0)
@@ -107,7 +118,7 @@ namespace em::Proc
             // If `!success`, this shouldn't be possible. Then assert.
             assert(success && "`MultiByteToWideChar` failed when encoding.");
 
-            ret.clean(); // Avoid returning half-baked string.
+            ret.clear(); // Avoid returning half-baked string.
 
             if (success)
                 *success = false;
@@ -115,7 +126,7 @@ namespace em::Proc
         }
 
         assert(actual_size == expected_size); // Can they ever not be equal?
-        ret.resize(actual_size); // If not, this will shrink the string.
+        ret.resize(std::size_t(actual_size)); // If not, this will shrink the string.
 
         if (success)
             *success = true;
@@ -180,9 +191,15 @@ namespace em::Proc
         // Compare with itself.
         friend std::strong_ordering operator<=>(const NativeString &, const NativeString &) = default;
 
-        // Compare with the native string type.
-        friend bool operator==(const NativeString &a, const UnderlyingType &b) {return a.native == b;}
+        // Compare with the native string type, in all the different forms.
+        friend bool                 operator== (const NativeString &a, const UnderlyingType &b) {return a.native == b;}
         friend std::strong_ordering operator<=>(const NativeString &a, const UnderlyingType &b) {return a.native <=> b;}
+
+        friend bool                 operator== (const NativeString &a, std::basic_string_view<NativeChar> b) {return a.native == b;}
+        friend std::strong_ordering operator<=>(const NativeString &a, std::basic_string_view<NativeChar> b) {return a.native <=> b;}
+
+        friend bool                 operator== (const NativeString &a, const NativeChar *b) {return a.native == b;}
+        friend std::strong_ordering operator<=>(const NativeString &a, const NativeChar *b) {return a.native <=> b;}
     };
 
     namespace detail
@@ -214,7 +231,10 @@ namespace em::Proc
         // `num_args` is the number of arguments, including the program name.
         // `get_arg(i)` is called for `0 <= i < num_args`, and must return either `NativeString` or something convertible to `std::string_view` or `std::wstring_view`.
         // `get_arg` can be called multiple times for the same index, make sure that works and is fast.
-        [[nodiscard]] NativeString AssembleCommandLine(const std::optional<NativeString> &executable, std::size_t num_args, auto &&get_arg)
+        // If `force_batch_escape` is specified, it controls whether or not we apply additional batch-style escaping to the arguments.
+        // By default it's enabled only when `argv[0]` (or `executable` instead, if specified) ends in `.bat` or `.cmd` (case-insensitive),
+        //   but passing `force_batch_escape` lets you force enable or disable it.
+        [[nodiscard]] NativeString AssembleCommandLine(const std::optional<NativeString> &executable, std::optional<bool> force_batch_escape, std::size_t num_args, auto &&get_arg)
         {
             if (num_args == 0)
                 return {}; // Must special-case this because we might call `get_arg(0)` to get the executable name.
@@ -234,38 +254,43 @@ namespace em::Proc
             // Now we can determine the character type of the input arguments;
             using Char = decltype(get_arg_view(0))::value_type;
 
-            // Is this a `.bat`/`.cmd` file? SDL escapes their arguments differently.
-            const bool batch = [&]{
-                auto ViewEndsWithBatchExt = []<typename T>(std::basic_string_view<T> view)
-                {
-                    view = view.substr(view.size() - 4);
-                    return
-                        view[0] == '.' && (
-                            (
-                                (view[1] == 'b' || view[1] == 'B') &&
-                                (view[2] == 'a' || view[2] == 'A') &&
-                                (view[3] == 't' || view[3] == 'T')
-                            ) ||
-                            (
-                                (view[1] == 'c' || view[1] == 'C') &&
-                                (view[2] == 'm' || view[2] == 'M') &&
-                                (view[3] == 'd' || view[3] == 'D')
-                            )
-                        );
-                };
+            auto EndsWithExt = []<typename T>(
+                std::basic_string_view<T> view,
+                std::type_identity_t<T> a,
+                std::type_identity_t<T> b,
+                std::type_identity_t<T> c,
+                std::type_identity_t<T> A,
+                std::type_identity_t<T> B,
+                std::type_identity_t<T> C
+            )
+            {
+                if (view.size() < 4)
+                    return false;
+                view = view.substr(view.size() - 4);
+                if (view[0] != '.')
+                    return false;
+                return
+                    (view[1] == a || view[1] == A) &&
+                    (view[2] == b || view[2] == B) &&
+                    (view[3] == c || view[3] == C);
+            };
 
-                if (executable)
-                    return ViewEndsWithBatchExt(std::wstring_view(executable->native));
-                else
-                    return ViewEndsWithBatchExt(get_arg_view(0));
-            }();
+            auto EndsWithBatchExt = [&]<typename T>(std::basic_string_view<T> view)
+            {
+                return EndsWithExt(view, 'b','a','t', 'B','A','T') || EndsWithExt(view, 'c','m','d', 'C','M','D');
+            };
+
+            // Is this a `.bat`/`.cmd` file? We only set this when using the stock escaping mode.
+            const bool is_batch_file =
+                force_batch_escape ? *force_batch_escape :
+                executable ? EndsWithBatchExt(std::basic_string_view(executable->native)) : EndsWithBatchExt(get_arg_view(0));
 
             // Handles `i`th command line argument.
             // If `Write == false`, returns the necessary string size to encode it. Then the `out` argument must not be specified.
             // If `Write == true`, appends the argument to `out` and returns nothing.
             auto HandleArg = [&]<bool Write>(std::size_t i, std::conditional_t<Write, std::basic_string<Char> &, std::nullptr_t> out = {}) -> std::conditional_t<Write, void, std::size_t>
             {
-                // Escaping algorithm ported straight from SDL.
+                // Escaping algorithm from here: https://learn.microsoft.com/en-us/archive/blogs/twistylittlepassagesallalike/everyone-quotes-command-line-arguments-the-wrong-way
 
                 std::size_t ret = 0;
 
@@ -281,42 +306,72 @@ namespace em::Proc
                 if (i != 0)
                     WriteChar(' ');
 
-                const std::basic_string_view<Char> arg = get_arg_view(i);;
+                const std::basic_string_view<Char> arg = get_arg_view(i);
 
+                const bool batch_escape_this_arg = i > 0 && is_batch_file;
+
+                // The original article doesn't list here `\r`, but SDL does.
+                // But from my experiments, out of those, only ` ` and `\t` are actually necessary here, the rest is courtesy. And since we're doing courtesy, why not add `\r` too.
                 static constexpr Char quoted_chars[] = {' ', '\r', '\n', '\t', '\v'};
                 const bool quote = arg.empty() || arg.find_first_of(quoted_chars) != std::size_t(-1);
-                if (quote)
-                    WriteChar('"');
 
-                for (const Char &ch : arg)
+                // Open the quote.
+                if (quote)
                 {
-                    // Prepend a special character to `ch` if needed.
-                    switch (ch)
+                    if (batch_escape_this_arg)
+                        WriteChar('^');
+                    WriteChar('"');
+                }
+
+                for (auto it = arg.begin(), end = arg.end(); it != end; it++)
+                {
+                    const auto ch = *it;
+
+                    if (ch == '\\')
                     {
-                      case '"':
-                        WriteChar(batch ? '"' : '\\');
-                        break;
-                      case '\\':
-                        // SDL says:  only escape backslashes that precede a double quote (including the enclosing double quote)
-                        if ((quote && &ch == &arg.back()) || (&ch != &arg.back() && (&ch)[1] == '"'))
-                            WriteChar('\\');
-                        break;
-                      case ' ': // SDL handles this one separately, but uses the exact same code. A little sus.
-                      case '^':
-                      case '&':
-                      case '|':
-                      case '<':
-                      case '>':
-                        if (batch)
-                            WriteChar('^');
-                        break;
+                        std::size_t num_slashes = 1;
+                        while (it + 1 != end && it[1] == '\\')
+                        {
+                            num_slashes++;
+                            ++it;
+                        }
+
+                        if (it + 1 != end ? it[1] == '"' : quote)
+                        {
+                            // If there's a quote after all those slashes, write 2*N+1 slashes. Leave the quote in the buffer to be processed at the next step.
+
+                            for (std::size_t i = 0; i < num_slashes; i++)
+                            {
+                                WriteChar('\\');
+                                WriteChar('\\'); // Again.
+                            }
+                            WriteChar('\\'); // And another one.
+                        }
+                        else
+                        {
+                            // If there's no quote after the slashes, just write the slashes as is.
+                            for (std::size_t i = 0; i < num_slashes; i++)
+                                WriteChar('\\');
+                        }
+
+                        continue;
                     }
+
+                    // For batch, prepend some special characters with `^`.
+                    // The list is straight from the article.
+                    if (batch_escape_this_arg && (ch == '(' || ch == ')' || ch == '%' || ch == '!' || ch == '^' || ch == '"' || ch == '<' || ch == '>' || ch == '&' || ch == '|'))
+                        WriteChar('^');
 
                     WriteChar(ch);
                 }
 
+                // Close the quote.
                 if (quote)
+                {
+                    if (batch_escape_this_arg)
+                        WriteChar('^');
                     WriteChar('"');
+                }
 
                 if constexpr (!Write)
                     return ret;
@@ -329,7 +384,7 @@ namespace em::Proc
             // Intentionally assemble the result in a possibly non-wide string. Then `return ret;` converts it to a wide string.
             // This way we only have to call WinAPI once, and not per argument.
             std::basic_string<Char> ret;
-            ret.resize(needed_size);
+            ret.reserve(needed_size);
             for (std::size_t i = 0; i < num_args; i++)
                 HandleArg.template operator()<true>(i, ret);
 
@@ -355,6 +410,57 @@ namespace em::Proc
             return ret;
         }
 
+        [[nodiscard]] inline std::string GetLastWinApiErrorMessage()
+        {
+            // Get the error code first, since we might clobber it when trying to get the error message in English if it's not available, see below.
+            auto last_error = GetLastError();
+
+            // Try getting the message in English first, and then try in the default language.
+            // Discussion https://stackoverflow.com/q/12715646/2752075 shows that firstly `0` doesn't mean English, and secondly that it's not guaranteed that English strings are available at all.
+            for (DWORD lang : {(DWORD)MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_US), DWORD(0)})
+            {
+                struct Guard
+                {
+                    wchar_t *message = nullptr;
+                    ~Guard()
+                    {
+                        if (message)
+                            LocalFree(message);
+                    }
+                };
+                Guard guard;
+
+                auto status = FormatMessageW(
+                    FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_ALLOCATE_BUFFER,
+                    nullptr,
+                    last_error,
+                    lang,
+                    // When `FORMAT_MESSAGE_ALLOCATE_BUFFER` is specfieid, this parameter changes meaning from `wchar_t *` to `wchar_t **`, so the manual says we need the cast.
+                    (wchar_t *)&guard.message,
+                    // Output buffer size. When `FORMAT_MESSAGE_ALLOCATE_BUFFER` is specified, it instead means the minimum amount of memory to allocate in the result, so 0 is fine.
+                    0,
+                    nullptr
+                );
+
+                if (status > 0)
+                {
+                    std::wstring_view ret_wide(guard.message);
+
+                    // SDL says it can end with `\r\n`.
+                    if (ret_wide.ends_with(L"\r\n"))
+                        ret_wide.remove_suffix(2);
+
+                    std::string ret = ConvertString_Win(ret_wide);
+                    std::erase(ret, '\r'); // For a good measure.
+
+                    return ret;
+                }
+            }
+
+            // If the message wasn't available in any language:
+            return std::to_string(last_error) + " (no error message is available)";
+        }
+
         #else
 
         #ifndef __APPLE__
@@ -377,8 +483,7 @@ namespace em::Proc
     // A list of environment variables.
     using EnvMap = std::map<NativeString, NativeString, std::less<>>;
 
-
-    // Take a snapshot of the current environment variables.
+    // Takes a snapshot of the current environment variables.
     // It might be a good idea to only do this once and save the result somewhere.
     [[nodiscard]] inline EnvMap CurrentEnv()
     {
@@ -436,8 +541,10 @@ namespace em::Proc
         return ret;
     }
 
+    // Explains why a process has exited.
     struct ExitReason
     {
+        // Returns true if exited with code 0.
         [[nodiscard]] bool Success() const
         {
             return ExitedWithCode(0);
@@ -449,13 +556,16 @@ namespace em::Proc
             return value && value->code == code;
         }
 
+        // A debug string to represent this exit reason.
         [[nodiscard]] std::string ToString() const
         {
             return std::visit(detail::Overload{
                 [](const Background &) -> std::string {return "Detached background process.";},
                 [](const Code &elem)   -> std::string {return "Exited with code " + std::to_string(elem.code) + ".";},
-                [](const Signal &elem) -> std::string {std::string ret = "Exited due to signal " + std::to_string(elem.signal) + "."; if (elem.core_dumped) ret += " Core dumped."; return ret;},
-                [](const Other &elem)  -> std::string {return "Exited for an unknown reason: " + std::to_string(elem.status) + ".";},
+                #ifndef _WIN32
+                [](const Signal_Posix &elem) -> std::string {std::string ret = "Exited due to signal " + std::to_string(elem.signal) + "."; if (elem.core_dumped) ret += " Core dumped."; return ret;},
+                [](const Other_Posix &elem)  -> std::string {return "Exited for an unknown reason: " + std::to_string(elem.status) + ".";},
+                #endif
                 [](const Error &)      -> std::string {return "Library error.";},
             }, var);
         }
@@ -468,21 +578,23 @@ namespace em::Proc
             friend auto operator<=>(Code, Code) = default; // Don't strictly need those operators on the variant members, but just in case.
         };
 
+        #ifndef _WIN32
         // Terminated by a signal.
-        struct Signal
+        struct Signal_Posix
         {
             int signal = 0;
             bool core_dumped = false; // Do we have a core dump?
-            friend auto operator<=>(Signal, Signal) = default;
+            friend auto operator<=>(Signal_Posix, Signal_Posix) = default;
         };
 
         // Exited for another reason.
-        struct Other
+        struct Other_Posix
         {
             // This value is straight from `waitpid()`.
             int status = 0;
-            friend auto operator<=>(Other, Other) = default;
+            friend auto operator<=>(Other_Posix, Other_Posix) = default;
         };
+        #endif
 
         // Don't know if exited or not, this is a background process.
         struct Background
@@ -496,16 +608,27 @@ namespace em::Proc
             friend auto operator<=>(Error, Error) = default;
         };
 
-        using Var = std::variant<Background, Code, Signal, Other, Error>; // `Background` is listed first because of the dumb default constructibility checks failing for nested classes with member initializers.
+        using Var = std::variant<
+            // `Background` is listed first because of the dumb default constructibility checks failing for nested classes with member initializers.
+            Background,
+            Code,
+            #ifndef _WIN32
+            Signal_Posix,
+            Other_Posix,
+            #endif
+            Error
+        >;
         Var var;
 
         ExitReason() : var(Code{0}) {} // I guess this is a good default value?
         ExitReason(Var var) : var(std::move(var)) {}
     };
 
+    // Process creation params.
     class Params
     {
       public:
+        // Call some setters after this.
         Params() noexcept
         {
             #ifndef _WIN32
@@ -545,13 +668,28 @@ namespace em::Proc
             #endif
         }
 
+        struct CommandExtras
+        {
+            // If specified, it replaces `argv[0]` as the program to execute. The original `argv[0]` is then only passed to the program's `main`.
+            // On Windows, specifying `executable` ignores `PATH` and `PATHEXT`, and instead either uses the exact path, or searches the current directory.
+            std::optional<NativeString> executable;
+
+            // This is only used on Windows. Not `#ifdef`ing it for simplicity. This is ignored by overloads that take a single string, as opposed to argument array, since the string is assumed to be pre-escaped.
+            // By convention, arguments of batch files (`.bat` or `.cmd`) need additional escaping. Unlike POSIX shells, the batch interpreter apparently can't escape the arguments by itself,
+            //   so either you give it pre-escaped ones, or your batch files break in mysterious ways (and possibly vulnerable ways, if the arguments are user-provided).
+            // Our default behavior is to batch-escape if the extension of `argv[0]` (or `executable` instead, if specified) ends with `.bat` or `.cmd` (case-insensitive).
+            // This variable overrides that logic.
+            // Note that the extension heuristic is unreliable because of `PATHEXT`, which lets you omit extensions. Even if you run e.g. `foo.exe`, it could resolve to `foo.exe.cmd` if that exists, or whatever.
+            // So to be safe, you should unset `PATHEXT` before starting processes, or set the `executable` parameter (which ignores `PATHEXT`).
+            std::optional<bool> batch_escaping;
+        };
+
         // Set the command to execute, and its arguments.
-        // If `executable` is specified, it replaces `argv[0]` as the program to execute. The original `argv[0]` is then only passed to the program's `main`.
-        Params &Command(std::vector<NativeString> argv, std::optional<NativeString> executable = {})
+        Params &Command(std::vector<NativeString> argv, CommandExtras extras = {})
         {
             #ifdef _WIN32
-            state.cmd_string = detail::AssembleCommandLine(executable, argv.size(), [&](std::size_t i) -> const auto & {return argv[i];});
-            state.exe_path = std::move(executable);
+            state.cmd_string = detail::AssembleCommandLine(extras.executable, extras.batch_escaping, argv.size(), [&](std::size_t i) -> const auto & {return argv[i];});
+            state.exe_path = std::move(extras.executable);
             #else
             state.cmd_argv_storage = std::move(argv);
             std::size_t argc = state.cmd_argv_storage.size();
@@ -562,22 +700,26 @@ namespace em::Proc
             state.cmd_argv_ptrs_storage.back() = nullptr; // Zero explicitly in case the vector wasn't empty before.
             state.cmd_argv = state.cmd_argv_ptrs_storage.data();
 
-            state.exe_path = executable;
+            state.exe_path = std::move(extras.executable);
             #endif
             return *this;
         }
         // This version doesn't copy `argv` on POSIX, make sure it doesn't dangle until the process starts.
-        Params &CommandArgv(const char *const *argv, std::optional<NativeString> executable = {})
+        // Naming this `Command` means that `Command({})` will call this overload and not the vector one. This isn't a big deal.
+        Params &Command(const char *const *argv, CommandExtras extras = {})
         {
             #ifdef _WIN32
-            state.cmd_string = detail::AssembleCommandLine(executable, detail::PtrArraySize(argv), [&](std::size_t i) {return argv[i];});
-            state.exe_path = std::move(executable);
+            if (argv)
+                state.cmd_string = detail::AssembleCommandLine(extras.executable, extras.batch_escaping, detail::PtrArraySize(argv), [&](std::size_t i) {return argv[i];});
+            else
+                state.cmd_string.reset();
+            state.exe_path = std::move(extras.executable);
             #else
             state.cmd_argv_storage.clear();
             state.cmd_argv_ptrs_storage.clear();
             state.cmd_argv = argv;
 
-            state.exe_path = executable;
+            state.exe_path = std::move(extras.executable);
             #endif
 
             return *this;
@@ -585,18 +727,23 @@ namespace em::Proc
 
         #ifdef _WIN32
         // Windows special: Command as a single string. Like `argv`, `command_str` must start with the executable name, which can be overridden with `executable`.
-        Params &CommandString_Win(NativeString command, std::optional<NativeString> executable = {})
+        // On Windows, if `executable` is specified, then `command` can be null. It's unclear if this does anything different compared to just passing 0 arguments.
+        Params &CommandString_Win(std::optional<NativeString> command, CommandExtras extras = {})
         {
             state.cmd_string = std::move(command);
-            state.exe_path = std::move(executable);
+            state.exe_path = std::move(extras.executable);
             return *this;
         }
 
         // Windows special: Command as a wide `argv`. Unlike the narrow `argv` version on POSIX, this is consumed immediately and can't dangle.
-        Params &CommandArgv_Win(const wchar_t *const *argv, std::optional<NativeString> executable = {})
+        // On Windows, if `executable` is specified, then `argv` can be null. It's unclear if this does anything different compared to just passing 0 arguments.
+        Params &Command_Win(const wchar_t *const *argv, CommandExtras extras = {})
         {
-            state.cmd_string = detail::AssembleCommandLine(executable, detail::PtrArraySize(argv), [&](std::size_t i) {return argv[i];});
-            state.exe_path = std::move(executable);
+            if (argv)
+                state.cmd_string = detail::AssembleCommandLine(extras.executable, extras.batch_escaping, detail::PtrArraySize(argv), [&](std::size_t i) {return argv[i];});
+            else
+                state.cmd_string.reset();
+            state.exe_path = std::move(extras.executable);
             return *this;
         }
         #endif
@@ -671,11 +818,14 @@ namespace em::Proc
             return *this;
         }
         // This version doesn't copy the strings on POSIX, so make sure they don't dangle.
-        // This can't be named `Env()` because then `Env({})` would call this overload, rather than passing an empty map.
+        // This can't be named `Env()` because then `Env({})` would call this overload, rather than passing an empty map, which is error-prone (unlike the similar `Command()` situation).
         Params &EnvPtr(const char *const *env_vars)
         {
             #ifdef _WIN32
-            return EnvString_Win(detail::AssembleEnvironmentFromPtr(env_vars));
+            if (env_vars)
+                return EnvString_Win(detail::AssembleEnvironmentFromPtr(env_vars));
+            else
+                return EnvStringPtr_Win(nullptr); // Special-case this to uncustomize the environment, to mirror the POSIX behavior. Why not.
             #else
             state.env_storage.clear();
             state.env_ptrs_storage.clear();
@@ -708,11 +858,67 @@ namespace em::Proc
         #endif
 
 
+        // This causes us to immediately release the process handle after starting it, so you can't wait for it to terminate and can't get its exit code.
+        //   (In theory, on POSIX we could still wait using the PID, using `kill(pid, 0)`. But that seems unreliable, because the PID could be reused by another process. And not very useful in the first place.)
+        //
+        // This prevents the mandatory wait for the process in the destructor. (Without this, the destructor is forced to wait on POSIX, otherwise we'd leak resources, look up so-called "zombie processes".
+        //   And on Windows it doesn't seem to be the case, but we replicate the POSIX behavior for consistency.)
+        //
+        // Also on POSIX this has a special effect of ensuring that this child won't get the terminal of the current process if the current process dies before the child, so it couldn't be Ctrl+C'ed in that case.
+        //
+        // What this does on POSIX is called "double forking" of "daemonizing" the new process, see this for more details: https://stackoverflow.com/q/881388/2752075
+        // You can still wait for its completion since we know its PID, but enabling this theoretically makes it not reliable anymore, since something could've reused it, I think?
+        Params &Background(bool enable = true)
+        {
+            state.background = enable;
+            return *this;
+        }
+
+        #ifdef _WIN32
+        // Windows special! Add or remove process creation flags, as documented here: https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags
+        Params &AddFlags_Win(DWORD flags)
+        {
+            state.process_flags |= flags;
+            return *this;
+        }
+        Params &RemoveFlags_Win(DWORD flags)
+        {
+            state.process_flags &= ~flags;
+            return *this;
+        }
+        #endif
+
+        // Sets the current directory (aka working directory).
+        // If not specified, the default behavior is to copy the working directory of the current process (when starting the subprocess, not when creating the `Params` instance, just like we do when mirroring environment).
+        Params &CurrentDirectory(std::optional<NativeString> working_dir)
+        {
+            #ifdef _WIN32
+            state.working_dir = std::move(working_dir);
+            #else
+            if (state.spawn_fa_alive)
+            {
+                // `_np` suffix means "non-portable" and marks experimental functions.
+                // Modern glibc has a version of it without the suffix, and so does MacOS. MacOS marks the `_np` version as deprecated.
+                // Android NDK doesn't have a non-`_np` version though (at v29, which is what I'm looking at).
+                // So I'm using the `_np` version just in case.
+                posix_spawn_file_actions_addchdir_np(&state.spawn_fa, working_dir->native.c_str());
+            }
+            else
+            {
+                // Silently ignoring this in release builds. Starting the process will catch this being null anyway.
+                // Since initializing `posix_spawn_file_actions_t` apparently can't fail on glibc, this should only happen in practice if it's moved from.
+                assert(false && "Operating on a null `posix_spawn_file_actions_t`, is this instance moved from?");
+            }
+            #endif
+            return *this;
+        }
+
         // Returns true on a non-null instance.
+        // This becomes false if moved from.
         [[nodiscard]] explicit operator bool() const
         {
             #ifdef _WIN32
-
+            return true;
             #else
             return state.spawn_attr_alive && state.spawn_fa_alive;
             #endif
@@ -730,13 +936,15 @@ namespace em::Proc
 
 
             #ifdef _WIN32
-            NativeString cmd_string;
+            // This is optional if `exe_path` is specified.
+            std::optional<NativeString> cmd_string;
             #else
             const char *const *cmd_argv = nullptr;
             std::vector<NativeString> cmd_argv_storage; // Not `std::vector<std::string>` for simplicity, since the user argument comes in this type.
             std::vector<const char *> cmd_argv_ptrs_storage;
             #endif
 
+            // There's no non-owning version of this for pure convenience. Who needs long paths?
             std::optional<NativeString> exe_path;
 
 
@@ -750,11 +958,14 @@ namespace em::Proc
             #endif
 
 
-            #ifdef _WIN32
-
-            #else
             bool background = false;
 
+            #ifdef _WIN32
+            DWORD process_flags = CREATE_UNICODE_ENVIRONMENT;
+            std::optional<NativeString> working_dir; // On POSIX this is baked into `spawn_attr`.
+            #endif
+
+            #ifndef _WIN32
             bool spawn_attr_alive = false;
             posix_spawnattr_t spawn_attr{};
             bool spawn_fa_alive = false;
@@ -766,6 +977,7 @@ namespace em::Proc
         friend class Process;
     };
 
+    // A single subprocess.
     class Process
     {
       public:
@@ -774,19 +986,160 @@ namespace em::Proc
         Process(const Params &params)
             : Process() // Run the destructor on throw.
         {
+            StartProcess(params);
+        }
+
+        Process(Params &&params)
+            : Process() // Run the destructor on throw.
+        {
+            StartProcess(std::move(params));
+        }
+
+        // This is move-only.
+        Process(Process &&other) noexcept : state(std::move(other.state)) {other.state = {};}
+        Process &operator=(Process other) noexcept {std::swap(state, other.state); return *this;}
+
+        // The default behavior is to wait for the process (if `IsBackground() == false`).
+        // We have to wait to clean up the process, otherwise it remains as a "zombie", because we never consumed its exit status.
+        ~Process()
+        {
+            // Not checking `HasError()`, it shouldn't stop us from calling `waitpid()` to clean up the process.
+
+            // We can either check `operator bool` or `OwnsProcess()` here (the latter being more strict). At least one of them is needed,
+            //   because `CheckOrWait()` asserts on that. But it does nothing if `bool(*this) == true && !OwnsProcess()` anyway, so it doesn't matter which one we check.
+
+            if (OwnsProcess())
+                CheckOrWait(true);
+        }
+
+        // Returns true if this instance owns a process, or used to own one.
+        [[nodiscard]] explicit operator bool() const {return state.pid != 0;}
+
+        // Returns true if this instance is an error state, due to the underlying API failing.
+        [[nodiscard]] bool HasError() const {return !state.error.empty();}
+        // Returns the error message. If `HasError() == false`, then always returns an empty string.
+        [[nodiscard]] const std::string ErrorMessage() const {return state.error;}
+
+        // This is zero for null processes.
+        [[nodiscard]] Proc::Pid Pid() const {return state.pid;}
+
+        // Returns true if this instance owns a process handle. This is a subset of `operator bool`.
+        // This is only true for non-background processes, which we didn't observe to exit yet. This means the destructor will have to do something to clean up the process handle/pid that we own.
+        [[nodiscard]] bool OwnsProcess() const
+        {
+            #ifdef _WIN32
+            return state.process_handle != INVALID_HANDLE_VALUE;
+            #else
+            return state.owns_pid;
+            #endif
+        }
+
+        // Returns true if this is a background process. See `Params::Background()` for more details.
+        [[nodiscard]] bool IsBackground() const
+        {
+            return state.exit_reason && std::holds_alternative<Proc::ExitReason::Background>(state.exit_reason->var);
+        }
+
+        // Update the process state. Check `ExitReason()` and `HasError()` after this.
+        void UpdateState()
+        {
+            CheckOrWait(false);
+        }
+
+        // Wait until the process exits.
+        // Note! This can deadlock if you have pipes open to this process, because you need to be manually poking those pipes.
+        void BlockUntilExit()
+        {
+            CheckOrWait(true);
+        }
+
+        // Returns the exit reason of the process, or false if it's not known to be exited.
+        [[nodiscard]] const std::optional<Proc::ExitReason> &ExitReason() const
+        {
+            return state.exit_reason;
+        }
+
+      private:
+        void StartProcess(auto &&params_ref)
+        {
+            const Params &params = params_ref;
+
             // Mark as background process before doing anything else, so that this information is not lost on error.
             if (params.state.background)
                 state.exit_reason = Proc::ExitReason(Proc::ExitReason::Background{});
 
-            #ifdef _WIN32
-
-            #else
             if (!params.state.error.empty())
             {
                 state.error = "Error in parameters: " + params.state.error;
                 return;
             }
 
+
+            #ifdef _WIN32
+
+            if (!params.state.cmd_string && !params.state.exe_path)
+            {
+                // WinAPI needs at least one.
+                state.error = "No command or executable path specified for process.";
+                return;
+            }
+
+            // Copy or move `cmd_string` from the parameters. `CreateProcessW()` is documented to clobber it (!!), so unlike on POSIX, we can't just `const_cast` the command line.
+            // This is the entire reason we have separate constructors for `const Params &` and `Params &&`.
+            auto cmd_string_copy = decltype(params_ref)(params_ref).state.cmd_string;
+
+            STARTUPINFOW startup_info{};
+            startup_info.cb = sizeof(startup_info);
+            // startup_info.dwFlags |= STARTF_USESTDHANDLES;
+            // startup_info.hStdInput = INVALID_HANDLE_VALUE;
+            // startup_info.hStdOutput = INVALID_HANDLE_VALUE;
+            // startup_info.hStdError = INVALID_HANDLE_VALUE;
+
+            struct ProcInfoGuard
+            {
+                PROCESS_INFORMATION value{};
+
+                ~ProcInfoGuard()
+                {
+                    // Not sure if the validity checks are needed. The manual doesn't say anything about allowing invalid handles, so probably needed.
+                    if (value.hProcess != INVALID_HANDLE_VALUE)
+                        CloseHandle(value.hProcess);
+                    if (value.hThread != INVALID_HANDLE_VALUE)
+                        CloseHandle(value.hThread);
+                }
+            };
+            ProcInfoGuard proc_info;
+
+            // Here if `env_ptr` is not specified, WinAPI copies the environment of this process, which is exactly what we want.
+            bool ok = CreateProcessW(
+                params.state.exe_path ? params.state.exe_path->native.c_str() : nullptr,
+                cmd_string_copy ? cmd_string_copy->native.data() : nullptr,
+                nullptr, // Process attributes.
+                nullptr, // Thread attributes.
+                true, // Inherit handles.
+                params.state.process_flags,
+                // It's mildly sus that `env_ptr` needs a `const_cast`. The function parameter is of type `void *`. Unlike for the command line, the documentation (at https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw)
+                //   doesn't say that the environment is clobbered, so I think the `const_cast` is fine.
+                const_cast<wchar_t *>(params.state.env_ptr),
+                params.state.working_dir ? params.state.working_dir->native.c_str() : nullptr,
+                &startup_info,
+                &proc_info.value
+            );
+            if (!ok)
+            {
+                state.error = "`CreateProcessW` failed: " + detail::GetLastWinApiErrorMessage();
+                return;
+            }
+
+            // Get the pid.
+            state.pid = proc_info.value.dwProcessId;
+
+
+            // Lastly, for non-background processes, preserve the handle.
+            if (!params.state.background)
+                state.process_handle = std::exchange(proc_info.value.hProcess, INVALID_HANDLE_VALUE);
+
+            #else
             if (!params.state.cmd_argv)
             {
                 // We check it here, because we sometimes use `cmd_argv[0]` below and it better not be null.
@@ -796,7 +1149,9 @@ namespace em::Proc
 
             if (!params)
             {
-                state.error = "Trying to create a process from a null params struct. Was it moved from?";
+                // This can only mean moved-from at this point, sinc we checked `params.state.error` earlier.
+                assert(false && "Null params struct, was it moved from?");
+                state.error = "Trying to create a process from a null params struct.";
                 return;
             }
 
@@ -886,84 +1241,54 @@ namespace em::Proc
                     state.error = std::string("`posix_spawnp` failed: ") + std::strerror(error);
                     return;
                 }
+
+                state.owns_pid = true;
             }
 
             assert(state.pid);
             #endif
         }
 
-        // This is move-only.
-        Process(Process &&other) noexcept : state(std::move(other.state)) {other.state = {};}
-        Process &operator=(Process other) noexcept {std::swap(state, other.state); return *this;}
-
-        // The default behavior is to wait for the process (if `IsBackground() == false`).
-        // We have to wait to clean up the process, otherwise it remains as a "zombie", because we never consumed its exit status.
-        ~Process()
-        {
-            // Not checking `HasError()`, it shouldn't stop us from calling `waitpid()` to clean up the process.
-            // Checking `operator bool` though, since `CheckOrWait()` asserts on that.
-            if (*this)
-                CheckOrWait(true);
-        }
-
-        // Returns false if this is a null instance that never held a process.
-        [[nodiscard]] explicit operator bool() const {return state.pid;}
-
-        // Returns true if this instance is an error state, due to the underlying API failing.
-        [[nodiscard]] bool HasError() const {return !state.error.empty();}
-        // Returns the error message. If `HasError() == false`, then always returns an empty string.
-        [[nodiscard]] const std::string ErrorMessage() const {return state.error;}
-
-        // This is zero for null processes.
-        [[nodiscard]] pid_t Pid() const {return state.pid;}
-
-        // Returns true if this is a background process. See `Params::Background()` for more details.
-        [[nodiscard]] bool IsBackground() const
-        {
-            #ifdef _WIN32
-            return false;
-            #error do we need the special case?
-            #else
-            return state.exit_reason && std::holds_alternative<Proc::ExitReason::Background>(state.exit_reason->var);
-            #endif
-        }
-
-        // Update the process state. Check `ExitReason()` and `HasError()` after this.
-        void UpdateState()
-        {
-            CheckOrWait(false);
-        }
-
-        // Wait until the process exits.
-        // Note! This can deadlock if you have pipes open to this process, because you need to be manually poking those pipes.
-        void BlockUntilExit()
-        {
-            CheckOrWait(true);
-        }
-
-        // Returns the exit reason of the process, or false if it's not known to be exited.
-        [[nodiscard]] const std::optional<Proc::ExitReason> &ExitReason() const
-        {
-            return state.exit_reason;
-        }
-
-      private:
         void CheckOrWait(bool wait)
         {
-            // Do nothing when already exited. This rejects background processes too.
-            if (state.exit_reason)
-                return;
-
             // Intentionally don't check `HasError()`. If something random has failed, we should still be able to `waitpid()` the process to clean it up.
 
             // Complain about null instances.
-            if (state.pid == 0)
+            if (!*this)
             {
                 // Assert instead of writing to `state.error`, this makes more sense to me.
                 assert(false && "Attempt to wait for a null instance.");
                 return;
             }
 
+            // Do nothing if we don't own a PID. This rejects background processes, and also repeated waits.
+            if (!OwnsProcess())
+                return;
+
+            #ifdef _WIN32
+            auto wait_result = WaitForSingleObject(state.process_handle, wait ? INFINITE : 0);
+            // If wait errored...
+            if (wait_result == WAIT_FAILED)
+            {
+                // Mark the process as exited, I guess.
+                // So that nothing gets blocked on the user side, waiting for it to exit.
+                state.exit_reason = Proc::ExitReason(Proc::ExitReason::Error{});
+                return;
+            }
+            // If wait says the process is still running...
+            if (wait_result != WAIT_OBJECT_0)
+            {
+                assert(wait); // Should only be possible if `wait == true`.
+                return;
+            }
+
+            // At this point we know the process has exited.
+
+            // Release the process handle, for consistency with POSIX. The destructor also relies on this function doing it.
+            CloseHandle(state.process_handle);
+            state.process_handle = INVALID_HANDLE_VALUE;
+
+            #else
             int status = 0;
             int wait_result = waitpid(state.pid, &status, wait ? 0 : WNOHANG);
             // If wait errored...
@@ -974,15 +1299,21 @@ namespace em::Proc
                 // Mark the process as exited, I guess.
                 // So that nothing gets blocked on the user side, waiting for it to exit.
                 state.exit_reason = Proc::ExitReason(Proc::ExitReason::Error{});
+                return;
             }
-            // If wait says the process is still running....
+            // If wait says the process is still running...
             if (wait_result == 0)
             {
                 assert(wait); // Should only be possible if `wait == true`.
                 return;
             }
 
-            // At this point we know the process has exited, but why?
+            // At this point we know the process has exited.
+
+            // We can no longer wait on this PID. We preserve it for posterity though.
+            state.owns_pid = false;
+
+            // But why did it exit?
             if (WIFEXITED(status))
             {
                 state.exit_reason = Proc::ExitReason(Proc::ExitReason::Code{WEXITSTATUS(status)});
@@ -990,7 +1321,7 @@ namespace em::Proc
             }
             if (WIFSIGNALED(status))
             {
-                state.exit_reason = Proc::ExitReason(Proc::ExitReason::Signal{
+                state.exit_reason = Proc::ExitReason(Proc::ExitReason::Signal_Posix{
                     WTERMSIG(status),
                     #ifdef WCOREDUMP // Manual says to ifdef this: https://linux.die.net/man/2/waitpid
                     bool(WCOREDUMP(status))
@@ -1000,7 +1331,8 @@ namespace em::Proc
             }
 
             // Some unknown reason.
-            state.exit_reason = Proc::ExitReason(Proc::ExitReason::Other{status});
+            state.exit_reason = Proc::ExitReason(Proc::ExitReason::Other_Posix{status});
+            #endif
         }
 
         struct State
@@ -1008,7 +1340,16 @@ namespace em::Proc
             // I considered merging this into `ExitReason`, but since I also merged `Background` into that, I'm worried that we'd lose information if the error message replaced that.
             std::string error;
 
-            pid_t pid = 0;
+            Proc::Pid pid = 0;
+
+            #ifdef _WIN32
+            // There's some weirdness with what counts as a valid handle. `INVALID_HANDLE_VALUE` is basically `(HANDLE)-1`, but `nullptr` also seems to be invalid.
+            // Using `INVALID_HANDLE_VALUE` seems better to me.
+            HANDLE process_handle = INVALID_HANDLE_VALUE;
+            #else
+            // Do we need to `waitpid()` on the PID to clean it up?
+            bool owns_pid = false;
+            #endif
 
             std::optional<Proc::ExitReason> exit_reason;
         };
