@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <functional>
+#include <initializer_list>
 #include <map>
 #include <optional>
 #include <string_view>
@@ -189,6 +190,8 @@ namespace em::Proc
         #endif
 
         // Compare with itself.
+        // Fun fact: having custom `==`s below forces us to explicitly default this `==`. Defaulting the `<=>` is no longer enough because of those other `==`s.
+        friend bool                 operator== (const NativeString &, const NativeString &) = default;
         friend std::strong_ordering operator<=>(const NativeString &, const NativeString &) = default;
 
         // Compare with the native string type, in all the different forms.
@@ -224,171 +227,397 @@ namespace em::Proc
 
         #ifdef _WIN32
 
-        // Combines multiple command-line arguments into one string. Can operate either on wide or on narrow strings, doesn't matter. Always returns a wide string.
-        // `executable` is the optional override for the executable name, that's otherwise taken from the first argument. We don't paste it into the result,
-        //   but need it to know if this is a batch file or not, SDL escapes those differently.
-        // `executable` is not an `std::optional<std::basic_string_view<...>>` for convenience, since we always pass `std::optional<NativeString>` to it.
-        // `num_args` is the number of arguments, including the program name.
-        // `get_arg(i)` is called for `0 <= i < num_args`, and must return either `NativeString` or something convertible to `std::string_view` or `std::wstring_view`.
+        template <typename T>
+        struct StringToCharType {using type = typename T::value_type;};
+        template <>
+        struct StringToCharType<NativeString> {using type = NativeChar;};
+
+        // Combines multiple command-line arguments into one string. Can operate either on wide or on narrow strings, doesn't matter.
+        // `executable` is the optional override for the executable name, that's otherwise taken from the first argument. We may modify it, and may reset it to null if needed. (Currently only resetting.)
+        // `executable` is not an `std::optional<std::basic_string_view<...>>` for convenience, since we always pass an owning optional string to it.
+        // `executable` has to store a `NativeString` or a `std::string` or a `std::wstring`.
+        // `num_args` is the number of arguments, including the program name. Passing 0 is legal and means you don't want to specify this.
+        // `get_arg(i)` is called for `0 <= i < num_args`, and must return something convertible to `std::basic_string_view<Char>`, matching the character type of `executable`.
         // `get_arg` can be called multiple times for the same index, make sure that works and is fast.
-        // If `force_batch_escape` is specified, it controls whether or not we apply additional batch-style escaping to the arguments.
-        // By default it's enabled only when `argv[0]` (or `executable` instead, if specified) ends in `.bat` or `.cmd` (case-insensitive),
-        //   but passing `force_batch_escape` lets you force enable or disable it.
-        [[nodiscard]] NativeString AssembleCommandLine(const std::optional<NativeString> &executable, std::optional<bool> force_batch_escape, std::size_t num_args, auto &&get_arg)
+        // If `batch_prepend_cmd == true`, we will prepend `cmd ... /c` to batch files, which is usually a good thing.
+        // If `batch_extra_safety == true`, we will process batch arguments in a safer way.
+        // The escaping algorithm is explained in: https://holyblackcat.github.io/blog/2026/09/05/escaping-createprocess-arguments.html
+        //   That also explains those two knobs in more details.
+        // `out_command` is the resulting combined string, or null if we think none is needed.
+        // `out_error` is set to error on failure.
+        // Returns true on success and false on failure. On success, `out_error` is left unchanged. On failure, `out_command` is left unmodified.
+        // If this function fails, it writes the error message to `out_error`.
+        template <typename String, typename Char = typename StringToCharType<String>::type>
+        [[nodiscard]] bool AssembleCommandLine(
+            std::optional<String> &executable,
+            std::size_t num_args,
+            bool batch_prepend_cmd,
+            bool batch_extra_safety,
+            std::optional<String> &out_command,
+            std::string &out_error,
+            auto &&get_arg)
         {
-            if (num_args == 0)
-                return {}; // Must special-case this because we might call `get_arg(0)` to get the executable name.
-
-            // What does the lambda return.
-            using LambdaReturnType = std::remove_cvref_t<decltype(get_arg(std::size_t{}))>;
-
             // This lambda returns the `i`th argument converted to `std::basic_string_view<...>`.
-            auto get_arg_view = [&](std::size_t i)
+            auto GetArgView = [&](std::size_t i)
             {
-                if constexpr (std::is_same_v<LambdaReturnType, NativeString>)
+                if constexpr (std::is_same_v<std::remove_cvref_t<decltype(get_arg(std::size_t{}))>, NativeString>)
                     return std::basic_string_view(get_arg(i).native);
                 else
                     return std::basic_string_view(get_arg(i));
             };
 
-            // Now we can determine the character type of the input arguments;
-            using Char = decltype(get_arg_view(0))::value_type;
+            // Now we can check the character type of the input arguments.
+            static_assert(std::is_same_v<typename decltype(GetArgView(0))::value_type, Char>);
 
-            auto EndsWithExt = []<typename T>(
-                std::basic_string_view<T> view,
-                std::type_identity_t<T> a,
-                std::type_identity_t<T> b,
-                std::type_identity_t<T> c,
-                std::type_identity_t<T> A,
-                std::type_identity_t<T> B,
-                std::type_identity_t<T> C
-            )
+
+            // 1. Check for bad inputs:
+
+            // 1.1. Check that at least one parameter is specified:
+            if (!executable && num_args == 0)
             {
-                if (view.size() < 4)
-                    return false;
-                view = view.substr(view.size() - 4);
-                if (view[0] != '.')
-                    return false;
-                return
-                    (view[1] == a || view[1] == A) &&
-                    (view[2] == b || view[2] == B) &&
-                    (view[3] == c || view[3] == C);
+                out_error = "Must specify either an executable or a command.";
+                return false;
+            }
+
+            auto GetExecutableView = [&]
+            {
+                if constexpr (std::is_same_v<String, NativeString>)
+                    return std::basic_string_view(executable->native);
+                else
+                    return std::basic_string_view(*executable);
             };
 
-            auto EndsWithBatchExt = [&]<typename T>(std::basic_string_view<T> view)
+            // 1.2. Check for null characters.
+            if (executable && GetExecutableView().find('\0') != std::size_t(-1))
             {
-                return EndsWithExt(view, 'b','a','t', 'B','A','T') || EndsWithExt(view, 'c','m','d', 'C','M','D');
-            };
-
-            // Is this a `.bat`/`.cmd` file? We only set this when using the stock escaping mode.
-            const bool is_batch_file =
-                force_batch_escape ? *force_batch_escape :
-                executable ? EndsWithBatchExt(std::basic_string_view(executable->native)) : EndsWithBatchExt(get_arg_view(0));
-
-            // Handles `i`th command line argument.
-            // If `Write == false`, returns the necessary string size to encode it. Then the `out` argument must not be specified.
-            // If `Write == true`, appends the argument to `out` and returns nothing.
-            auto HandleArg = [&]<bool Write>(std::size_t i, std::conditional_t<Write, std::basic_string<Char> &, std::nullptr_t> out = {}) -> std::conditional_t<Write, void, std::size_t>
+                out_error = "Null character in the executable name.";
+                return false;
+            }
+            for (std::size_t i = 0; i < num_args; i++)
             {
-                // Escaping algorithm from here: https://learn.microsoft.com/en-us/archive/blogs/twistylittlepassagesallalike/everyone-quotes-command-line-arguments-the-wrong-way
-
-                std::size_t ret = 0;
-
-                auto WriteChar = [&](Char ch)
+                if (GetArgView(i).find('\0') != std::size_t(-1))
                 {
-                    if constexpr (Write)
-                        out += ch;
-                    else
-                        ret++;
-                };
+                    out_error = "Null character in the command.";
+                    return false;
+                }
+            }
 
-                // Argument separator.
-                if (i != 0)
-                    WriteChar(' ');
+            // 2. Determine executable name.
+            std::basic_string_view<Char> exe_name = executable ? GetExecutableView() : GetArgView(0);
 
-                const std::basic_string_view<Char> arg = get_arg_view(i);
+            // 3. Check that the executable name doesn't end with garbage.
+            if (exe_name.ends_with(' ') || exe_name.ends_with('.'))
+            {
+                out_error = "The program name can't end with a space or a dot.";
+                return false;
+            }
 
-                const bool batch_escape_this_arg = i > 0 && is_batch_file;
 
-                // The original article doesn't list here `\r`, but SDL does.
-                // But from my experiments, out of those, only ` ` and `\t` are actually necessary here, the rest is courtesy. And since we're doing courtesy, why not add `\r` too.
-                static constexpr Char quoted_chars[] = {' ', '\r', '\n', '\t', '\v'};
-                const bool quote = arg.empty() || arg.find_first_of(quoted_chars) != std::size_t(-1);
+            // Checks if `object` equals to `target_lowercase`, case-insensitive.
+            // `target_lowercase` must be in lowercase for this function to work correctly.
+            // Using `initializer_list` for convenience, because we can't pass string literals here, because `Char` can vary. Braced lists of characters work fine though.
+            auto EqualsCaseInsensitive = [](std::basic_string_view<Char> object, std::initializer_list<Char> target_lowercase) -> bool
+            {
+                if (object.size() != target_lowercase.size())
+                    return false;
 
-                // Open the quote.
-                if (quote)
+                for (std::size_t i = 0; i < object.size(); i++)
                 {
-                    if (batch_escape_this_arg)
-                        WriteChar('^');
-                    WriteChar('"');
+                    Char obj_ch = object[i];
+                    Char tgt_ch = target_lowercase.begin()[i];
+                    if (!(
+                        obj_ch == tgt_ch ||
+                        (tgt_ch >= 'a' && tgt_ch <= 'z' && obj_ch == tgt_ch - 'a' + 'A')
+                    ))
+                    {
+                        return false;
+                    }
                 }
 
-                for (auto it = arg.begin(), end = arg.end(); it != end; it++)
+                return true;
+            };
+            auto StartsWithCaseInsensitive = [&](std::basic_string_view<Char> object, std::initializer_list<Char> target_lowercase) -> bool
+            {
+                if (object.size() < target_lowercase.size())
+                    return false;
+
+                return EqualsCaseInsensitive(object.substr(0, target_lowercase.size()), target_lowercase);
+            };
+            auto EndsWithCaseInsensitive = [&](std::basic_string_view<Char> object, std::initializer_list<Char> target_lowercase) -> bool
+            {
+                if (object.size() < target_lowercase.size())
+                    return false;
+
+                return EqualsCaseInsensitive(object.substr(object.size() - target_lowercase.size()), target_lowercase);
+            };
+
+            // 4. Check for a direct CMD invocation.
+            // Using `std::to_array()` stuff to be able to handle both wide and narrow strings.
+            bool is_cmd = EqualsCaseInsensitive(exe_name, {'c','m','d'}) || EqualsCaseInsensitive(exe_name, {'c','m','d','.','e','x','e'});
+
+
+            // 5. Check for batch.
+            bool is_batch = EndsWithCaseInsensitive(exe_name, {'.','b','a','t'}) || EndsWithCaseInsensitive(exe_name, {'.','c','m','d'});
+
+            // 6. Batch/cmd argument validation.
+            if (is_cmd || is_batch)
+            {
+                static constexpr Char bad_chars_array[] = {'\n', '\r', '%', '!'};
+                // Reject `%` if `batch_extra_safety == true`.
+                // Reject `!` if `batch_extra_safety == true && batch_prepend_cmd == false`.
+                const std::basic_string_view bad_chars(bad_chars_array, batch_extra_safety ? (batch_prepend_cmd ? 3 : 4) : 2);
+
+                auto CheckString = [&](std::basic_string_view<Char> str) -> bool
                 {
-                    const auto ch = *it;
-
-                    if (ch == '\\')
+                    if (auto pos = str.find_first_of(bad_chars); pos != std::size_t(-1))
                     {
-                        std::size_t num_slashes = 1;
-                        while (it + 1 != end && it[1] == '\\')
+                        out_error = "Bad character in cmd/batch argument: ";
+                        char bad_char = char(str[pos]); // The cast to `char` here is fine, because all possible bad characters are hardcoded above and are narrow.
+                        if (bad_char == '\n')
                         {
-                            num_slashes++;
-                            ++it;
+                            out_error += "line break.";
                         }
-
-                        if (it + 1 != end ? it[1] == '"' : quote)
+                        else if (bad_char == '\r')
                         {
-                            // If there's a quote after all those slashes, write 2*N+1 slashes. Leave the quote in the buffer to be processed at the next step.
-
-                            for (std::size_t i = 0; i < num_slashes; i++)
-                            {
-                                WriteChar('\\');
-                                WriteChar('\\'); // Again.
-                            }
-                            WriteChar('\\'); // And another one.
+                            out_error += "carriage return.";
                         }
                         else
                         {
-                            // If there's no quote after the slashes, just write the slashes as is.
-                            for (std::size_t i = 0; i < num_slashes; i++)
-                                WriteChar('\\');
+                            out_error += '`';
+                            out_error += bad_char;
+                            out_error += "`.\n";
                         }
+
+                        return false;
+                    }
+
+                    return true;
+                };
+
+                if (num_args == 0)
+                {
+                    if (!CheckString(GetExecutableView()))
+                        return false;
+                }
+                else
+                {
+                    for (std::size_t i = 0; i < num_args; i++)
+                    {
+                        if (!CheckString(GetArgView(i)))
+                            return false;
+                    }
+                }
+            }
+
+            // We shouldn't fail beyond this point.
+            // We also don't read `exe_name` beyond this point, it might get invalidated.
+
+            out_command = {};
+
+            auto GetWritableOutCommand = [&]() -> auto &
+            {
+                if constexpr (std::is_same_v<String, NativeString>)
+                    return out_command->native;
+                else
+                    return *out_command;
+            };
+
+            bool seen_slash_d = false;
+            bool seen_slash_e = false;
+            bool seen_slash_v = false;
+            bool seen_slash_s = false;
+            bool seen_slash_c_or_k = false;
+            bool need_separator_before_next_arg = false;
+            bool is_first_arg = true;
+            bool need_final_closing_quote = false; // If this is true, we need a `"` at the end of the command.
+
+            // Appends a single argument to the output. Assumes `out_command` isn't null, ensure that before calling this.
+            auto WriteArgument = [&](std::basic_string_view<Char> arg)
+            {
+                auto &out = GetWritableOutCommand();
+
+                // Track special arguments.
+                bool this_arg_is_slash_c_or_k = false;
+                if (is_cmd && !is_first_arg && !seen_slash_c_or_k)
+                {
+                    if (arg.starts_with('/'))
+                    {
+                        auto remainder = arg.substr(1);
+                        if (StartsWithCaseInsensitive(remainder, {'c'}) || StartsWithCaseInsensitive(remainder, {'k'}))
+                        {
+                            seen_slash_c_or_k = true;
+                            this_arg_is_slash_c_or_k = true;
+                        }
+                        else if (batch_prepend_cmd) // Reuse this knob for this.
+                        {
+                            // Note, using "starts with" for all arguments, and not checking `:` for arguments that take parameters. See the blog post for more details.
+                            if (StartsWithCaseInsensitive(remainder, {'d'}))
+                                seen_slash_d = true;
+                            else if (StartsWithCaseInsensitive(remainder, {'e'}))
+                                seen_slash_e = true;
+                            else if (StartsWithCaseInsensitive(remainder, {'v'}))
+                                seen_slash_v = true;
+                            else if (StartsWithCaseInsensitive(remainder, {'s'}))
+                                seen_slash_s = true;
+                        }
+                    }
+                }
+
+                // If this is `/c` or `/k`, insert the extra arguments before it if the user didn't provide them.
+                if (this_arg_is_slash_c_or_k && batch_prepend_cmd) // Reuse this knob for this.
+                {
+                    if (!seen_slash_d)
+                        out += std::basic_string_view(std::to_array<Char>({' ','/','d'}));
+                    if (!seen_slash_e)
+                        out += std::basic_string_view(std::to_array<Char>({' ','/','e',':','o','n'}));
+                    if (!seen_slash_v)
+                        out += std::basic_string_view(std::to_array<Char>({' ','/','v',':','o','f','f'}));
+                    if (!seen_slash_s)
+                        out += std::basic_string_view(std::to_array<Char>({' ','/','s'}));
+                }
+
+                // The separating space.
+                if (std::exchange(need_separator_before_next_arg, true))
+                    out += ' ';
+
+                // Should we quote this argument?
+                bool quote = false;
+                if (is_first_arg)
+                {
+                    quote = true;
+                }
+                else
+                {
+                    static constexpr Char quotable_chars_array[] = {' ','\t','"', /*batch only:*/ '<','>','&','|','(',')','[',']','{','}','^','=',';','%','!','\'','+','`','~'};
+                    const std::basic_string_view<Char> quotable_chars = is_cmd || is_batch ? quotable_chars_array : std::basic_string_view<Char>(quotable_chars_array, 3);
+
+                    if (arg.find_first_of(quotable_chars) != std::size_t(-1))
+                        quote = true;
+                }
+
+                // Opening quote.
+                if (quote)
+                    out += '"';
+
+                // Write the escaped contents.
+                std::size_t arg_size = arg.size();
+                for (std::size_t i = 0; i < arg_size; i++)
+                {
+                    Char ch = arg[i];
+
+                    if (ch == '"')
+                    {
+                        if constexpr (std::is_same_v<Char, wchar_t>)
+                            out += L"\"\"";
+                        else
+                            out +=  "\"\"";
+                        continue;
+                    }
+
+                    if (ch == '%' && (is_cmd || is_batch) && !(!batch_prepend_cmd && !batch_extra_safety))
+                    {
+                        assert(batch_prepend_cmd && !batch_extra_safety); // We should reject it in all other cases.
+
+                        if constexpr (std::is_same_v<Char, wchar_t>)
+                            out += L"%%cd:~,%";
+                        else
+                            out +=  "%%cd:~,%";
 
                         continue;
                     }
 
-                    // For batch, prepend some special characters with `^`.
-                    // The list is straight from the article.
-                    if (batch_escape_this_arg && (ch == '(' || ch == ')' || ch == '%' || ch == '!' || ch == '^' || ch == '"' || ch == '<' || ch == '>' || ch == '&' || ch == '|'))
-                        WriteChar('^');
+                    if (ch == '\\')
+                    {
+                        std::size_t num_backslashes = 1;
+                        while (i + 1 < arg_size && arg[i+1] == '\\')
+                        {
+                            i++;
+                            num_backslashes++;
+                        }
 
-                    WriteChar(ch);
+                        // Is the next character is a quote? (Either natural or our own.)
+                        // Then double the amount of backslashes.
+                        if (i + 1 < arg_size ? arg[i+1] == '"' : quote)
+                            num_backslashes *= 2;
+
+                        for (std::size_t j = 0; j < num_backslashes; j++)
+                            out += '\\';
+
+                        continue;
+                    }
+
+                    out += ch;
                 }
 
-                // Close the quote.
+                // Closing quote.
                 if (quote)
+                    out += '"';
+
+                // Insert the opening quote after `/c` or `/k` if needed.
+                if (this_arg_is_slash_c_or_k)
                 {
-                    if (batch_escape_this_arg)
-                        WriteChar('^');
-                    WriteChar('"');
+                    need_separator_before_next_arg = false;
+                    need_final_closing_quote = true;
+                    out += ' ';
+                    out += '"';
                 }
 
-                if constexpr (!Write)
-                    return ret;
+                is_first_arg = false;
             };
 
-            std::size_t needed_size = 0;
-            for (std::size_t i = 0; i < num_args; i++)
-                needed_size += HandleArg.template operator()<false>(i);
+            // 7. Prepend CMD invocation to Batch files.
+            if (batch_prepend_cmd && is_batch)
+            {
+                // Just handroll all of those for speed.
+                seen_slash_d = true;
+                seen_slash_e = true;
+                seen_slash_v = true;
+                seen_slash_s = true;
+                seen_slash_c_or_k = true;
+                is_first_arg = false;
+                need_final_closing_quote = true;
 
-            // Intentionally assemble the result in a possibly non-wide string. Then `return ret;` converts it to a wide string.
-            // This way we only have to call WinAPI once, and not per argument.
-            std::basic_string<Char> ret;
-            ret.reserve(needed_size);
-            for (std::size_t i = 0; i < num_args; i++)
-                HandleArg.template operator()<true>(i, ret);
+                assert(!out_command);
+                out_command.emplace();
+                if constexpr (std::is_same_v<Char, wchar_t>)
+                    out_command = L"\"cmd\" /d /e:on /v:off /s /c \"";
+                else
+                    out_command =  "\"cmd\" /d /e:on /v:off /s /c \"";
 
-            return ret;
+                // If we have no user-provided arguments, write the executable as an argument.
+                // I figured it's easier to use `WriteArgument()` here.
+                if (num_args == 0)
+                    WriteArgument(GetExecutableView());
+
+                // Either way, reset `executable`.
+                executable = {};
+
+                is_cmd = true;
+                is_batch = false;
+            }
+
+            // If by this point `out_command` is still null, make it non-null if necessary.
+            if (num_args != 0 && !out_command)
+                out_command.emplace();
+
+            // 8. Quote the entire command if needed.
+            if (executable && num_args != 0 && is_batch)
+            {
+                GetWritableOutCommand() += '"';
+
+                assert(!need_final_closing_quote);
+                need_final_closing_quote = true;
+            }
+
+            // 9. Actually write the arguments.
+            for (std::size_t i = 0; i < num_args; i++)
+                WriteArgument(GetArgView(i));
+
+            // Lastly, close the CMD quote if needed.
+            if (need_final_closing_quote)
+                GetWritableOutCommand() += '"';
+
+            return true;
         }
 
         // Produces a windows-style environemtn string by concating `env[i]` into a `\0`-separated list, with `\0\0` at the end.
@@ -668,29 +897,47 @@ namespace em::Proc
             #endif
         }
 
+        // Defined unconditionally for simplicity. Because of that we don't suffix it `_Win`.
+        enum class CmdBatchMode
+        {
+            // Will prepend `cmd ... /c` to batch files, and also append a bunch of basic flags to manual CMD invocations.
+            // Allows passing `!` to batch/cmd, but doesn't allow passing `%` to them, since it can't be reliably escaped.
+            // Those extra flags are needed mainly to override any registry settings that customize CMD behavior,
+            //   which is both convenient to the user and also allows reliable escaping of certain symbols (allows escaping `%`,
+            //   but that one is only allowed in `relaxed` but not here; and also disables `!` expanding env variables, which allows us to not reject it).
+            normal,
+            // Same as `normal`, but allows passing `%`, escaping it.
+            // Note that on certain batch files it can lead to arbitrary command execution.
+            // Try passing `%CMDCMDLINE:~-1%&calc.exe` as an argument to check if your batch file is affected.
+            relaxed,
+            // Don't prepend `cmd ... /c` to batch files, and also don't append any flags to manual CMD invocations.
+            // Because with this we can no longer guarantee the behavior of `!` and of our escaping of `%` (used in `relaxed`),
+            //   this doesn't allow passing `%` nor `!`.
+            keep_registry_settings,
+            // Don't prepend `cmd ... /c` to batch files, and allow passing `%` (not escaped) and `!` anyway.
+            // This leads to arbitrary comamnd execution if the user controls arguments to your batch files.
+            unsafe,
+        };
+
         struct CommandExtras
         {
-            // If specified, it replaces `argv[0]` as the program to execute. The original `argv[0]` is then only passed to the program's `main`.
-            // On Windows, specifying `executable` ignores `PATH` and `PATHEXT`, and instead either uses the exact path, or searches the current directory.
-            std::optional<NativeString> executable;
-
-            // This is only used on Windows. Not `#ifdef`ing it for simplicity. This is ignored by overloads that take a single string, as opposed to argument array, since the string is assumed to be pre-escaped.
-            // By convention, arguments of batch files (`.bat` or `.cmd`) need additional escaping. Unlike POSIX shells, the batch interpreter apparently can't escape the arguments by itself,
-            //   so either you give it pre-escaped ones, or your batch files break in mysterious ways (and possibly vulnerable ways, if the arguments are user-provided).
-            // Our default behavior is to batch-escape if the extension of `argv[0]` (or `executable` instead, if specified) ends with `.bat` or `.cmd` (case-insensitive).
-            // This variable overrides that logic.
-            // Note that the extension heuristic is unreliable because of `PATHEXT`, which lets you omit extensions. Even if you run e.g. `foo.exe`, it could resolve to `foo.exe.cmd` if that exists, or whatever.
-            // So to be safe, you should unset `PATHEXT` before starting processes, or set the `executable` parameter (which ignores `PATHEXT`).
-            std::optional<bool> batch_escaping;
+            // Defined unconditionally for simplicity. Because of that we don't suffix it `_win`.
+            CmdBatchMode cmd_batch_mode = CmdBatchMode::normal;
         };
 
         // Set the command to execute, and its arguments.
-        Params &Command(std::vector<NativeString> argv, CommandExtras extras = {})
+        // If `executable` is specified, it replaces `argv[0]` as the program to execute. The original `argv[0]` is then only passed to the program's `main`.
+        // On Windows, specifying `executable` ignores `PATH` and disables the implicit `.exe` extension, and instead either uses the exact path,
+        //   or searches the current directory. (`argv[0]` also searches in the current directory on Windows.)
+        // Also on Windows `executable` allows passing overly long executable names. (Those must be prefixed with `\\?\` and canonicalized to use `\` instead of `/`,
+        //   don't use multiple adjacent `\`, don't use `.` or `..` directory names, etc. But they remain case-insensitive.)
+        std::optional<NativeString> executable;
+        Params &Command(std::vector<NativeString> argv, std::optional<NativeString> executable = {}, CommandExtras extras = DefaultCommandExtras())
         {
             #ifdef _WIN32
-            state.cmd_string = detail::AssembleCommandLine(extras.executable, extras.batch_escaping, argv.size(), [&](std::size_t i) -> const auto & {return argv[i];});
-            state.exe_path = std::move(extras.executable);
+            detail_SetCommand_Win(executable, extras, argv.size(), [&](std::size_t i) -> const auto & {return argv[i];});
             #else
+            (void)extras;
             state.cmd_argv_storage = std::move(argv);
             std::size_t argc = state.cmd_argv_storage.size();
             // A direct resize should be faster than reserve?
@@ -706,14 +953,13 @@ namespace em::Proc
         }
         // This version doesn't copy `argv` on POSIX, make sure it doesn't dangle until the process starts.
         // Naming this `Command` means that `Command({})` will call this overload and not the vector one. This isn't a big deal.
-        Params &Command(const char *const *argv, CommandExtras extras = {})
+        // Note, the `executable is narrow here to match `argv`. This is to simplify our implementation, since the command line is assembled narrow here,
+        //   and we might need to copy `executable` into the command line. I guess we could overload this with a `NativeString` executable, and narrow that
+        //   ourselves, but it's probably not worth it. You can do it yourself if you need.
+        Params &Command(const char *const *argv, std::optional<std::string> executable = {}, CommandExtras extras = DefaultCommandExtras())
         {
             #ifdef _WIN32
-            if (argv)
-                state.cmd_string = detail::AssembleCommandLine(extras.executable, extras.batch_escaping, detail::PtrArraySize(argv), [&](std::size_t i) {return argv[i];});
-            else
-                state.cmd_string.reset();
-            state.exe_path = std::move(extras.executable);
+            detail_SetCommand_Win(executable, extras, detail::PtrArraySize(argv), [&](std::size_t i) {return argv[i];});
             #else
             state.cmd_argv_storage.clear();
             state.cmd_argv_ptrs_storage.clear();
@@ -728,22 +974,20 @@ namespace em::Proc
         #ifdef _WIN32
         // Windows special: Command as a single string. Like `argv`, `command_str` must start with the executable name, which can be overridden with `executable`.
         // On Windows, if `executable` is specified, then `command` can be null. It's unclear if this does anything different compared to just passing 0 arguments.
-        Params &CommandString_Win(std::optional<NativeString> command, CommandExtras extras = {})
+        // This ignores `extras.cmd_batch_mode`, but we're still passing `extras` for consistency.
+        Params &CommandString_Win(std::optional<NativeString> command, std::optional<NativeString> executable = {}, CommandExtras extras = DefaultCommandExtras())
         {
+            (void)extras;
             state.cmd_string = std::move(command);
-            state.exe_path = std::move(extras.executable);
+            state.exe_path = std::move(executable);
             return *this;
         }
 
         // Windows special: Command as a wide `argv`. Unlike the narrow `argv` version on POSIX, this is consumed immediately and can't dangle.
         // On Windows, if `executable` is specified, then `argv` can be null. It's unclear if this does anything different compared to just passing 0 arguments.
-        Params &Command_Win(const wchar_t *const *argv, CommandExtras extras = {})
+        Params &Command_Win(const wchar_t *const *argv, std::optional<NativeString> executable, CommandExtras extras = DefaultCommandExtras())
         {
-            if (argv)
-                state.cmd_string = detail::AssembleCommandLine(extras.executable, extras.batch_escaping, detail::PtrArraySize(argv), [&](std::size_t i) {return argv[i];});
-            else
-                state.cmd_string.reset();
-            state.exe_path = std::move(extras.executable);
+            detail_SetCommand_Win(executable, extras, detail::PtrArraySize(argv), [&](std::size_t i) {return argv[i];});
             return *this;
         }
         #endif
@@ -973,6 +1217,47 @@ namespace em::Proc
             #endif
         };
         State state;
+
+        #ifdef _WIN32
+        // If `String` is `NativeString`, then `get_arg(i)` should return that, possibly by reference.
+        // Otherwise `String` has to be `std::basic_string<T>`, then `get_arg(i)` should return something convertible to `std::basic_string_view<T>`.
+        // This is a little wrapper for `detail::AssembleCommandLine()`. Maybe we could merge them, but it's currently easier not to.
+        template <typename String>
+        void detail_SetCommand_Win(std::optional<String> executable, CommandExtras extras, std::size_t num_args, auto &&get_arg)
+        {
+            bool ok = false;
+
+            auto MakeCommand = [&](auto &out_command)
+            {
+                ok = detail::AssembleCommandLine(
+                    executable,
+                    num_args,
+                    extras.cmd_batch_mode == CmdBatchMode::normal || extras.cmd_batch_mode == CmdBatchMode::relaxed,
+                    extras.cmd_batch_mode == CmdBatchMode::normal || extras.cmd_batch_mode == CmdBatchMode::keep_registry_settings,
+                    out_command,
+                    state.error,
+                    decltype(get_arg)(get_arg)
+                );
+            };
+
+            if constexpr (std::is_same_v<String, NativeString>)
+            {
+                MakeCommand(state.cmd_string);
+            }
+            else
+            {
+                std::optional<String> out_command; // Have to use a temporary output variable of the specific type.
+                MakeCommand(out_command);
+                state.cmd_string = std::move(out_command); // This correctly handles null optionals.
+            }
+
+            // Write the updated executable name.
+            if (ok)
+                state.exe_path = std::move(executable); // This correctly handles null optionals.
+        }
+        #endif
+
+        [[nodiscard]] static CommandExtras DefaultCommandExtras() {return {};} // Make Clang happy.
 
         friend class Process;
     };
