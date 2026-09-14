@@ -70,8 +70,9 @@ namespace em::Proc
     #endif
 
     #ifdef _WIN32
-    // This is primarily for internal use, and exposed as a courtesy. Prefer `class NativeString` defined below.
+    // This is primarily for internal use, and exposed as a courtesy. You can also use `class NativeString` defined below.
     // Converts between `std::string` and `std::wstring` in both directions.
+    // If the argument is `std::basic_string<T>` as opposed to `std::basic_string_view<T>`, you can cast it to `std::basic_string_view(...)` via CTAD to avoid having to specify `Char`.
     // By default, replaces invalid characters in the input with placeholders.
     // If `success` is specified, instead returns an empty string if the input has invalid characters, and writes false to `success`. On success, writes true.
     template <typename Char>
@@ -371,7 +372,8 @@ namespace em::Proc
                 {
                     if (auto pos = str.find_first_of(bad_chars); pos != std::size_t(-1))
                     {
-                        out_error = "Bad character in cmd/batch argument: ";
+                        // Note that this says "command" and not "argument", since we reject it in the batch filename too.
+                        out_error = "Bad character in cmd/batch command: ";
                         char bad_char = char(str[pos]); // The cast to `char` here is fine, because all possible bad characters are hardcoded above and are narrow.
                         if (bad_char == '\n')
                         {
@@ -385,7 +387,7 @@ namespace em::Proc
                         {
                             out_error += '`';
                             out_error += bad_char;
-                            out_error += "`.\n";
+                            out_error += "`.";
                         }
 
                         return false;
@@ -482,7 +484,7 @@ namespace em::Proc
 
                 // Should we quote this argument?
                 bool quote = false;
-                if (is_first_arg)
+                if (is_first_arg && !executable)
                 {
                     quote = true;
                 }
