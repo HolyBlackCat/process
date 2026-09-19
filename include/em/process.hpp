@@ -241,19 +241,22 @@ namespace em::Proc
         // `get_arg(i)` is called for `0 <= i < num_args`, and must return something convertible to `std::basic_string_view<Char>`, matching the character type of `executable`.
         // `get_arg` can be called multiple times for the same index, make sure that works and is fast.
         // If `batch_prepend_cmd == true`, we will prepend `cmd ... /c` to batch files, which is usually a good thing.
-        // If `batch_extra_safety == true`, we will process batch arguments in a safer way.
+        // `batch_safety` is either 0 or 1 or 2:
+        //   `0` allows unsafe characters in arguments without escaping them (`%` and `!`).
+        //   `1` tries to escape them when possible (which can still break on some batch files).
+        //   `2` bans unsafe characters.
         // The escaping algorithm is explained in: https://holyblackcat.github.io/blog/2026/09/05/escaping-createprocess-arguments.html
         //   That also explains those two knobs in more details.
         // `out_command` is the resulting combined string, or null if we think none is needed.
         // `out_error` is set to error on failure.
-        // Returns true on success and false on failure. On success, `out_error` is left unchanged. On failure, `out_command` is left unmodified.
+        // Returns true on success and false on failure. On success, `out_error` is left unchanged. On failure, `out_command` may be unmodified.
         // If this function fails, it writes the error message to `out_error`.
         template <typename String, typename Char = typename StringToCharType<String>::type>
         [[nodiscard]] bool AssembleCommandLine(
             std::optional<String> &executable,
             std::size_t num_args,
             bool batch_prepend_cmd,
-            bool batch_extra_safety,
+            int batch_safety,
             std::optional<String> &out_command,
             std::string &out_error,
             auto &&get_arg)
@@ -353,229 +356,298 @@ namespace em::Proc
             };
 
             // 4. Check for a direct CMD invocation.
-            // Using `std::to_array()` stuff to be able to handle both wide and narrow strings.
-            bool is_cmd = EqualsCaseInsensitive(exe_name, {'c','m','d'}) || EqualsCaseInsensitive(exe_name, {'c','m','d','.','e','x','e'});
-
+            // Note `!executable`. We only want to check those if the name comes from `argv[0]`, since `executable` doesn't respect PATH and `cmd` and `cmd.exe` need that.
+            bool is_cmd = !executable && (EqualsCaseInsensitive(exe_name, {'c','m','d'}) || EqualsCaseInsensitive(exe_name, {'c','m','d','.','e','x','e'}));
 
             // 5. Check for batch.
             bool is_batch = EndsWithCaseInsensitive(exe_name, {'.','b','a','t'}) || EndsWithCaseInsensitive(exe_name, {'.','c','m','d'});
 
-            // 6. Batch/cmd argument validation.
-            if (is_cmd || is_batch)
+
+            bool seen_d = false;
+            std::optional<bool> flag_e;
+            std::optional<bool> flag_v;
+            bool seen_s = false;
+            bool seen_c_or_k = false;
+
+            // If the argument is bad, writes to `out_error` and returns true.
+            auto ArgContainsBadChars = [&](std::basic_string_view<Char> arg) -> bool
             {
-                static constexpr Char bad_chars_array[] = {'\n', '\r', '%', '!'};
-                // Reject `%` if `batch_extra_safety == true`.
-                // Reject `!` if `batch_extra_safety == true && batch_prepend_cmd == false`.
-                const std::basic_string_view bad_chars(bad_chars_array, batch_extra_safety ? (batch_prepend_cmd ? 3 : 4) : 2);
+                // This function only checks CMD and batch arguments.
+                if (!is_cmd && !is_batch)
+                    return false;
 
-                auto CheckString = [&](std::basic_string_view<Char> str) -> bool
+                // In CMD, this only kicks in after `/c`-or-`/k`.
+                if (is_cmd && !seen_c_or_k)
+                    return false;
+
+                Char bad_chars_array[4] = {'\n', '\r'};
+                std::size_t bad_chars_array_pos = 2;
+
+                // Populate `bad_chars_array`.
+                if (batch_safety > 0)
                 {
-                    if (auto pos = str.find_first_of(bad_chars); pos != std::size_t(-1))
-                    {
-                        // Note that this says "command" and not "argument", since we reject it in the batch filename too.
-                        out_error = "Bad character in cmd/batch command: ";
-                        char bad_char = char(str[pos]); // The cast to `char` here is fine, because all possible bad characters are hardcoded above and are narrow.
-                        if (bad_char == '\n')
-                        {
-                            out_error += "line break.";
-                        }
-                        else if (bad_char == '\r')
-                        {
-                            out_error += "carriage return.";
-                        }
-                        else
-                        {
-                            out_error += '`';
-                            out_error += bad_char;
-                            out_error += "`.";
-                        }
+                    // If `/v` is unknown or true.
+                    if (!flag_v && *flag_v)
+                        bad_chars_array[bad_chars_array_pos++] = '!';
 
-                        return false;
+                    // If `batch_safety >= 2`, or if `/e` is unknown or false.
+                    if (batch_safety >= 2 || (!flag_e && !*flag_e))
+                        bad_chars_array[bad_chars_array_pos++] = '%';
+                }
+
+                const std::basic_string_view bad_chars(bad_chars_array, bad_chars_array_pos);
+
+                if (auto pos = arg.find_first_of(bad_chars); pos != std::size_t(-1))
+                {
+                    // Note that this says "command" and not "argument", since this function applies to batch filenames too.
+                    out_error = "Bad character in cmd/batch command: ";
+                    char bad_char = char(arg[pos]); // The cast to `char` here is fine, because all possible bad characters are hardcoded above and are narrow.
+                    if (bad_char == '\n')
+                    {
+                        out_error += "line break.";
+                    }
+                    else if (bad_char == '\r')
+                    {
+                        out_error += "carriage return.";
+                    }
+                    else
+                    {
+                        out_error += '`';
+                        out_error += bad_char;
+                        out_error += "`.";
                     }
 
                     return true;
-                };
-
-                if (num_args == 0)
-                {
-                    if (!CheckString(GetExecutableView()))
-                        return false;
                 }
-                else
-                {
-                    for (std::size_t i = 0; i < num_args; i++)
-                    {
-                        if (!CheckString(GetArgView(i)))
-                            return false;
-                    }
-                }
-            }
 
-            // We shouldn't fail beyond this point.
-            // We also don't read `exe_name` beyond this point, it might get invalidated.
+                return false;
+            };
+
+            // 6. Batch/cmd name validation.
+            if (num_args == 0 && ArgContainsBadChars(GetExecutableView()))
+                return false;
+
+
+            // Don't read `exe_name` beyond this point, it might get invalidated.
 
             out_command = {};
 
             auto GetWritableOutCommand = [&]() -> auto &
             {
+                assert(out_command);
                 if constexpr (std::is_same_v<String, NativeString>)
                     return out_command->native;
                 else
                     return *out_command;
             };
 
-            bool seen_slash_d = false;
-            bool seen_slash_e = false;
-            bool seen_slash_v = false;
-            bool seen_slash_s = false;
-            bool seen_slash_c_or_k = false;
             bool need_separator_before_next_arg = false;
             bool is_first_arg = true;
             bool need_final_closing_quote = false; // If this is true, we need a `"` at the end of the command.
 
+            // This is in a lambda because we can update `executable` and `is_batch` below.
+            auto ShouldQuoteEntireCommand = [&]{return executable && num_args != 0 && is_batch;};
+
             // Appends a single argument to the output. Assumes `out_command` isn't null, ensure that before calling this.
-            auto WriteArgument = [&](std::basic_string_view<Char> arg)
+            // Returns true on failure, then you should exit this function too.
+            auto WriteArgument = [&](std::basic_string_view<Char> arg) -> bool
             {
                 auto &out = GetWritableOutCommand();
 
-                // Track special arguments.
-                bool this_arg_is_slash_c_or_k = false;
-                if (is_cmd && !is_first_arg && !seen_slash_c_or_k)
+                while (true)
                 {
-                    if (arg.starts_with('/'))
+                    // If this isn't empty at the end of the function, we replace `arg` with it, and do another iteration.
+                    // We use this to split `/cfoo` into `/c foo`.
+                    std::basic_string_view<Char> restart_with_arg;
+
+
+                    // 8.3.1. Does this argument need CMD-specific handling?
+                    bool arg_needs_cmd_handling = (is_cmd && seen_c_or_k) || is_batch;
+
+                    // 8.3.2. CMD-specific validation, if needed.
+                    // `ArgContainsBadChars()` embeds all the necessary conditions, so we can just call it.
+                    if (ArgContainsBadChars(arg))
+                        return true;
+
+                    // 8.3.3. Track special arguments.
+                    bool this_arg_is_c_or_k = false;
+                    if (is_cmd && !is_first_arg && !seen_c_or_k)
                     {
-                        auto remainder = arg.substr(1);
-                        if (StartsWithCaseInsensitive(remainder, {'c'}) || StartsWithCaseInsensitive(remainder, {'k'}))
-                        {
-                            seen_slash_c_or_k = true;
-                            this_arg_is_slash_c_or_k = true;
-                        }
-                        else if (batch_prepend_cmd) // Reuse this knob for this.
+                        if (arg.starts_with('/'))
                         {
                             // Note, using "starts with" for all arguments, and not checking `:` for arguments that take parameters. See the blog post for more details.
-                            if (StartsWithCaseInsensitive(remainder, {'d'}))
-                                seen_slash_d = true;
-                            else if (StartsWithCaseInsensitive(remainder, {'e'}))
-                                seen_slash_e = true;
-                            else if (StartsWithCaseInsensitive(remainder, {'v'}))
-                                seen_slash_v = true;
-                            else if (StartsWithCaseInsensitive(remainder, {'s'}))
-                                seen_slash_s = true;
+
+                            auto remainder = arg.substr(1);
+                            if (StartsWithCaseInsensitive(remainder, {'c'}) || StartsWithCaseInsensitive(remainder, {'k'}))
+                            {
+                                seen_c_or_k = true;
+                                this_arg_is_c_or_k = true;
+
+                                // If the result happens to be empty, `restart_with_arg` is ignored, which is exactly what we want.
+                                restart_with_arg = remainder.substr(1);
+
+                                // Trim the part after `/c`-or-`/k`, which is what went into `restart_with_arg`.
+                                arg = {arg.data(), 2};
+                            }
+                            else if (!seen_s && StartsWithCaseInsensitive(remainder, {'s'})) // This one is mandatory and is not guarded by `batch_prepend_cmd`.
+                            {
+                                seen_s = true;
+                            }
+                            // We care about this if we'd add our own `/d `if it's missing (`batch_prepend_cmd == true`).
+                            else if (batch_prepend_cmd && !seen_d && StartsWithCaseInsensitive(remainder, {'d'}))
+                            {
+                                seen_d = true;
+                            }
+                            // We care about this if we'd add our own `/e `if it's missing (`batch_prepend_cmd == true`), or if we're doing `%` escaping (`batch_safety == 1`, at `2` it's not allowed, and at `0` it's not escaped).
+                            else if ((batch_prepend_cmd || batch_safety == 1) && !flag_e && StartsWithCaseInsensitive(remainder, {'e'}))
+                            {
+                                // This weird check is exactly what CMD seems to be doing.
+                                remainder.remove_prefix(1);
+                                if (batch_safety <= 0)
+                                    flag_e = true; // Don't care about the value, just need to engage the optional.
+                                else
+                                    flag_e = !StartsWithCaseInsensitive(remainder, {':','o','f','f'});
+                            }
+                            // We care about this if we'd add our own `/v `if it's missing (`batch_prepend_cmd == true`), or if we're checking for `!` with special meaning in the arguments (`batch_safety >= 1`).
+                            else if ((batch_prepend_cmd || batch_safety >= 1) && !flag_v && StartsWithCaseInsensitive(remainder, {'v'}))
+                            {
+                                // This weird check is exactly what CMD seems to be doing.
+                                remainder.remove_prefix(1);
+                                if (batch_safety <= 0)
+                                    flag_v = true; // Don't care about the value, just need to engage the optional.
+                                else
+                                    flag_v = !StartsWithCaseInsensitive(remainder, {':','o','f','f'});
+                            }
                         }
                     }
-                }
 
-                // If this is `/c` or `/k`, insert the extra arguments before it if the user didn't provide them.
-                if (this_arg_is_slash_c_or_k && batch_prepend_cmd) // Reuse this knob for this.
-                {
-                    if (!seen_slash_d)
-                        out += std::basic_string_view(std::to_array<Char>({' ','/','d'}));
-                    if (!seen_slash_e)
-                        out += std::basic_string_view(std::to_array<Char>({' ','/','e',':','o','n'}));
-                    if (!seen_slash_v)
-                        out += std::basic_string_view(std::to_array<Char>({' ','/','v',':','o','f','f'}));
-                    if (!seen_slash_s)
-                        out += std::basic_string_view(std::to_array<Char>({' ','/','s'}));
-                }
-
-                // The separating space.
-                if (std::exchange(need_separator_before_next_arg, true))
-                    out += ' ';
-
-                // Should we quote this argument?
-                bool quote = false;
-                if (is_first_arg && !executable)
-                {
-                    quote = true;
-                }
-                else
-                {
-                    static constexpr Char quotable_chars_array[] = {' ','\t','"', /*batch only:*/ '<','>','&','|','(',')','[',']','{','}','^','=',';','%','!','\'','+','`','~'};
-                    const std::basic_string_view<Char> quotable_chars = is_cmd || is_batch ? quotable_chars_array : std::basic_string_view<Char>(quotable_chars_array, 3);
-
-                    if (arg.find_first_of(quotable_chars) != std::size_t(-1))
-                        quote = true;
-                }
-
-                // Opening quote.
-                if (quote)
-                    out += '"';
-
-                // Write the escaped contents.
-                std::size_t arg_size = arg.size();
-                for (std::size_t i = 0; i < arg_size; i++)
-                {
-                    Char ch = arg[i];
-
-                    if (ch == '"')
+                    // 8.3.4. If this is `/c` or `/k`, insert the extra arguments before it if the user didn't provide them.
+                    if (this_arg_is_c_or_k)
                     {
-                        if constexpr (std::is_same_v<Char, wchar_t>)
-                            out += L"\"\"";
-                        else
-                            out +=  "\"\"";
-                        continue;
-                    }
-
-                    if (ch == '%' && (is_cmd || is_batch) && !(!batch_prepend_cmd && !batch_extra_safety))
-                    {
-                        assert(batch_prepend_cmd && !batch_extra_safety); // We should reject it in all other cases.
-
-                        if constexpr (std::is_same_v<Char, wchar_t>)
-                            out += L"%%cd:~,%";
-                        else
-                            out +=  "%%cd:~,%";
-
-                        continue;
-                    }
-
-                    if (ch == '\\')
-                    {
-                        std::size_t num_backslashes = 1;
-                        while (i + 1 < arg_size && arg[i+1] == '\\')
+                        if (batch_prepend_cmd) // Reuse this knob for this.
                         {
-                            i++;
-                            num_backslashes++;
+                            if (!seen_d)
+                                out += std::basic_string_view(std::to_array<Char>({' ','/','d'}));
+                            if (!flag_e)
+                                out += std::basic_string_view(std::to_array<Char>({' ','/','e',':','o','n'}));
+                            if (!flag_v)
+                                out += std::basic_string_view(std::to_array<Char>({' ','/','v',':','o','f','f'}));
                         }
 
-                        // Is the next character is a quote? (Either natural or our own.)
-                        // Then double the amount of backslashes.
-                        if (i + 1 < arg_size ? arg[i+1] == '"' : quote)
-                            num_backslashes *= 2;
-
-                        for (std::size_t j = 0; j < num_backslashes; j++)
-                            out += '\\';
-
-                        continue;
+                        // This one is mandatory.
+                        if (!seen_s)
+                            out += std::basic_string_view(std::to_array<Char>({' ','/','s'}));
                     }
 
-                    out += ch;
+                    // 8.3.5. The separating space.
+                    if (std::exchange(need_separator_before_next_arg, true))
+                        out += ' ';
+
+                    // 8.3.6. Should we quote this argument?
+                    bool quote = false;
+                    if (is_first_arg && (!executable || ShouldQuoteEntireCommand()))
+                    {
+                        quote = true;
+                    }
+                    else
+                    {
+                        static constexpr Char quotable_chars_array[] = {' ','\t','"', /*batch only:*/ '<','>','&','|','(',')','[',']','{','}','^','=',';','%','!','\'','+','`','~'};
+                        const std::basic_string_view<Char> quotable_chars = arg_needs_cmd_handling ? quotable_chars_array : std::basic_string_view<Char>(quotable_chars_array, 3);
+
+                        if (arg.find_first_of(quotable_chars) != std::size_t(-1))
+                            quote = true;
+                    }
+
+                    // 8.3.7. Opening quote.
+                    if (quote)
+                        out += '"';
+
+                    // 8.3.8. Write the escaped contents.
+                    std::size_t arg_size = arg.size();
+                    for (std::size_t i = 0; i < arg_size; i++)
+                    {
+                        Char ch = arg[i];
+
+                        if (ch == '"')
+                        {
+                            if constexpr (std::is_same_v<Char, wchar_t>)
+                                out += L"\"\"";
+                            else
+                                out +=  "\"\"";
+                            continue;
+                        }
+
+                        assert(ch != '%' || batch_safety <= 1); // Should've rejected it at 2.
+                        // At `batch_safety == 0` we'll write `%` unescaped below.
+                        // Using `>=` instead of `==` here just in case. `2` should be unreachable.
+                        if (ch == '%' && batch_safety >= 1)
+                        {
+                            if constexpr (std::is_same_v<Char, wchar_t>)
+                                out += L"%%cd:~,%";
+                            else
+                                out +=  "%%cd:~,%";
+
+                            continue;
+                        }
+
+                        if (ch == '\\')
+                        {
+                            std::size_t num_backslashes = 1;
+                            while (i + 1 < arg_size && arg[i+1] == '\\')
+                            {
+                                i++;
+                                num_backslashes++;
+                            }
+
+                            // Is the next character is a quote? (Either natural or our own.)
+                            // Then double the amount of backslashes.
+                            if (i + 1 < arg_size ? arg[i+1] == '"' : quote)
+                                num_backslashes *= 2;
+
+                            for (std::size_t j = 0; j < num_backslashes; j++)
+                                out += '\\';
+
+                            continue;
+                        }
+
+                        out += ch;
+                    }
+
+                    // 8.3.9. Closing quote.
+                    if (quote)
+                        out += '"';
+
+                    // 8.3.10. Insert the opening quote after `/c` or `/k` if needed.
+                    if (this_arg_is_c_or_k)
+                    {
+                        need_separator_before_next_arg = false;
+                        need_final_closing_quote = true;
+                        out += ' ';
+                        out += '"';
+                    }
+
+                    is_first_arg = false;
+
+
+                    // Finally, do another iteration with a new argument if needed.
+                    if (restart_with_arg.empty())
+                        break;
+                    arg = restart_with_arg;
                 }
 
-                // Closing quote.
-                if (quote)
-                    out += '"';
-
-                // Insert the opening quote after `/c` or `/k` if needed.
-                if (this_arg_is_slash_c_or_k)
-                {
-                    need_separator_before_next_arg = false;
-                    need_final_closing_quote = true;
-                    out += ' ';
-                    out += '"';
-                }
-
-                is_first_arg = false;
+                return false;
             };
 
             // 7. Prepend CMD invocation to Batch files.
             if (batch_prepend_cmd && is_batch)
             {
                 // Just handroll all of those for speed.
-                seen_slash_d = true;
-                seen_slash_e = true;
-                seen_slash_v = true;
-                seen_slash_s = true;
-                seen_slash_c_or_k = true;
+                seen_d = true;
+                flag_e = true;
+                flag_v = false;
+                seen_s = true;
+                seen_c_or_k = true;
+
                 is_first_arg = false;
                 need_final_closing_quote = true;
 
@@ -598,12 +670,14 @@ namespace em::Proc
                 is_batch = false;
             }
 
+            // 8. Assemble the command:
+
             // If by this point `out_command` is still null, make it non-null if necessary.
             if (num_args != 0 && !out_command)
                 out_command.emplace();
 
-            // 8. Quote the entire command if needed.
-            if (executable && num_args != 0 && is_batch)
+            // 8.1. Quote the entire command if needed.
+            if (ShouldQuoteEntireCommand())
             {
                 GetWritableOutCommand() += '"';
 
@@ -611,11 +685,16 @@ namespace em::Proc
                 need_final_closing_quote = true;
             }
 
-            // 9. Actually write the arguments.
-            for (std::size_t i = 0; i < num_args; i++)
-                WriteArgument(GetArgView(i));
+            // 8.2. Needs no code.
 
-            // Lastly, close the CMD quote if needed.
+            // 8.3. Actually write the arguments.
+            for (std::size_t i = 0; i < num_args; i++)
+            {
+                if (WriteArgument(GetArgView(i)))
+                    return false;
+            }
+
+            // 8.4. Lastly, close the CMD quote if needed.
             if (need_final_closing_quote)
                 GetWritableOutCommand() += '"';
 
@@ -899,32 +978,38 @@ namespace em::Proc
             #endif
         }
 
-        // Defined unconditionally for simplicity. Because of that we don't suffix it `_Win`.
-        enum class CmdBatchMode
+        #ifdef _WIN32
+        // How to handle special symbols in CMD and batch arguments.
+        enum class CmdBatchSafety_Win
         {
-            // Will prepend `cmd ... /c` to batch files, and also append a bunch of basic flags to manual CMD invocations.
-            // Allows passing `!` to batch/cmd, but doesn't allow passing `%` to them, since it can't be reliably escaped.
-            // Those extra flags are needed mainly to override any registry settings that customize CMD behavior,
-            //   which is both convenient to the user and also allows reliable escaping of certain symbols (allows escaping `%`,
-            //   but that one is only allowed in `relaxed` but not here; and also disables `!` expanding env variables, which allows us to not reject it).
-            normal,
-            // Same as `normal`, but allows passing `%`, escaping it.
-            // Note that on certain batch files it can lead to arbitrary command execution.
-            // Try passing `%CMDCMDLINE:~-1%&calc.exe` as an argument to check if your batch file is affected.
+            // Always error on `%`, because while it's possible to escape, certain batch files still allow it to be misused even when escaped. (E.g. those that run nested `cmd /c ...` instances.)
+            // Only allow `!` if `/v:off` is specified, since otherwise `!` can have special behavior that can be unsafe. (`/v:on` would enable this unsafe behavior, and omitting it would take the default from the registry,
+            //   which defaults to off, but we don't check the registry and just don't allow `!` in that case).
+            // When `CommandExtras::cmd_batch_override_registry == true`, we add our own `/v:off`, making sure `!` is allowed by default.
+            safe,
+            // For `!`, same behavior as `safe`.
+            // For `%`, allow and escape it, but only if `/e:on` is specified, which is necessary for the escape to work. (`e:off` would break our escape mechanism. Omitting it would take the default from the registry,
+            //   which defaults to on, but we don't check the registry and just don't allow `%` in that case).
+            // If `/e:on` is not specified, will error on `%`.
+            // When `CommandExtras::cmd_batch_override_registry == true`, we add our own `/e:on`, making sure `%` is allowed by default.
             relaxed,
-            // Don't prepend `cmd ... /c` to batch files, and also don't append any flags to manual CMD invocations.
-            // Because with this we can no longer guarantee the behavior of `!` and of our escaping of `%` (used in `relaxed`),
-            //   this doesn't allow passing `%` nor `!`.
-            keep_registry_settings,
-            // Don't prepend `cmd ... /c` to batch files, and allow passing `%` (not escaped) and `!` anyway.
-            // This leads to arbitrary comamnd execution if the user controls arguments to your batch files.
+            // Allow both `%` and `!` unconditionally, and don't escape them.
             unsafe,
+
+            // Note, the numbering of those doens't match what `detail::AssembleCommandLine()` accepts, but I really want `safe` to have the value 0, to be the default value.
         };
+        #endif
 
         struct CommandExtras
         {
+            #ifdef _WIN32
+            // When running `cmd ... /c`, add some flags at `...` to ignore certain registry overrides, ensuring sane consistent behavior even if the user has something weird in the registry.
+            // Will also prepend `cmd ... /c` when running batch files to prepend the same flags.
+            bool cmd_batch_override_registry_win = true;
+
             // Defined unconditionally for simplicity. Because of that we don't suffix it `_win`.
-            CmdBatchMode cmd_batch_mode = CmdBatchMode::normal;
+            CmdBatchSafety_Win cmd_safety_win = CmdBatchSafety_Win::safe;
+            #endif
         };
 
         // Set the command to execute, and its arguments.
@@ -1234,8 +1319,8 @@ namespace em::Proc
                 ok = detail::AssembleCommandLine(
                     executable,
                     num_args,
-                    extras.cmd_batch_mode == CmdBatchMode::normal || extras.cmd_batch_mode == CmdBatchMode::relaxed,
-                    extras.cmd_batch_mode == CmdBatchMode::normal || extras.cmd_batch_mode == CmdBatchMode::keep_registry_settings,
+                    extras.cmd_batch_override_registry_win,
+                    extras.cmd_safety_win == CmdBatchSafety_Win::unsafe ? 0 : extras.cmd_safety_win == CmdBatchSafety_Win::relaxed ? 1 : 2,
                     out_command,
                     state.error,
                     decltype(get_arg)(get_arg)
