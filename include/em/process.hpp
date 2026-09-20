@@ -387,11 +387,11 @@ namespace em::Proc
                 if (batch_safety > 0)
                 {
                     // If `/v` is unknown or true.
-                    if (!flag_v && *flag_v)
+                    if (!flag_v || *flag_v)
                         bad_chars_array[bad_chars_array_pos++] = '!';
 
                     // If `batch_safety >= 2`, or if `/e` is unknown or false.
-                    if (batch_safety >= 2 || (!flag_e && !*flag_e))
+                    if (batch_safety >= 2 || (!flag_e || !*flag_e))
                         bad_chars_array[bad_chars_array_pos++] = '%';
                 }
 
@@ -422,11 +422,6 @@ namespace em::Proc
 
                 return false;
             };
-
-            // 6. Batch/cmd name validation.
-            if (num_args == 0 && ArgContainsBadChars(GetExecutableView()))
-                return false;
-
 
             // Don't read `exe_name` beyond this point, it might get invalidated.
 
@@ -528,10 +523,18 @@ namespace em::Proc
                         {
                             if (!seen_d)
                                 out += std::basic_string_view(std::to_array<Char>({' ','/','d'}));
+
                             if (!flag_e)
+                            {
                                 out += std::basic_string_view(std::to_array<Char>({' ','/','e',':','o','n'}));
+                                flag_e = true; // Note that `flag_e` is `std::optional<bool>`.
+                            }
+
                             if (!flag_v)
+                            {
                                 out += std::basic_string_view(std::to_array<Char>({' ','/','v',':','o','f','f'}));
+                                flag_v = false; // Note that `flag_v` is `std::optional<bool>`.
+                            }
                         }
 
                         // This one is mandatory.
@@ -545,14 +548,16 @@ namespace em::Proc
 
                     // 8.3.6. Should we quote this argument?
                     bool quote = false;
-                    if (is_first_arg && (!executable || ShouldQuoteEntireCommand()))
+                    if (arg.empty() || (is_first_arg && (!executable || ShouldQuoteEntireCommand())))
                     {
                         quote = true;
                     }
                     else
                     {
                         static constexpr Char quotable_chars_array[] = {' ','\t','"', /*batch only:*/ '<','>','&','|','(',')','[',']','{','}','^','=',';','%','!','\'','+','`','~'};
-                        const std::basic_string_view<Char> quotable_chars = arg_needs_cmd_handling ? quotable_chars_array : std::basic_string_view<Char>(quotable_chars_array, 3);
+                        // Need the `sizeof` here, or would have to add a null terminator.
+                        // I don't want to include neither `<iterator>` for `std::size` nor `<type_traits>` for `std::extent_v`, so I'll use the sizeof trick.
+                        const std::basic_string_view<Char> quotable_chars = arg_needs_cmd_handling ? std::basic_string_view<Char>(quotable_chars_array, sizeof quotable_chars_array / sizeof(Char)) : std::basic_string_view<Char>(quotable_chars_array, 3);
 
                         if (arg.find_first_of(quotable_chars) != std::size_t(-1))
                             quote = true;
@@ -577,17 +582,21 @@ namespace em::Proc
                             continue;
                         }
 
-                        assert(ch != '%' || batch_safety <= 1); // Should've rejected it at 2.
-                        // At `batch_safety == 0` we'll write `%` unescaped below.
-                        // Using `>=` instead of `==` here just in case. `2` should be unreachable.
-                        if (ch == '%' && batch_safety >= 1)
+                        // Escaping `%`.
+                        if ((is_cmd && seen_c_or_k) || is_batch)
                         {
-                            if constexpr (std::is_same_v<Char, wchar_t>)
-                                out += L"%%cd:~,%";
-                            else
-                                out +=  "%%cd:~,%";
+                            assert(ch != '%' || batch_safety <= 1); // Should've rejected it at 2.
+                            // At `batch_safety == 0` we'll write `%` unescaped below.
+                            // Using `>=` instead of `==` here just in case. `2` should be unreachable.
+                            if (ch == '%' && batch_safety >= 1)
+                            {
+                                if constexpr (std::is_same_v<Char, wchar_t>)
+                                    out += L"%%cd:~,%";
+                                else
+                                    out +=  "%%cd:~,%";
 
-                            continue;
+                                continue;
+                            }
                         }
 
                         if (ch == '\\')
@@ -638,7 +647,7 @@ namespace em::Proc
                 return false;
             };
 
-            // 7. Prepend CMD invocation to Batch files.
+            // 6. Prepend CMD invocation to Batch files.
             if (batch_prepend_cmd && is_batch)
             {
                 // Just handroll all of those for speed.
@@ -661,7 +670,10 @@ namespace em::Proc
                 // If we have no user-provided arguments, write the executable as an argument.
                 // I figured it's easier to use `WriteArgument()` here.
                 if (num_args == 0)
-                    WriteArgument(GetExecutableView());
+                {
+                    if (WriteArgument(GetExecutableView()))
+                        return false;
+                }
 
                 // Either way, reset `executable`.
                 executable = {};
@@ -669,6 +681,12 @@ namespace em::Proc
                 is_cmd = true;
                 is_batch = false;
             }
+
+            // 7. Batch/cmd name validation.
+            // The `&& executable` may look redundant, but we could've appended some extra arguments on step 6 (which don't count against `num_args`) and reset `executable`,
+            //   so it's possible that both `num_args == 0` and `!executable`.
+            if (num_args == 0 && executable && ArgContainsBadChars(GetExecutableView()))
+                return false;
 
             // 8. Assemble the command:
 
@@ -994,7 +1012,7 @@ namespace em::Proc
             // When `CommandExtras::cmd_batch_override_registry == true`, we add our own `/e:on`, making sure `%` is allowed by default.
             relaxed,
             // Allow both `%` and `!` unconditionally, and don't escape them.
-            unsafe,
+            unsafe_as_is,
 
             // Note, the numbering of those doens't match what `detail::AssembleCommandLine()` accepts, but I really want `safe` to have the value 0, to be the default value.
         };
@@ -1320,7 +1338,7 @@ namespace em::Proc
                     executable,
                     num_args,
                     extras.cmd_batch_override_registry_win,
-                    extras.cmd_safety_win == CmdBatchSafety_Win::unsafe ? 0 : extras.cmd_safety_win == CmdBatchSafety_Win::relaxed ? 1 : 2,
+                    extras.cmd_safety_win == CmdBatchSafety_Win::unsafe_as_is ? 0 : extras.cmd_safety_win == CmdBatchSafety_Win::relaxed ? 1 : 2,
                     out_command,
                     state.error,
                     decltype(get_arg)(get_arg)
