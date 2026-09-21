@@ -2,7 +2,6 @@
 
 #include <cassert>
 #include <functional>
-#include <initializer_list>
 #include <map>
 #include <optional>
 #include <string_view>
@@ -12,6 +11,7 @@
 #include <vector>
 
 #ifdef _WIN32
+#  include <initializer_list>
 #  include <type_traits>
 #  pragma push_macro("NOMINMAX")
 #  pragma push_macro("WIN32_LEAN_AND_MEAN")
@@ -28,6 +28,9 @@
 #  include <unistd.h>
 #  if __APPLE__
 #    include <crt_externs.h> // For `_NSGetEnviron()`.
+#  endif
+#  ifdef WCOREDUMP // Manual says to ifdef this: https://linux.die.net/man/2/waitpid
+#    define EM_PROC_CAN_DETECT_CORE_DUMPS // Let's leave this undefined instead of 0 if false.
 #  endif
 #endif
 
@@ -184,11 +187,17 @@ namespace em::Proc
         #else
         // Returns the stored string.
         // Never fails on POSIX, so if `success` is specified, always writes true to it. See the Windows comment for how this can fail on Windows.
-        [[nodiscard]] const std::string &get(bool *success = nullptr) const
+        [[nodiscard]] const std::string &get(bool *success = nullptr) const &
         {
             if (success)
                 *success = true;
             return native;
+        }
+        [[nodiscard]] std::string &&get(bool *success = nullptr) &&
+        {
+            if (success)
+                *success = true;
+            return std::move(native);
         }
         #endif
 
@@ -557,9 +566,8 @@ namespace em::Proc
                     else
                     {
                         static constexpr Char quotable_chars_array[] = {' ','\t','"', /*batch only:*/ '<','>','&','|','(',')','[',']','{','}','^','=',';','%','!','\'','+','`','~'};
-                        // Need the `sizeof` here, or would have to add a null terminator.
-                        // I don't want to include neither `<iterator>` for `std::size` nor `<type_traits>` for `std::extent_v`, so I'll use the sizeof trick.
-                        const std::basic_string_view<Char> quotable_chars = arg_needs_cmd_handling ? std::basic_string_view<Char>(quotable_chars_array, sizeof quotable_chars_array / sizeof(Char)) : std::basic_string_view<Char>(quotable_chars_array, 3);
+                        // Need to pass `std::extent_v<...>`, or would have to add a null terminator.
+                        const std::basic_string_view<Char> quotable_chars = arg_needs_cmd_handling ? std::basic_string_view<Char>(quotable_chars_array, std::extent_v<decltype(quotable_chars_array)>) : std::basic_string_view<Char>(quotable_chars_array, 3);
 
                         if (arg.find_first_of(quotable_chars) != std::size_t(-1))
                             quote = true;
@@ -867,7 +875,7 @@ namespace em::Proc
             {
                 std::string_view view = *e++;
                 // SDL silently ignores the missing `=`, so we do too. It shouldn't be normally possible.
-                // Even `putenv` is said to have a special case for the missing `=` on glibc, which causes it to unsert that variable: https://linux.die.net/man/3/putenv
+                // Even `putenv` is said to have a special case for the missing `=` on glibc, which causes it to unset that variable: https://linux.die.net/man/3/putenv
                 if (auto pos = view.find('='); pos != std::string_view::npos)
                 {
                     auto [iter, is_new] = ret.try_emplace(view.substr(0, pos));
@@ -923,7 +931,10 @@ namespace em::Proc
         struct Signal_Posix
         {
             int signal = 0;
-            bool core_dumped = false; // Do we have a core dump?
+
+            // Do we have a core dump? If `EM_PROC_CAN_DETECT_CORE_DUMPS` is not defined, this will always be false.
+            bool core_dumped = false;
+
             friend auto operator<=>(Signal_Posix, Signal_Posix) = default;
         };
 
@@ -1044,8 +1055,9 @@ namespace em::Proc
 
         // Set the command to execute, and its arguments.
         // If `executable` is specified, it replaces `argv[0]` as the program to execute. The original `argv[0]` is then only passed to the program's `main`.
+        // On POSIX, this has no special effects, other than making the executable and `argv[0]` different.
         // On Windows, specifying `executable` ignores `PATH` and disables the implicit `.exe` extension, and instead either uses the exact path,
-        //   or searches the current directory. (`argv[0]` also searches in the current directory on Windows.)
+        //   or searches the current directory (`argv[0]` also searches in the current directory on Windows). Also if you pass `\foo\bar.exe`, it searches the current drive.
         // Also on Windows `executable` allows passing overly long executable names. (Those must be prefixed with `\\?\` and canonicalized to use `\` instead of `/`,
         //   don't use multiple adjacent `\`, don't use `.` or `..` directory names, etc. But they remain case-insensitive.)
         std::optional<NativeString> executable;
@@ -1064,7 +1076,7 @@ namespace em::Proc
             state.cmd_argv_ptrs_storage.back() = nullptr; // Zero explicitly in case the vector wasn't empty before.
             state.cmd_argv = state.cmd_argv_ptrs_storage.data();
 
-            state.exe_path = std::move(extras.executable);
+            state.exe_path = std::move(executable);
             #endif
             return *this;
         }
@@ -1078,11 +1090,13 @@ namespace em::Proc
             #ifdef _WIN32
             detail_SetCommand_Win(executable, extras, detail::PtrArraySize(argv), [&](std::size_t i) {return argv[i];});
             #else
+            (void)extras;
+
             state.cmd_argv_storage.clear();
             state.cmd_argv_ptrs_storage.clear();
             state.cmd_argv = argv;
 
-            state.exe_path = std::move(extras.executable);
+            state.exe_path = std::move(executable);
             #endif
 
             return *this;
@@ -1724,9 +1738,10 @@ namespace em::Proc
             if (WIFSIGNALED(status))
             {
                 state.exit_reason = Proc::ExitReason(Proc::ExitReason::Signal_Posix{
-                    WTERMSIG(status),
-                    #ifdef WCOREDUMP // Manual says to ifdef this: https://linux.die.net/man/2/waitpid
-                    bool(WCOREDUMP(status))
+                    WTERMSIG(status)
+                    #ifdef EM_PROC_CAN_DETECT_CORE_DUMPS
+                    // I know that trailing commas are ignored. Want to do it this way.
+                    , bool(WCOREDUMP(status))
                     #endif
                 });
                 return;
