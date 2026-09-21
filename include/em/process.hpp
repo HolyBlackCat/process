@@ -164,7 +164,9 @@ namespace em::Proc
         [[nodiscard]] NativeString(std::wstring_view value) : native(value) {}
         [[nodiscard]] NativeString(const wchar_t *value) : native(value) {}
         #else
-        // See the Windows version for what `success` does.
+        // Set the string value.
+        // On POSIX those never fail. If `success` is specified, writes `true` to it.
+        // See the comments on the Windows version fow how it can fail there.
         [[nodiscard]] NativeString(std::string value, bool *success = nullptr)      : native(std::move(value)) {if (success) *success = true;}
         [[nodiscard]] NativeString(std::string_view value, bool *success = nullptr) : native(value)            {if (success) *success = true;}
         [[nodiscard]] NativeString(const char *value, bool *success = nullptr)      : native(value)            {if (success) *success = true;}
@@ -191,7 +193,7 @@ namespace em::Proc
         #endif
 
         // Compare with itself.
-        // Fun fact: having custom `==`s below forces us to explicitly default this `==`. Defaulting the `<=>` is no longer enough because of those other `==`s.
+        // Fun fact: having custom `==`s below forces us to explicitly default this `==`. Defaulting the `<=>` alone is no longer enough because of those other `==`s.
         friend bool                 operator== (const NativeString &, const NativeString &) = default;
         friend std::strong_ordering operator<=>(const NativeString &, const NativeString &) = default;
 
@@ -731,6 +733,15 @@ namespace em::Proc
             std::basic_string<Char> ret;
             while (*env)
             {
+                if (!**env)
+                {
+                    // If the string is empty, it would normally cause the rest of the strings to be ignored, since `\0\0` is the terminator.
+                    // Instead we manually discard it here.
+                    assert(false && "Empty string in an environment array.");
+                    env++;
+                    continue;
+                }
+
                 ret += *env++;
                 ret += '\0'; // Intentional even after the last element. We want `\0\0` at the end.
             }
@@ -800,6 +811,7 @@ namespace em::Proc
             #ifdef __APPLE__
             // Use `*_NSGetEnviron()` instead of `environ`.
             // `environ` does kinda work on Macs, but `man environ` on Macs says that it doesn't work in shared libraries and in bundles (whatever those are), but this function works.
+            // SDL uses this too.
             return *_NSGetEnviron();
             #else
             return environ;
