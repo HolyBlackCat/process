@@ -1,14 +1,16 @@
-* POSIX: Temporarily disable signals when vforking
-* POSIX: use `posix_spawnattr_setsigdefault` and `posix_spawnattr_setsigmask` to reset signal handling in child to the default. SDL doesn't do that, but reproc does something similar (but without spawn). I guess we should do it.
-* POSIX: close all FDs in the child, like SDL does. Reproc does this too.
 
-* Document that on Windows, specifying a custom executable path disables PATH and PATHEXT search
-* Document the batch escaping safety issues on windows.
+* POSIX: close all FDs in the child, like SDL does. Reproc does this too. Behind a knob.
 
 
 Maybe later:
 
 * Test what happens if parent dies before child on Windows and on POSIX. Do we need to configure that?
+
+* A knob to reset signal handlers in the child?
+
+  It's not a problem, since the custom handlers are reset to default on spawn, but how each signal is handled (ignored or not, etc?) is not reset.
+
+  It seems we should use `posix_spawnattr_setsigdefault` for this.
 
 * Polling.
 

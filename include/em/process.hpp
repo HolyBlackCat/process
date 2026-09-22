@@ -985,6 +985,7 @@ namespace em::Proc
             #ifndef _WIN32
             // Those are dirt cheap to initialize, so no separate constructor.
 
+            // Construct spawn attributes.
             if (int spawn_res = posix_spawnattr_init(&state.spawn_attr))
             {
                 // No useful messages for us to emit here, so just write the number.
@@ -994,6 +995,34 @@ namespace em::Proc
             }
             state.spawn_attr_alive = true;
 
+            { // Configure the signal mask for `POSIX_SPAWN_SETSIGMASK` below. See that for details.
+                sigset_t new_sigmask{};
+                if (sigemptyset(&new_sigmask))
+                {
+                    state.error = std::string("`sigemptyset` failed: ") + std::strerror(errno);
+                    return;
+                }
+
+                // This seems to perform a deep copy, at least in glibc.
+                if (int error = posix_spawnattr_setsigmask(&state.spawn_attr, &new_sigmask))
+                {
+                    state.error = std::string("`posix_spawnattr_setsigmask` failed: ") + std::strerror(error);
+                    return;
+                }
+
+            }
+
+            // Set flags.
+            // `POSIX_SPAWN_SETSIGMASK` uses the mask we set with `posix_spawnattr_setsigmask` above.
+            //   We need this for two reasons. Firstly, general sanity. Secondly, for background processes we temporarily disable signals before forking, and this restores them.
+            // `POSIX_SPAWN_SETSIGDEF` resets the signal handling modes to the default values. Note that custom handlers seem to be detached automatically even without this.
+            if (int error = posix_spawnattr_setflags(&state.spawn_attr, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF))
+            {
+                state.error = std::string("`posix_spawnattr_setflags` failed: ") + std::strerror(error);
+                return;
+            }
+
+            // Construct spawn file actions.
             if (int spawn_res = posix_spawn_file_actions_init(&state.spawn_fa))
             {
                 // No useful messages for us to emit here, so just write the number.
@@ -1571,7 +1600,6 @@ namespace em::Proc
                 return;
             }
 
-            // This is almost directly copied from SDL:
 
             // Note the `const_cast` here and on `argv` below. It's needed because the POSIX API takes `char *const *` instead of `const char *const *`, because the C pointer conversion rules are more strict than the C++ ones,
             //   and they figured it would be more convenient. They don't actually modify those strings.
@@ -1580,6 +1608,72 @@ namespace em::Proc
 
             if (params.state.background)
             {
+                // This is similar to what SDL does. Except they don't block signals.
+
+                // First, temporarily disable signals so their handlers don't run in the forked process. Would be especially weird with `vfork()`.
+                struct SignalGuard
+                {
+                    bool error = false;
+                    Process *self;
+
+                    sigset_t old_sigmask{};
+                    sigset_t new_sigmask{};
+
+                    SignalGuard(Process &new_self)
+                        : self(&new_self)
+                    {
+                        // Set the new mask to all ones.
+                        if (sigfillset(&new_sigmask))
+                        {
+                            // The manual doesn't say that it can write to `errno`, so just in case I'm not checking it. Shouldn't fail anyway.
+                            self->state.error = std::string("`sigfillset` failed: ") + std::strerror(errno);
+                            error = true;
+                            return;
+                        }
+
+                        // Disable all signals. (Enabled bits in the mask mean disabled signals.)
+
+                        // In theory, this is a thread-safe version of `sigprocmask()`. In practice on glibc they seem to do the exact same thing, so we could use either one.
+                        // `pthread_sigmask()` looks more correct to me, but if it causes portability issues, we could replace it with `sigprocmask()`.
+                        // It seems this works fine even without `-pthread`, on glibc at least.
+                        // NOTE: Their API is slightly different. `pthread_sigmask()` returns the error code on failure, while `sigprocmask()` returns -1 on failure and writes to `errno`.
+                        if (int sigmask_status = pthread_sigmask(SIG_SETMASK, &new_sigmask, &old_sigmask); sigmask_status < 0)
+                        {
+                            // The manual doesn't say that it can write to `errno`, so just in case I'm not checking it. Shouldn't fail anyway.
+                            self->state.error = std::string("`pthread_sigmask` failed to disable signals before forking: ") + std::strerror(sigmask_status);
+                            error = true;
+                            return;
+                        }
+                    }
+
+                    SignalGuard(const SignalGuard &) = delete;
+                    SignalGuard &operator=(const SignalGuard &) = delete;
+
+                    void Finish() noexcept
+                    {
+                        if (!self)
+                            return;
+
+                        if (int sigmask_status = pthread_sigmask(SIG_SETMASK, &old_sigmask, nullptr); sigmask_status < 0)
+                        {
+                            // The manual doesn't say that it can write to `errno`, so just in case I'm not checking it. Shouldn't fail anyway.
+                            self->state.error = std::string("`pthread_sigmask` failed to restore signals after forking: ") + std::strerror(sigmask_status);
+                            error = true;
+                            return;
+                        }
+
+                        self = nullptr;
+                    }
+
+                    ~SignalGuard()
+                    {
+                        Finish();
+                    }
+                };
+                SignalGuard signal_guard(*this);
+                if (signal_guard.error)
+                    return;
+
                 #ifdef __APPLE__ // SDL says:  Apple has vfork marked as deprecated and (as of macOS 10.12) is almost identical to calling fork() anyhow.
                 const pid_t pid = fork();
                 const char *forkname = "fork";
@@ -1612,12 +1706,16 @@ namespace em::Proc
                     // Note the `const_cast` here and on `env_ptr` above. It's needed because the POSIX API takes `char *const *` instead of `const char *const *`, because the C pointer conversion rules are more strict than the C++ ones,
                     //   and they figured it would be more convenient. They don't actually modify those strings.
 
-                    if (int error = posix_spawnp(&state.pid, exe_path, &params.state.spawn_fa, &params.state.spawn_attr, const_cast<char **>(params.state.cmd_argv), env_ptr))
-                        _exit(error);
-                    else
-                        _exit(0);
+                    // It's technically undefined `posix_spawnp()` in `vfork()` (it's not in the list of allowed functions), but SDL does it anyway, and it seems to be fine in practice.
+
+                    // `posix_spawnp` returns 0 on success, or error code on failure.
+                    _exit(posix_spawnp(&state.pid, exe_path, &params.state.spawn_fa, &params.state.spawn_attr, const_cast<char **>(params.state.cmd_argv), env_ptr));
 
                   default:
+                    // Firstly, allow signals again.
+                    // Don't check `signal_guard.error` here though! I don't want to leak the process handle because of it.
+                    signal_guard.Finish();
+
                     // Check the exit code of the direct child process. Also must call it to clean it up, otherwise it remains as a zombie.
                     // Note `pid` here, not `state.pid`.
                     // `waitpid` can wait for some other things than process termination, but it seems all of that is opt-in via the flags parameter, and by default it only waits for termination.
@@ -1627,6 +1725,8 @@ namespace em::Proc
                         state.error = std::string("`waitpid` failed: ") + std::strerror(errno);
                         return;
                     }
+
+                    // Analyze the exit status of the child.
                     if (WIFEXITED(status)) // Did the process exit normally? Regardless of the exit code.
                     {
                         if (int exit_code = WEXITSTATUS(status))
@@ -1639,7 +1739,14 @@ namespace em::Proc
                     else
                     {
                         state.error = "Forked process exited abnormally. Status integer: " + std::to_string(status);
+                        return;
                     }
+
+                    // Lastly, check `signal_guard` for errors.
+                    // Do this after cleaning up the child process handle.
+                    if (signal_guard.error)
+                        return;
+
                     break;
                 }
             }
