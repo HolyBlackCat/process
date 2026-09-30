@@ -1,51 +1,64 @@
 #pragma once
 
 #include <cassert>
+#include <cstddef>
 #include <functional>
 #include <map>
 #include <optional>
+#include <span>
 #include <string_view>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
 
 #ifdef _WIN32
-#  include <initializer_list>
-#  include <type_traits>
-#  pragma push_macro("NOMINMAX")
-#  pragma push_macro("WIN32_LEAN_AND_MEAN")
-#  define NOMINMAX
-#  define WIN32_LEAN_AND_MEAN
-#  include <windows.h>
-#  pragma pop_macro("NOMINMAX")
-#  pragma pop_macro("WIN32_LEAN_AND_MEAN")
+
+#include <initializer_list>
+
+#pragma push_macro("NOMINMAX")
+#pragma push_macro("WIN32_LEAN_AND_MEAN")
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#pragma pop_macro("NOMINMAX")
+#pragma pop_macro("WIN32_LEAN_AND_MEAN")
+
 #else
-#  include <cstring> // For `std::strerror()`.
-#  include <spawn.h>
-#  include <sys/types.h> // For `pid_t`.
-#  include <sys/wait.h> // For `waitpid()`.
-#  include <unistd.h>
-#  if __APPLE__
-#    include <crt_externs.h> // For `_NSGetEnviron()`.
-#  endif
+
+#include <cstring> // For `std::strerror()`.
+#include <fcntl.h> // For `fcntl()`.
+#include <spawn.h> // For `posix_spawn()` and friends.
+#include <sys/types.h> // For `pid_t`.
+#include <sys/wait.h> // For `waitpid()`.
+#include <unistd.h>
+
+#if __APPLE__
+#  include <crt_externs.h> // For `_NSGetEnviron()`.
+#endif
+
+#ifndef EM_PROC_CAN_DETECT_CORE_DUMPS
 #  ifdef WCOREDUMP // Manual says to ifdef this: https://linux.die.net/man/2/waitpid
-#    define EM_PROC_CAN_DETECT_CORE_DUMPS // Let's leave this undefined instead of 0 if false.
+#    define EM_PROC_CAN_DETECT_CORE_DUMPS 1
+#  else
+#    define EM_PROC_CAN_DETECT_CORE_DUMPS 0
 #  endif
 #endif
 
-// Changes here relative to SDL:
-// * Better error reporting from starting background processes. See: https://github.com/libsdl-org/SDL/issues/16188
-// * Use return values instead of `errno` in a few places. But it seems in glibc those functions do set errno, even though it's not documented in the manual, so I'm not sure this ever matters.
-// * Don't bother with android-specific code to obtain extra env variables from the application manifest, whatever that is.
-// * Refuse to use `kill(pid, 0)` to wait for background processes. Since PIDs can be recycled, this seems unreliable.
-// * Added "have core dump" check when a process stops due to a signal.
-// * On Windows, the `CREATE_NO_WINDOW` flag that disables console allocation is not implied by process background-ness. It doesn't seem terribly useful, and we expose the flags directly on Windows.
+// Do we have `pipe2()`? If this is false, fall back to `pipe()`.
+// On Macs this is available starting from MacOS 27 (https://github.com/curl/curl/issues/21236), and I think it was exported from the libraries a bit earlier too.
+// I don't feel like figuring out the correct check for Macs, and the fallback works fine either way.
+// At least on Linux, if `_GNU_SOURCE` is not defined, the function disappears. It's defined by default.
+#ifndef EM_PROC_HAVE_PIPE2
+#  if defined(__linux__) && defined(_GNU_SOURCE)
+#    define EM_PROC_HAVE_PIPE2 1
+#  else
+#    define EM_PROC_HAVE_PIPE2 0
+#  endif
+#endif
 
-// Differences to reproc:
-// * We don't try to use sockets as pipes as reproc does on Windows. Seems hacky, and they have several suspicious bug reports that look like they could be caused by those, that they didn't respond to.
-//   They did that to support polling (so checking which pipes are ready without actually reading/writing to them), but we can use IO completion ports instead. Those seem to force you to queue an operation,
-//     instead of just reporting the pipe status (like polling does on Linux), so the API has to be designed around it.
+#endif
 
 #ifdef _WIN32
 // Usage: `EM_PROC_NATIVE("blah")`.
@@ -57,6 +70,29 @@
 #define EM_PROC_NATIVE(x) "" x ""
 #endif
 
+// Some user-facing OS macros if you prefer.
+#ifdef _WIN32
+#define EM_PROC_PLATFORM_WIN 1
+#define EM_PROC_PLATFORM_POSIX 0
+#else
+#define EM_PROC_PLATFORM_WIN 0
+#define EM_PROC_PLATFORM_POSIX 1
+#endif
+
+// Changes here relative to SDL:
+// * Better error reporting from starting background processes. See: https://github.com/libsdl-org/SDL/issues/16188
+// * Use return values instead of `errno` in a few places. But it seems in glibc those functions do set errno, even though it's not documented in the manual, so I'm not sure this ever matters.
+// * Don't bother with android-specific code to obtain extra env variables from the application manifest, whatever that is.
+// * Refuse to use `kill(pid, 0)` to wait for background processes. Since PIDs can be recycled, this seems unreliable.
+// * Added "have core dump" check when a process stops due to a signal.
+// * On Windows, the `CREATE_NO_WINDOW` flag that disables console allocation is not implied by process background-ness. It doesn't seem terribly useful, and we expose the flags directly on Windows.
+// * Use `pipe2()` instead of `pipe()` when possible.
+
+// Differences to reproc:
+// * We don't try to use sockets as pipes as reproc does on Windows. Seems hacky, and they have several suspicious bug reports that look like they could be caused by those, that they didn't respond to.
+//   They did that to support polling (so checking which pipes are ready without actually reading/writing to them), but we can use IO completion ports instead. Those seem to force you to queue an operation,
+//     instead of just reporting the pipe status (like polling does on Linux), so the API has to be designed around it.
+
 namespace em::Proc
 {
     #ifdef _WIN32
@@ -65,7 +101,7 @@ namespace em::Proc
     using NativeChar = char;
     #endif
 
-    // This is always some integer type.
+    // Process ID type. This is always some integer type.
     #ifdef _WIN32
     using Pid = DWORD;
     #else
@@ -108,7 +144,7 @@ namespace em::Proc
         if (expected_size == 0)
         {
             // If `!success`, this shouldn't be possible. Then assert.
-            assert(success && "`MultiByteToWideChar` failed when calculating the buffer size.");
+            assert(success && "`MultiByteToWideChar()` failed when calculating the buffer size.");
 
             if (success)
                 *success = false;
@@ -121,7 +157,7 @@ namespace em::Proc
         if (actual_size == 0)
         {
             // If `!success`, this shouldn't be possible. Then assert.
-            assert(success && "`MultiByteToWideChar` failed when encoding.");
+            assert(success && "`MultiByteToWideChar()` failed when encoding.");
 
             ret.clear(); // Avoid returning half-baked string.
 
@@ -215,6 +251,334 @@ namespace em::Proc
 
         friend bool                 operator== (const NativeString &a, const NativeChar *b) {return a.native == b;}
         friend std::strong_ordering operator<=>(const NativeString &a, const NativeChar *b) {return a.native <=> b;}
+    };
+
+    // Some tags for `BasicIoStream`, mostly for internal use.
+
+    struct TagTakeOwnership {explicit TagTakeOwnership() = default;};
+    static constexpr TagTakeOwnership take_ownership;
+    struct TagNonOwning {explicit TagNonOwning() = default;};
+    static constexpr TagNonOwning non_owning;
+    struct TagErrorMessage {explicit TagErrorMessage() = default;};
+    static constexpr TagErrorMessage error_message;
+
+    // A base class for files, pipes, etc.
+    class BasicIoStream
+    {
+      public:
+        #ifdef _WIN32
+        using handle_t = HANDLE;
+        // There's some weirdness with what counts as a valid handle. `INVALID_HANDLE_VALUE` is basically `(HANDLE)-1`, but `nullptr` also seems to be invalid. Using `INVALID_HANDLE_VALUE` seems better to me.
+        // Also this can't be constexpr! D:<
+        inline static const handle_t invalid_handle = INVALID_HANDLE_VALUE;
+        #else
+        using handle_t = int;
+        static constexpr handle_t invalid_handle = 0;
+        #endif
+
+      private:
+        struct State
+        {
+            handle_t handle = invalid_handle;
+            bool owns_handle = false;
+
+            std::string error;
+        };
+        State state;
+
+      public:
+        [[nodiscard]] constexpr BasicIoStream() {}
+
+        // Takes ownership of an existing handle. Mainly for internal use.
+        [[nodiscard]] BasicIoStream(TagTakeOwnership, handle_t handle)
+        {
+            state.handle = handle;
+            state.owns_handle = true;
+        }
+
+        // Stores an existing handle without taking ownership. Rarely useful.
+        [[nodiscard]] BasicIoStream(TagNonOwning, handle_t handle)
+        {
+            state.handle = handle;
+            state.owns_handle = false;
+        }
+
+        // Stores an error message. Mainly for internal use.
+        [[nodiscard]] BasicIoStream(TagErrorMessage, std::string message)
+        {
+            state.error = std::move(message);
+        }
+
+        [[nodiscard]] BasicIoStream(BasicIoStream &&other) noexcept : state(std::move(other.state)) {other.state = {};}
+        BasicIoStream &operator=(BasicIoStream &&other) noexcept {BasicIoStream copy = std::move(other); std::swap(state, copy.state); return *this;} // Can't use by-value parameter because of the protected dtor. Ugh.
+
+      protected:
+        ~BasicIoStream()
+        {
+            if (state.owns_handle)
+            {
+                #ifdef _WIN32
+                [[maybe_unused]] bool ok = CloseHandle(state.handle);
+                assert(ok);
+                #else
+                [[maybe_unused]] bool ok = close(state.handle);
+                assert(ok);
+                #endif
+            }
+        }
+
+      public:
+        [[nodiscard]] explicit operator bool() const
+        {
+            return state.handle != invalid_handle;
+        }
+
+        // If this instance is null, writes a error message nothing this fact in `ErrorMessage()` and returns true.
+        // If not null, returns false.
+        // Mainly for internal use.
+        [[nodiscard]] bool ErrorIfNull()
+        {
+            if (!*this)
+            {
+                if (!HasError()) // Don't clobber the existing error, if any.
+                    state.error = "This IO stream instance is null.";
+                return true;
+            }
+            return false;
+        }
+
+        [[nodiscard]] handle_t Handle() const {return state.handle;}
+        [[nodiscard]] bool IsOwning() const {return state.owns_handle;}
+
+        [[nodiscard]] bool HasError() const {return !state.error.empty();}
+        [[nodiscard]] const std::string &ErrorMessage() const {return state.error;}
+
+        // Returns the current handle, and then releases ownership of it, if any, and resets this instance to null.
+        // It's then your job to free it.
+        [[nodiscard]] handle_t ReleaseHandle_Unsafe() &&
+        {
+            state.owns_handle = false;
+            return std::exchange(state.handle, invalid_handle);
+        }
+    };
+
+    // Explains the result of a read or write operation.
+    enum class IoResult
+    {
+        ok, // Read or wrote something. You can try sending more data immediately.
+        retry_later, // Can't read or write right now, try again later.
+        end_of_input, // Nothing more to read. For a pipe, this means the remote end is closed. For a file, this is EOF. Can only appear on read.
+        no_data, // You passed zero bytes, nothing to do.
+        error, // Something broke,
+    };
+
+    [[nodiscard]] inline const char *to_string(IoResult result)
+    {
+        switch (result)
+        {
+            case IoResult::ok:           return "ok";
+            case IoResult::retry_later:  return "retry_later";
+            case IoResult::end_of_input: return "end_of_input";
+            case IoResult::no_data:      return "no_data";
+            case IoResult::error:        return "error";
+        }
+        assert(false && "Invalid enum.");
+        return "??";
+    }
+
+    // A base class for non-async IO streams.
+    class BasicSyncIoStream : public BasicIoStream
+    {
+      public:
+        using BasicIoStream::BasicIoStream;
+
+        BasicSyncIoStream(BasicSyncIoStream &&) = default;
+        BasicSyncIoStream &operator=(BasicSyncIoStream &&) = default;
+
+      protected:
+        ~BasicSyncIoStream() = default;
+
+      public:
+        // NOTE: Don't call this on ends of pipes that you'll pass to child processes. You should only call this on the ends of pipes that you'll use yourself.
+        // Set whether this stream is blocking. I.e. when there is nothing more to read or write, should the read/write call block until it can continue, or return immediately.
+        // Defaults to true.
+        // Returns true on success, false on failure. On failure, resets this instance to null and stores the error on it, call `ErrorMessage()` to get it.
+        bool SetBlocking(bool is_blocking)
+        {
+            if (ErrorIfNull())
+                return false;
+
+            // Note `F_{GET,SET}FL`, as opposed to `F_{GET,SET}FD`, which is a different thing.
+
+            // Read existing flags.
+            int flags = fcntl(Handle(), F_GETFL);
+            if (flags == -1)
+            {
+                *this = {error_message, std::string("`fcntl(F_GETFL)` failed: ") + std::strerror(errno)};
+                return false;
+            }
+
+            if (is_blocking)
+                flags &= ~O_NONBLOCK;
+            else
+                flags |= O_NONBLOCK;
+
+            // Write flags.
+            if (fcntl(Handle(), F_SETFL, flags))
+            {
+                *this = {error_message, std::string("`fcntl(F_SETFL)` failed: ") + std::strerror(errno)};
+                return false;
+            }
+
+            return true;
+        }
+
+      protected:
+        // Perform a read or write.
+        // `out_result` is optional.
+        // Returns true when the result is `IoResult::ok` (regardless of `out_result` being specified or not).
+        // On failure, resets the handle to null so you don't miss the error.
+        template <bool Read>
+        bool ReadOrWriteUnbuffered(std::conditional_t<Read, std::span<unsigned char>, std::span<const unsigned char>> data, std::size_t &pos, IoResult *out_result)
+        {
+            if (ErrorIfNull())
+            {
+                if (out_result)
+                    *out_result = IoResult::error;
+                return false;
+            }
+
+            // Note that `pos == data.size()` is a valid no-op, but `pos > data.size()` is an assert (and a no-op in release builds).
+            assert(pos <= data.size());
+            if (pos >= data.size())
+            {
+                if (out_result)
+                    *out_result = IoResult::no_data;
+                return false;
+            }
+
+            std::size_t remaining_size = data.size() - pos;
+
+            auto result = [&]{
+                if constexpr (Read)
+                    return read(Handle(), data.data() + pos, remaining_size);
+                else
+                    return write(Handle(), data.data() + pos, remaining_size);
+            }();
+
+            int errno_copy = 0;
+            if (result < 0)
+                errno_copy = errno;
+
+            // Just in case, protect against `write()` returning zero. This should never happen.
+            if constexpr (!Read)
+            {
+                if (result == 0)
+                {
+                    assert(false && "`write()` somehow returned zero."); // `write()` should never return zero, hmm. Only `read()` can return it, which indicates EOF.
+
+                    // Fix up the results.
+                    result = -1;
+                    errno_copy = EAGAIN;
+                }
+            }
+
+            // Error or retry later.
+            if (result < 0)
+            {
+                // Need to retry later?
+                if (
+                    errno_copy == EAGAIN
+                    #if EAGAIN != EWOULDBLOCK // It's unspecified if they're equal or not. `#if` just in case, to silence possible warnings.
+                    || errno_copy == EWOULDBLOCK
+                    #endif
+                )
+                {
+                    if (out_result)
+                        *out_result = IoResult::retry_later;
+                    return false;
+                }
+
+                // Surely an error at this point.
+                *this = {error_message, std::string(Read ? "`read()` failed: " : "`write()` failed: ") + std::strerror(errno_copy)};
+                if (out_result)
+                    *out_result = IoResult::error;
+                return false;
+            }
+
+            // EOF.
+            // We already ensured earlier that this is only possible if `Read == true`.
+            if (result == 0)
+            {
+                if (out_result)
+                    *out_result = IoResult::end_of_input;
+                return false;
+            }
+
+            // Success.
+            // `result` is always positive at this point.
+            assert(std::size_t(result) <= remaining_size);
+            pos += std::size_t(result);
+
+            if (out_result)
+                *out_result = IoResult::ok;
+            return true;
+        }
+    };
+
+    // An input stream. Normally either the read end of a pipe, or a file opened for reading.
+    class InputStream : public BasicSyncIoStream
+    {
+        using BasicSyncIoStream::BasicSyncIoStream;
+
+        // Tries to read some data, without any buffering.
+        // You should probably set `pos` to zero initially.
+        // Tries to fill `data` starting from `pos` and until the end. Increases `pos` to indicate how many bytes we were able to get.
+        // If `out_result` is specified, writes status to it:
+        // * `ok`           - Success. `pos` got increased.
+        // * `retry_later`  - No data yet, try again later. This is only possible if you called `SetBlocking(false)` before.
+        // * `end_of_input` - No more data. For pipes, this means the remote end got closed. For files, this is EOF.
+        // * `no_data`      - You passed `pos == data.size()`, nothing to do.
+        // * `error`        - Something went wrong. This instance becomes null, so you don't miss it. Call `ErrorMessage()` for the error message.
+        // Returns true if the status is `ok` (regardless of `out_result` being null).
+        // You can call this in a loop while it returns true if you prefer.
+        bool ReadUnbuffered(std::span<unsigned char> data, std::size_t &pos, IoResult *out_result = nullptr)
+        {
+            return ReadOrWriteUnbuffered<true>(data, pos, out_result);
+        }
+    };
+
+    // An output stream. Normally either the write end of a pipe, or a file opened for writing.
+    class OutputStream : public BasicSyncIoStream
+    {
+        using BasicSyncIoStream::BasicSyncIoStream;
+
+        // Tries to write some data, without any buffering.
+        // You should probably set `pos` to zero initially.
+        // Tries to write the part of `data` starting from `pos` and until the end. Increases `pos` to indicate how many bytes we were able to send.
+        // If `out_result` is specified, writes status to it:
+        // * `ok`           - Success. `pos` got increased.
+        // * `retry_later`  - No room to send more data, try again later. This is only possible if you called `SetBlocking(false)` before.
+        // * `no_data`      - You passed `pos == data.size()`, nothing to do.
+        // * `error`        - Something went wrong. This instance becomes null, so you don't miss it. Call `ErrorMessage()` for the error message.
+        // Returns true if the status is `ok` (regardless of `out_result` being null).
+        // You can call this in a loop while it returns true if you prefer.
+        bool ReadUnbuffered(std::span<unsigned char> data, std::size_t &pos, IoResult *out_result = nullptr)
+        {
+            return ReadOrWriteUnbuffered<true>(data, pos, out_result);
+        }
+    };
+
+    // A base class for async IO streams.
+    class BasicAsyncIoStream : public BasicIoStream
+    {
+        using BasicIoStream::BasicIoStream;
+
+        BasicAsyncIoStream(BasicAsyncIoStream &&) = default;
+        BasicAsyncIoStream &operator=(BasicAsyncIoStream &&) = default;
+
+      protected:
+        ~BasicAsyncIoStream() = default;
     };
 
     namespace detail
@@ -828,6 +1192,107 @@ namespace em::Proc
         #endif
     }
 
+    // Creates a pipe, assigning the two ends to `read` and `write`, which should be initially empty. If they aren't empty, their existing values are discarded.
+    // On success, returns true and makes `read` and `write` non-null.
+    // On failure, returns false, makes `read` and `write` null, and stores the error message in `read` and `write`.
+    inline bool MakePipe(InputStream &read, OutputStream &write)
+    {
+        // Firstly, destroy existing handles, if any.
+        read = {};
+        write = {};
+
+        #ifdef _WIN32
+        BasicIoStream::handle_t read_handle = BasicIoStream::invalid_handle;
+        BasicIoStream::handle_t write_handle = BasicIoStream::invalid_handle;
+        SECURITY_ATTRIBUTES attrs{};
+        attrs.nLength = sizeof(attrs);
+        attrs.bInheritHandle = true; // Enable inheriting the handles by subprocesses.
+        // Note that on failure, `CreatePipe()` isn't guaranteed to leave the output parameters unchanged. So even if we allowed obtaining a pointer to the underlying handle from `BasicIoStream`,
+        //   we still wouldn't be able to pass that here directly, unless we also called `ReleaseHandle_Unsafe()` on failure.
+        if (CreatePipe(&read_handle, &write_handle, &attrs, 0)) // `0` is the buffer size. Passing zero leaves it defaulted.
+        {
+            // Success.
+            read = {take_ownership, read_handle};
+            write = {take_ownership, write_handle};
+        }
+        else
+        {
+            // Failure.
+            read = {error_message, detail::GetLastWinApiErrorMessage()};
+            write = {error_message, read.ErrorMessage()};
+            return false;
+        }
+        return true;
+        #else
+        BasicIoStream::handle_t read_write_handles[2] = {BasicIoStream::invalid_handle, BasicIoStream::invalid_handle};
+
+        if (
+            #if EM_PROC_HAVE_PIPE2
+            // Note `O_CLOEXEC` rather than `FD_CLOEXEC`. The latter is for `fcntl()` only.
+            // We can't pass `O_NONBLOCK` here, since we don't always need it, and when we do, it's only for one end of the pipe.
+            pipe2(read_write_handles, O_CLOEXEC)
+            #else
+            pipe(read_write_handles)
+            #endif
+        )
+        {
+            // Failure.
+            read = {error_message, std::string("`pipe()` failed: ") + std::strerror(errno)};
+            write = {error_message, read.ErrorMessage()};
+            return false;
+        }
+        else
+        {
+            // Pipe created successfully.
+            read = {take_ownership, read_write_handles[0]};
+            write = {take_ownership, read_write_handles[1]};
+
+            #if !EM_PROC_HAVE_PIPE2
+            // Add `FD_CLOEXEC` flag. This prevents child processes from inheriting this handle by default.
+            for (BasicIoStream::handle_t handle : {read.Handle(), write.Handle()})
+            {
+                // Note `F_{GET,SET}FD`, as opposed to `F_{GET,SET}FL`, which is a different thing.
+
+                // Read existing flags.
+                int flags = fcntl(handle, F_GETFD);
+                if (flags == -1)
+                {
+                    read = {error_message, std::string("`fcntl(F_GETFD)` failed: ") + std::strerror(errno)};
+                    write = {error_message, read.ErrorMessage()}; // Store the same error in both instances for simplicity.
+                    return false;
+                }
+
+                flags |= FD_CLOEXEC;
+
+                // Write flags.
+                if (fcntl(handle, F_SETFD, flags))
+                {
+                    read = {error_message, std::string("`fcntl(F_SETFD)` failed: ") + std::strerror(errno)};
+                    write = {error_message, read.ErrorMessage()}; // Store the same error in both instances for simplicity.
+                    return false;
+                }
+            }
+            #endif
+        }
+        return true;
+        #endif
+    }
+
+    // A convenience variant of `MakePipe()` that returns the read end of the pipe and outputs the write end through a parameter.
+    [[nodiscard]] inline InputStream MakePipe(OutputStream &write)
+    {
+        InputStream ret;
+        (void)MakePipe(ret, write);
+        return ret;
+    }
+    // A convenience variant of `MakePipe()` that returns the write end of the pipe and outputs the read end through a parameter.
+    [[nodiscard]] inline OutputStream MakePipe(InputStream &read)
+    {
+        OutputStream ret;
+        (void)MakePipe(read, ret);
+        return ret;
+    }
+
     // A list of environment variables.
     using EnvMap = std::map<NativeString, NativeString, std::less<>>;
 
@@ -980,7 +1445,7 @@ namespace em::Proc
     {
       public:
         // Call some setters after this.
-        Params() noexcept
+        [[nodiscard]] Params() noexcept
         {
             #ifndef _WIN32
             // Those are dirt cheap to initialize, so no separate constructor.
@@ -990,7 +1455,7 @@ namespace em::Proc
             {
                 // No useful messages for us to emit here, so just write the number.
                 // The manual doesn't mention this setting `errno`, so we use the return value instead. At least for `posix_spawn`, glibc sets the errno anyway, even though the manual doesn't say so, but for this function I can't check, because it never fails in glibc.
-                state.error = "`posix_spawnattr_init` failed: " + std::to_string(spawn_res);
+                state.error = "`posix_spawnattr_init()` failed: " + std::to_string(spawn_res);
                 return;
             }
             state.spawn_attr_alive = true;
@@ -999,14 +1464,14 @@ namespace em::Proc
                 sigset_t new_sigmask{};
                 if (sigemptyset(&new_sigmask))
                 {
-                    state.error = std::string("`sigemptyset` failed: ") + std::strerror(errno);
+                    state.error = std::string("`sigemptyset()` failed: ") + std::strerror(errno);
                     return;
                 }
 
                 // This seems to perform a deep copy, at least in glibc.
                 if (int error = posix_spawnattr_setsigmask(&state.spawn_attr, &new_sigmask))
                 {
-                    state.error = std::string("`posix_spawnattr_setsigmask` failed: ") + std::strerror(error);
+                    state.error = std::string("`posix_spawnattr_setsigmask()` failed: ") + std::strerror(error);
                     return;
                 }
 
@@ -1018,7 +1483,7 @@ namespace em::Proc
             // `POSIX_SPAWN_SETSIGDEF` resets the signal handling modes to the default values. Note that custom handlers seem to be detached automatically even without this.
             if (int error = posix_spawnattr_setflags(&state.spawn_attr, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF))
             {
-                state.error = std::string("`posix_spawnattr_setflags` failed: ") + std::strerror(error);
+                state.error = std::string("`posix_spawnattr_setflags()` failed: ") + std::strerror(error);
                 return;
             }
 
@@ -1027,12 +1492,17 @@ namespace em::Proc
             {
                 // No useful messages for us to emit here, so just write the number.
                 // The manual doesn't mention this setting `errno`, so we use the return value instead. At least for `posix_spawn`, glibc sets the errno anyway, even though the manual doesn't say so, but for this function I can't check, because it never fails in glibc.
-                state.error = "`posix_spawn_file_actions_init` failed: " + std::to_string(spawn_res);
+                state.error = "`posix_spawn_file_actions_init()` failed: " + std::to_string(spawn_res);
                 return;
             }
             state.spawn_fa_alive = true;
             #endif
         }
+
+        // If something fails, you'll get an error here.
+        // You don't have to check those, creating the process will do it for you.
+        [[nodiscard]] bool HasError() const {return !state.error.empty();}
+        [[nodiscard]] const std::string &ErrorMessage() const {return state.error;}
 
         // Non-movable for now, this is simpler to implement.
         Params(const Params &) = delete;
@@ -1045,6 +1515,17 @@ namespace em::Proc
                 posix_spawnattr_destroy(&state.spawn_attr);
             if (state.spawn_fa_alive)
                 posix_spawn_file_actions_destroy(&state.spawn_fa);
+            #endif
+        }
+
+        // Returns true on a non-null instance.
+        // This becomes false if moved from.
+        [[nodiscard]] explicit operator bool() const
+        {
+            #ifdef _WIN32
+            return true;
+            #else
+            return state.spawn_attr_alive && state.spawn_fa_alive;
             #endif
         }
 
@@ -1089,12 +1570,19 @@ namespace em::Proc
         //   or searches the current directory (`argv[0]` also searches in the current directory on Windows). Also if you pass `\foo\bar.exe`, it searches the current drive.
         // Also on Windows `executable` allows passing overly long executable names. (Those must be prefixed with `\\?\` and canonicalized to use `\` instead of `/`,
         //   don't use multiple adjacent `\`, don't use `.` or `..` directory names, etc. But they remain case-insensitive.)
-        std::optional<NativeString> executable;
+        #ifdef _WIN32
+        Params &Command(std::span<const NativeString> argv, std::optional<NativeString> executable = {}, CommandExtras extras = DefaultCommandExtras())
+        {
+            detail_SetCommand_Win(executable, extras, argv.size(), [&](std::size_t i) -> const auto & {return argv[i];});
+            return *this;
+        }
+        Params &Command(std::initializer_list<NativeString> argv, std::optional<NativeString> executable = {}, CommandExtras extras = DefaultCommandExtras())
+        {
+            return Command(std::span(argv), std::move(executable), std::move(extras));
+        }
+        #else
         Params &Command(std::vector<NativeString> argv, std::optional<NativeString> executable = {}, CommandExtras extras = DefaultCommandExtras())
         {
-            #ifdef _WIN32
-            detail_SetCommand_Win(executable, extras, argv.size(), [&](std::size_t i) -> const auto & {return argv[i];});
-            #else
             (void)extras;
             state.cmd_argv_storage = std::move(argv);
             std::size_t argc = state.cmd_argv_storage.size();
@@ -1106,9 +1594,9 @@ namespace em::Proc
             state.cmd_argv = state.cmd_argv_ptrs_storage.data();
 
             state.exe_path = std::move(executable);
-            #endif
             return *this;
         }
+        #endif
         // This version doesn't copy `argv` on POSIX, make sure it doesn't dangle until the process starts.
         // Naming this `Command` means that `Command({})` will call this overload and not the vector one. This isn't a big deal.
         // Note, the `executable is narrow here to match `argv`. This is to simplify our implementation, since the command line is assembled narrow here,
@@ -1317,18 +1805,23 @@ namespace em::Proc
             return *this;
         }
 
-        // Returns true on a non-null instance.
-        // This becomes false if moved from.
-        [[nodiscard]] explicit operator bool() const
-        {
-            #ifdef _WIN32
-            return true;
-            #else
-            return state.spawn_attr_alive && state.spawn_fa_alive;
-            #endif
-        }
+        // Inherit `stdin` from the parent application. This is the default behavior.
+        Params &Stdin_Inherit() {state.stdin_var = StreamInherit{}; return *this;}
+        // Disable `stdin`.
+        Params &Stdin_Null() {state.stdin_var = StreamNull{}; return *this;}
+        // Attach `stdin` to something.
+        // One of the things you can pass here is `MakePipe(output)`.
+        Params &Stdin_Attach(InputStream input) {state.stdin_var = std::move(input); return *this;}
 
       private:
+        struct StreamInherit {};
+        struct StreamNull {};
+        struct StreamMergeIntoOtherOutput {}; // Mark one of the two output streams (`stdout` or `stderr`) with this to merge it into the other one.
+
+        // In those, "inherit" is first to keep it the default behavior.
+        using InputStreamVar = std::variant<StreamInherit, StreamNull, InputStream>;
+        using OutputStreamVar = std::variant<StreamInherit, StreamNull, OutputStream, StreamMergeIntoOtherOutput>;
+
         struct State
         {
             // Having those in a struct isn't strictly necessary anymore. Leaving it in case we decide to make this movable later.
@@ -1337,6 +1830,14 @@ namespace em::Proc
             // When we assign to this, we don't immediately destroy the resources we already created.
             // This is easier to implement, and also lets the user check for errors faster.
             std::string error;
+
+
+            #ifndef _WIN32
+            bool spawn_attr_alive = false;
+            posix_spawnattr_t spawn_attr{};
+            bool spawn_fa_alive = false;
+            posix_spawn_file_actions_t spawn_fa{};
+            #endif
 
 
             #ifdef _WIN32
@@ -1364,17 +1865,14 @@ namespace em::Proc
 
             bool background = false;
 
+
             #ifdef _WIN32
             DWORD process_flags = CREATE_UNICODE_ENVIRONMENT;
             std::optional<NativeString> working_dir; // On POSIX this is baked into `spawn_attr`.
             #endif
 
-            #ifndef _WIN32
-            bool spawn_attr_alive = false;
-            posix_spawnattr_t spawn_attr{};
-            bool spawn_fa_alive = false;
-            posix_spawn_file_actions_t spawn_fa{};
-            #endif
+
+            InputStreamVar stdin_var;
         };
         State state;
 
@@ -1426,22 +1924,22 @@ namespace em::Proc
     class Process
     {
       public:
-        Process() {}
+        [[nodiscard]] constexpr Process() {}
 
-        Process(const Params &params)
+        [[nodiscard]] Process(const Params &params)
             : Process() // Run the destructor on throw.
         {
             StartProcess(params);
         }
 
-        Process(Params &&params)
+        [[nodiscard]] Process(Params &&params)
             : Process() // Run the destructor on throw.
         {
             StartProcess(std::move(params));
         }
 
         // This is move-only.
-        Process(Process &&other) noexcept : state(std::move(other.state)) {other.state = {};}
+        [[nodiscard]] Process(Process &&other) noexcept : state(std::move(other.state)) {other.state = {};}
         Process &operator=(Process other) noexcept {std::swap(state, other.state); return *this;}
 
         // The default behavior is to wait for the process (if `IsBackground() == false`).
@@ -1572,7 +2070,7 @@ namespace em::Proc
             );
             if (!ok)
             {
-                state.error = "`CreateProcessW` failed: " + detail::GetLastWinApiErrorMessage();
+                state.error = "`CreateProcessW()` failed: " + detail::GetLastWinApiErrorMessage();
                 return;
             }
 
@@ -1625,8 +2123,7 @@ namespace em::Proc
                         // Set the new mask to all ones.
                         if (sigfillset(&new_sigmask))
                         {
-                            // The manual doesn't say that it can write to `errno`, so just in case I'm not checking it. Shouldn't fail anyway.
-                            self->state.error = std::string("`sigfillset` failed: ") + std::strerror(errno);
+                            self->state.error = std::string("`sigfillset()` failed: ") + std::strerror(errno);
                             error = true;
                             return;
                         }
@@ -1639,8 +2136,7 @@ namespace em::Proc
                         // NOTE: Their API is slightly different. `pthread_sigmask()` returns the error code on failure, while `sigprocmask()` returns -1 on failure and writes to `errno`.
                         if (int sigmask_status = pthread_sigmask(SIG_SETMASK, &new_sigmask, &old_sigmask); sigmask_status < 0)
                         {
-                            // The manual doesn't say that it can write to `errno`, so just in case I'm not checking it. Shouldn't fail anyway.
-                            self->state.error = std::string("`pthread_sigmask` failed to disable signals before forking: ") + std::strerror(sigmask_status);
+                            self->state.error = std::string("`pthread_sigmask()` failed to disable signals before forking: ") + std::strerror(sigmask_status);
                             error = true;
                             return;
                         }
@@ -1656,8 +2152,7 @@ namespace em::Proc
 
                         if (int sigmask_status = pthread_sigmask(SIG_SETMASK, &old_sigmask, nullptr); sigmask_status < 0)
                         {
-                            // The manual doesn't say that it can write to `errno`, so just in case I'm not checking it. Shouldn't fail anyway.
-                            self->state.error = std::string("`pthread_sigmask` failed to restore signals after forking: ") + std::strerror(sigmask_status);
+                            self->state.error = std::string("`pthread_sigmask()` failed to restore signals after forking: ") + std::strerror(sigmask_status);
                             error = true;
                             return;
                         }
@@ -1686,7 +2181,7 @@ namespace em::Proc
                 {
                   case -1:
                     // Forking failed.
-                    state.error = std::string("`") + forkname + "` failed: " + std::strerror(errno);
+                    state.error = std::string("`") + forkname + "()` failed: " + std::strerror(errno);
                     return;
 
                   case 0:
@@ -1722,7 +2217,7 @@ namespace em::Proc
                     int status = -1;
                     if (waitpid(pid, &status, 0) < 0)
                     {
-                        state.error = std::string("`waitpid` failed: ") + std::strerror(errno);
+                        state.error = std::string("`waitpid()` failed: ") + std::strerror(errno);
                         return;
                     }
 
@@ -1732,7 +2227,7 @@ namespace em::Proc
                         if (int exit_code = WEXITSTATUS(status))
                         {
                             // We use the exit code to propagate the error code from `posix_spawnp` above.
-                            state.error = std::string("`posix_spawnp` failed: ") + std::strerror(exit_code);
+                            state.error = std::string("`posix_spawnp()` failed: ") + std::strerror(exit_code);
                             return;
                         }
                     }
@@ -1761,7 +2256,7 @@ namespace em::Proc
 
                 if (int error = posix_spawnp(&state.pid, exe_path, &params.state.spawn_fa, &params.state.spawn_attr, const_cast<char **>(params.state.cmd_argv), env_ptr))
                 {
-                    state.error = std::string("`posix_spawnp` failed: ") + std::strerror(error);
+                    state.error = std::string("`posix_spawnp()` failed: ") + std::strerror(error);
                     return;
                 }
 
@@ -1818,7 +2313,7 @@ namespace em::Proc
             // It returns `-1` on error.
             if (wait_result < 0)
             {
-                state.error = std::string("`waitpid` failed: ") + std::strerror(errno);
+                state.error = std::string("`waitpid()` failed: ") + std::strerror(errno);
                 // Mark the process as exited, I guess.
                 // So that nothing gets blocked on the user side, waiting for it to exit.
                 state.exit_reason = Proc::ExitReason(Proc::ExitReason::Error{});
@@ -1846,7 +2341,7 @@ namespace em::Proc
             {
                 state.exit_reason = Proc::ExitReason(Proc::ExitReason::Signal_Posix{
                     WTERMSIG(status)
-                    #ifdef EM_PROC_CAN_DETECT_CORE_DUMPS
+                    #if EM_PROC_CAN_DETECT_CORE_DUMPS
                     // I know that trailing commas are ignored. Want to do it this way.
                     , bool(WCOREDUMP(status))
                     #endif
@@ -1867,8 +2362,7 @@ namespace em::Proc
             Proc::Pid pid = 0;
 
             #ifdef _WIN32
-            // There's some weirdness with what counts as a valid handle. `INVALID_HANDLE_VALUE` is basically `(HANDLE)-1`, but `nullptr` also seems to be invalid.
-            // Using `INVALID_HANDLE_VALUE` seems better to me.
+            // There's some weirdness with what counts as a valid handle. `INVALID_HANDLE_VALUE` is basically `(HANDLE)-1`, but `nullptr` also seems to be invalid. Using `INVALID_HANDLE_VALUE` seems better to me.
             HANDLE process_handle = INVALID_HANDLE_VALUE;
             #else
             // Do we need to `waitpid()` on the PID to clean it up?
