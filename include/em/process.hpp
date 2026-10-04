@@ -11,7 +11,6 @@
 #include <type_traits>
 #include <utility>
 #include <variant>
-#include <vector>
 
 #ifdef _WIN32
 
@@ -26,6 +25,8 @@
 #pragma pop_macro("WIN32_LEAN_AND_MEAN")
 
 #else
+
+#include <vector>
 
 #include <cstring> // For `std::strerror()`.
 #include <fcntl.h> // For `fcntl()`.
@@ -80,12 +81,12 @@
 #endif
 
 // Changes here relative to SDL:
-// * Better error reporting from starting background processes. See: https://github.com/libsdl-org/SDL/issues/16188
+// * Better error reporting from starting background (detached) processes. See: https://github.com/libsdl-org/SDL/issues/16188
 // * Use return values instead of `errno` in a few places. But it seems in glibc those functions do set errno, even though it's not documented in the manual, so I'm not sure this ever matters.
 // * Don't bother with android-specific code to obtain extra env variables from the application manifest, whatever that is.
-// * Refuse to use `kill(pid, 0)` to wait for background processes. Since PIDs can be recycled, this seems unreliable.
+// * Refuse to use `kill(pid, 0)` to wait for background (detached) processes. Since PIDs can be recycled, this seems unreliable.
 // * Added "have core dump" check when a process stops due to a signal.
-// * On Windows, the `CREATE_NO_WINDOW` flag that disables console allocation is not implied by process background-ness. It doesn't seem terribly useful, and we expose the flags directly on Windows.
+// * On Windows, the `CREATE_NO_WINDOW` flag that disables console allocation is not implied by process background-ness (detached-ness). It doesn't seem terribly useful, and we expose it separately.
 // * Use `pipe2()` instead of `pipe()` when possible.
 
 // Differences to reproc:
@@ -95,27 +96,50 @@
 
 namespace em::Proc
 {
+    // Some tag types.
+
+    struct TagErrorMessage {explicit TagErrorMessage() = default;};
+    inline constexpr TagErrorMessage error_message;
+    struct TagTakeOwnership {explicit TagTakeOwnership() = default;};
+    inline constexpr TagTakeOwnership take_ownership;
+    struct TagNonOwning {explicit TagNonOwning() = default;};
+    inline constexpr TagNonOwning non_owning;
+
+
     #ifdef _WIN32
     using NativeChar = wchar_t;
+    using Pid = DWORD; // Process ID type. This is always some integer type.
     #else
     using NativeChar = char;
+    using Pid = pid_t; // Process ID type. This is always some integer type.
     #endif
 
-    // Process ID type. This is always some integer type.
     #ifdef _WIN32
-    using Pid = DWORD;
-    #else
-    using Pid = pid_t;
+    struct TagWindowsOnly {explicit TagWindowsOnly() = default;};
+    // This is passed as the first argument to some functions to acknowledge that you understand that they're Windows-specific, and need to be `#if`ed.
+    inline constexpr TagWindowsOnly windows_only{};
     #endif
+
+
+    namespace detail
+    {
+        template <typename T>
+        constexpr bool is_basic_string_view = false;
+        template <typename T>
+        constexpr bool is_basic_string_view<std::basic_string_view<T>> = true;
+
+        // True if `T` is not a specialization of `basic_string_view` but is convertible to one with CTAD.
+        template <typename T>
+        concept ConvertibleToStringView = !is_basic_string_view<std::remove_cvref_t<T>> && requires(T &&t){std::basic_string_view(decltype(t)(t));};
+    }
 
     #ifdef _WIN32
     // This is primarily for internal use, and exposed as a courtesy. You can also use `class NativeString` defined below.
     // Converts between `std::string` and `std::wstring` in both directions.
-    // If the argument is `std::basic_string<T>` as opposed to `std::basic_string_view<T>`, you can cast it to `std::basic_string_view(...)` via CTAD to avoid having to specify `Char`.
     // By default, replaces invalid characters in the input with placeholders.
-    // If `success` is specified, instead returns an empty string if the input has invalid characters, and writes false to `success`. On success, writes true.
+    // If `success` is specified, instead returns an empty string if the input has invalid characters, and writes `false` to `success`. On success, writes `true`.
     template <typename Char>
-    [[nodiscard]] std::basic_string<std::conditional_t<std::is_same_v<Char, char>, wchar_t, char>> ConvertString_Win(std::basic_string_view<Char> in, bool *success = nullptr)
+    [[nodiscard]] std::basic_string<std::conditional_t<std::is_same_v<Char, char>, wchar_t, char>> ConvertString(TagWindowsOnly, std::basic_string_view<Char> in, bool *success = nullptr)
     {
         using RetChar = std::conditional_t<std::is_same_v<Char, char>, wchar_t, char>;
 
@@ -173,9 +197,18 @@ namespace em::Proc
             *success = true;
         return ret;
     }
+
+    // A convenience overload to take things convertible to `std::basic_string_view` (as opposed to `std::basic_string_view` itself) without specifying the template argument.
+    [[nodiscard]] auto ConvertString(TagWindowsOnly, detail::ConvertibleToStringView auto &&in, bool *success = nullptr)
+    {
+        return ConvertString(windows_only, std::basic_string_view(decltype(in)(in)), success);
+    }
     #endif
 
-    // Stores `std::wstring` on Windows and `std::string` on other platforms, and provides functions to convert that to/from UTF-8.
+    // We use this instead of `std::string` in a few places.
+    // On Windows this stores `std::wstring` rather than `std::string`, but it's still constructible from `std::string` on all platforms (on Windows this converts from UTF-8).
+    // On Windows you can construct it from `std::wstring` directly if you have that. (Similarly narrow and wide `string_view`s, etc.)
+    // This is currently only used to store environment variables, but you're also free to use it in your own code.
     struct NativeString
     {
         using UnderlyingType = std::basic_string<NativeChar>;
@@ -187,12 +220,14 @@ namespace em::Proc
         // Constructs an empty string.
         [[nodiscard]] NativeString() {}
 
+        NativeString(std::nullptr_t) = delete;
+
         #ifdef _WIN32
         // Set the value as a UTF-8 string.
         // If `success` is not specified, then invalid characters in the input will be replaced with placeholders in the result.
         // If `success` is specfied, then invalid characters cause the result to be empty instead. Writes true to `success` on success and false on failure.
         // Not specifying `success` is completely fine.
-        [[nodiscard]] NativeString(std::string_view value, bool *success = nullptr) : native(ConvertString_Win(value, success)) {}
+        [[nodiscard]] NativeString(std::string_view value, bool *success = nullptr) : native(ConvertString(windows_only, value, success)) {}
         [[nodiscard]] NativeString(const std::string &value, bool *success = nullptr) : NativeString(std::string_view(value), success) {}
         [[nodiscard]] NativeString(const char *value, bool *success = nullptr) : NativeString(std::string_view(value), success) {}
 
@@ -218,7 +253,7 @@ namespace em::Proc
         // Not specifying `success` is completely fine.
         [[nodiscard]] std::string get(bool *success = nullptr) const
         {
-            return ConvertString_Win(std::wstring_view(native), success);
+            return ConvertString(windows_only, native, success);
         }
         #else
         // Returns the stored string.
@@ -253,17 +288,397 @@ namespace em::Proc
         friend std::strong_ordering operator<=>(const NativeString &a, const NativeChar *b) {return a.native <=> b;}
     };
 
-    // Some tags for `BasicIoStream`, mostly for internal use.
+    namespace detail
+    {
+        // Returns the array size for `argv`-style arrays.
+        // If `ptr` is null, returns zero.
+        [[nodiscard]] inline std::size_t PtrArraySize(const auto *const *ptr)
+        {
+            std::size_t ret = 0;
+            if (ptr) // Return zero if `ptr` is null.
+            {
+                while (ptr[ret])
+                    ret++;
+            }
+            return ret;
+        }
 
-    struct TagTakeOwnership {explicit TagTakeOwnership() = default;};
-    static constexpr TagTakeOwnership take_ownership;
-    struct TagNonOwning {explicit TagNonOwning() = default;};
-    static constexpr TagNonOwning non_owning;
-    struct TagErrorMessage {explicit TagErrorMessage() = default;};
-    static constexpr TagErrorMessage error_message;
+        [[nodiscard]] auto &&UnderlyingString(auto &&str)
+        {
+            if constexpr (std::is_same_v<std::remove_cvref_t<decltype(str)>, NativeString>)
+                return decltype(str)(str).native;
+            else
+                return decltype(str)(str);
+        }
+
+        // Stores either a non-owning `Char *` (which may or may not be const!) or an owning `std::basic_string<std::remove_const_t<Char>>`.
+        // NOTE: The two variants with `String = const ??;` have the public typedefs `MaybeOwningString` and `MaybeOwningNativeString`.
+        template <typename Char>
+        requires
+            std::is_same_v<std::remove_const_t<Char>, char>
+            #ifdef _WIN32
+            || std::is_same_v<std::remove_const_t<Char>, wchar_t>
+            #endif
+        class MaybeOwningMaybeMutString
+        {
+            using UnqualChar = std::remove_const_t<Char>;
+            using String = std::basic_string<UnqualChar>;
+
+            String string;
+            Char *ptr_override = nullptr;
+
+            static constexpr bool is_wide =
+                #ifdef _WIN32
+                std::is_same_v<UnqualChar, wchar_t>;
+                #else
+                false;
+                #endif
+
+          public:
+            [[nodiscard]] constexpr MaybeOwningMaybeMutString() {}
+
+            MaybeOwningMaybeMutString(std::nullptr_t) = delete;
+
+            #ifdef _WIN32
+            // From narrow strings.
+            // On Windows, those can run into encoding errors. By default, they replace bad characters with placeholders.
+            // But if `success` is specified, they instead return an empty string on failure, and set `success` to `false`. On success, they set it to `true`.
+            [[nodiscard]] MaybeOwningMaybeMutString(const std::string &str, bool *success = nullptr) requires is_wide : string(ConvertString(windows_only, str, success)) {}
+            [[nodiscard]] MaybeOwningMaybeMutString(std::string_view str, bool *success = nullptr) requires is_wide : string(ConvertString(windows_only, str, success)) {}
+            [[nodiscard]] MaybeOwningMaybeMutString(const char *str, bool *success = nullptr) requires is_wide : string(ConvertString(windows_only, str, success)) {}
+            #endif
+
+            // From narrow strings.
+            // On POSIX those never fail. See the Windows versions above for more details.
+            [[nodiscard]] MaybeOwningMaybeMutString(std::string str, bool *success = nullptr) requires(!is_wide) : string(std::move(str)) {if (success) *success = true;}
+            [[nodiscard]] MaybeOwningMaybeMutString(std::string_view str, bool *success = nullptr) requires(!is_wide) : string(str) {if (success) *success = true;}
+            [[nodiscard]] MaybeOwningMaybeMutString(const char *str, bool *success = nullptr) requires(!is_wide) : string(str) {if (success) *success = true;}
+
+            #ifdef _WIN32
+            // From wide strings.
+            // Those never fail, so no `bool *success`.
+            [[nodiscard]] MaybeOwningMaybeMutString(String str) requires is_wide : string(std::move(str)) {}
+            [[nodiscard]] MaybeOwningMaybeMutString(std::wstring_view str) requires is_wide : string(str) {}
+            [[nodiscard]] MaybeOwningMaybeMutString(const wchar_t *str) requires is_wide : string(str) {}
+            #endif
+
+            // Non-owning narrow.
+            [[nodiscard]] MaybeOwningMaybeMutString(TagNonOwning, const char *ptr) requires(!is_wide) : ptr_override(ptr) {}
+            [[nodiscard]] MaybeOwningMaybeMutString(TagNonOwning, const char *ptr) requires is_wide : MaybeOwningMaybeMutString(ptr) {} // This just ignores `non_owning`.
+
+            // Non-owning wide.
+            [[nodiscard]] MaybeOwningMaybeMutString(TagNonOwning, const wchar_t *ptr) requires is_wide : ptr_override(ptr) {}
+
+            // From `NativeString`. Why not.
+            [[nodiscard]] MaybeOwningMaybeMutString(NativeString str) requires is_wide
+                : string(std::move(str.native))
+            {}
+
+            // Convert back to `NativeString`.
+            [[nodiscard]] operator NativeString() const
+            {
+                return NativeString(GetStringView());
+            }
+
+
+            [[nodiscard]] MaybeOwningMaybeMutString(const MaybeOwningMaybeMutString &other) = default;
+
+            [[nodiscard]] MaybeOwningMaybeMutString(MaybeOwningMaybeMutString &&other) noexcept
+                : string(std::move(other.string)), ptr_override(other.ptr_override)
+            {
+                other.string = {};
+                other.ptr_override = nullptr;
+            }
+
+            MaybeOwningMaybeMutString &operator=(const MaybeOwningMaybeMutString &other) = default;
+
+            MaybeOwningMaybeMutString &operator=(MaybeOwningMaybeMutString &&other) noexcept
+            {
+                if (&other == this) // A courtesy, not strictly necessary.
+                    return *this;
+
+                string = std::move(other.string);
+                ptr_override = other.ptr_override;
+
+                other.string = {};
+                other.ptr_override = nullptr;
+                return *this;
+            }
+
+            [[nodiscard]] Char *GetMutPointer() requires(!std::is_const_v<Char>)
+            {
+                return ptr_override ? ptr_override : string.data();
+            }
+            [[nodiscard]] Char *GetPointer() const requires std::is_const_v<Char>
+            {
+                return ptr_override ? ptr_override : string.c_str();
+            }
+
+            [[nodiscard]] std::basic_string_view<UnqualChar> GetStringView() const
+            {
+                // Not ternary to avoid having to cast the branches to `basic_string_view`.
+                if (ptr_override)
+                    return ptr_override;
+                else
+                    return string;
+            }
+
+            // This is usually not necessary, unless you're modifying the string directly.
+            [[nodiscard]] String &GetOwnedString()
+            {
+                assert(!ptr_override);
+                return string;
+            }
+        };
+
+        template <typename T>
+        constexpr bool is_MaybeOwningMaybeMutString = false;
+        template <typename Char>
+        constexpr bool is_MaybeOwningMaybeMutString<MaybeOwningMaybeMutString<Char>> = true;
+
+        template <typename T>
+        struct StringToCharTypeImpl {using type = typename T::value_type;};
+        template <>
+        struct StringToCharTypeImpl<NativeString> {using type = NativeChar;};
+        template <typename T>
+        struct StringToCharTypeImpl<MaybeOwningMaybeMutString<T>> {using type = std::remove_const_t<T>;};
+
+        template <typename T> requires std::is_same_v<std::remove_cvref_t<T>, T>
+        using StringToCharType = typename StringToCharTypeImpl<T>::type;
+
+
+        #ifndef _WIN32
+        // Stores an argv-like array of strings. Can be owning or non-owning.
+        // Can't be null. Passing a null pointer makes it empty.
+        template <typename String>
+        class StringPtrArray
+        {
+            using Char = StringToCharType<String>;
+
+            std::vector<String> storage;
+            std::vector<const Char *> pointers;
+
+            // If this is specified, it replaces `pointers.data()` as the final value.
+            const Char *const *ptr_override = nullptr;
+
+            [[nodiscard]] static const Char *StringToPtr(const String &str)
+            {
+                if constexpr (is_MaybeOwningMaybeMutString<String>)
+                    return str.GetPointer(); // Not bothering with `GetMutablePointer`, the mutable variants shouldn't appear here.
+                else
+                    return str.c_str();
+            }
+
+          public:
+            // Constructs an invalid instance. `GetPointer()` will return null on those.
+            [[nodiscard]] constexpr StringPtrArray() {}
+
+            [[nodiscard]] StringPtrArray(const StringPtrArray &other)
+            {
+                *this = other;
+            }
+
+            StringPtrArray &operator=(const StringPtrArray &other)
+            {
+                if (!other)
+                {
+                    // `*this = {};` would call the move assignment. I'd rather do it myself.
+                    storage = {};
+                    pointers = {};
+                    ptr_override = nullptr;
+                    return *this;
+                }
+
+                if (other.ptr_override)
+                {
+                    ptr_override = other.ptr_override;
+                    storage = {};
+                    pointers = {};
+                    return *this;
+                }
+
+                // Zero the instance if something throws.
+                struct ExceptionGuard
+                {
+                    StringPtrArray *self;
+                    ~ExceptionGuard()
+                    {
+                        if (self)
+                            *self = {};
+                    }
+                };
+                ExceptionGuard exception_guard{this};
+
+                storage = other.storage;
+
+                std::size_t num_elems = storage.size();
+                pointers.resize(num_elems + 1);
+                for (std::size_t i = 0; i < num_elems; i++)
+                    pointers[i] = StringToPtr(storage[i]);
+                pointers[num_elems] = nullptr; // Since we're reusing the existing array, must explicitly reset this to null in case it wasn't before.
+
+                ptr_override = nullptr;
+
+                exception_guard.self = nullptr; // Disarm the guard.
+
+                return *this;
+            }
+
+            [[nodiscard]] StringPtrArray(StringPtrArray &&other) noexcept
+            {
+                *this = std::move(other);
+            }
+
+            StringPtrArray &operator=(StringPtrArray &&other) noexcept
+            {
+                if (&other == this) // Not strictly required, just good manners.
+                    return *this;
+
+                if (!other)
+                {
+                    // `*this = {};` would infinitely recurse.
+                    storage = {};
+                    pointers = {};
+                    ptr_override = nullptr;
+                    return *this;
+                }
+
+                if (other.ptr_override)
+                {
+                    ptr_override = std::exchange(other.ptr_override, nullptr);
+                    storage = {};
+                    pointers = {};
+                    return *this;
+                }
+
+                // Moved-from vectors are empty in practice.
+                storage = std::move(other.storage);
+                pointers = std::move(other.pointers);
+                ptr_override = nullptr;
+                return *this;
+            }
+
+            // Constructs an array of `num_elems` strings. Each string is produced by calling `make_elem(i)`,
+            //   which must return `std::basic_string<Char>` (or `NativeString` if `UseNativeString == true`), or something convertible to it.
+            // `make_elem` is always called in order, so it can ignore `i` if that's more convenient.
+            [[nodiscard]] StringPtrArray(std::size_t num_elems, auto &&make_elem)
+                : StringPtrArray([&]{
+                    std::vector<String> new_storage;
+                    new_storage.reserve(num_elems);
+                    for (std::size_t i = 0; i < num_elems; i++)
+                        new_storage.push_back(make_elem(std::size_t(i))); // Cast to make `i` an rvalue, just in case.
+                    return new_storage;
+                }())
+            {}
+
+            // Construct directly from the underlying vector.
+            [[nodiscard]] StringPtrArray(std::vector<String> vec)
+                : storage(std::move(vec))
+            {
+                std::size_t num_elems = storage.size();
+
+                pointers.resize(num_elems + 1); // One extra null pointer at the end.
+                for (std::size_t i = 0; i < num_elems; i++)
+                    pointers[i] = StringToPtr(storage[i]);
+            }
+
+            [[nodiscard]] StringPtrArray(const Char *const *ptr)
+                : StringPtrArray(PtrArraySize(ptr), [&](std::size_t i){return ptr[i];})
+            {}
+
+            [[nodiscard]] StringPtrArray(TagNonOwning, const Char *const *ptr)
+                : ptr_override(ptr)
+            {}
+
+            // Returns true if this is a valid instance.
+            [[nodiscard]] explicit operator bool() const {return ptr_override || !pointers.empty();}
+
+            [[nodiscard]] const Char *const *GetPointer() const
+            {
+                if (!*this)
+                    return nullptr;
+
+                return ptr_override ? ptr_override : pointers.data();
+            }
+        };
+        #endif
+    }
+
+    // Ugh. I might simplify all those to `NativeString` one day.
+
+    // Similar to `NativeString`, but can also store non-owning pointers (use constructors with `em::Proc::non_owning` tag).
+    // You're not really intended to create instances of this in user code, prefer `class NativeString`. You can think of this class as of a `NativeString` equivalent.
+    using MaybeOwningNativeString = detail::MaybeOwningMaybeMutString<const NativeChar>;
+    // This variant wants the pointer to be non-const, and is forced to copy if you give it a const pointer. You don't need to worry about this.
+    using MaybeOwningMutNativeString = detail::MaybeOwningMaybeMutString<NativeChar>;
+
+    // Similar to `std::string`, but can also store non-owning pointers (use constructors with `em::Proc::non_owning` tag).
+    // You're not really intended to create instances of this in user code.
+    // Unlike `MaybeOwningNativeString`, this stores a narrow string and can't be constructed from a wide string directly.
+    using MaybeOwningString = detail::MaybeOwningMaybeMutString<const char>;
+
+    // Similar to `MaybeOwningNativeString`, but more aggressively tries to be non-owning when possible. It's supposed to be used as a function parameter, so it's also not default-constructible.
+    // You're not really intended to create instances of this in user code, prefer `class NativeString`. You can think of this class as of a `NativeString` equivalent.
+    struct NativeCStringViewParam : MaybeOwningNativeString
+    {
+        // Intentionally not default-constructible.
+
+        NativeCStringViewParam(std::nullptr_t) = delete;
+
+        [[nodiscard]] NativeCStringViewParam(std::string_view str) : MaybeOwningNativeString(str) {} // Isn't necessarily null-terminated, have to copy.
+        [[nodiscard]] NativeCStringViewParam(const std::string &str) : MaybeOwningNativeString(non_owning, str.c_str()) {}
+        [[nodiscard]] NativeCStringViewParam(const char *str) : MaybeOwningNativeString(non_owning, str) {}
+
+        #ifdef _WIN32
+        [[nodiscard]] NativeCStringViewParam(std::wstring_view str) : MaybeOwningNativeString(str) {} // Isn't necessarily null-terminated, have to copy.
+        [[nodiscard]] NativeCStringViewParam(const std::wstring &str) : MaybeOwningNativeString(non_owning, str.c_str()) {}
+        [[nodiscard]] NativeCStringViewParam(const wchar_t *str) : MaybeOwningNativeString(non_owning, str) {}
+        #endif
+    };
+
+    // A base class that stores an optional error string.
+    // Primarily for internal use. A lot of our classes inherit from this.
+    // When inheriting from this, you probably want to inherit ctors: `using StoresErrorMessage::StoresErrorMessage;`.
+    class StoresErrorMessage
+    {
+      protected:
+        // You can assign to this directly if you prefer.
+        std::string error_string;
+
+      public:
+        // Stores no error.
+        [[nodiscard]] constexpr StoresErrorMessage() {}
+
+        // Stores an error message.
+        [[nodiscard]] StoresErrorMessage(TagErrorMessage, std::string error_string) : error_string(std::move(error_string)) {}
+
+        // Copyable and movable. Moved-from instances are guaranteed to not retain errors.
+
+        [[nodiscard]] StoresErrorMessage(const StoresErrorMessage &) = default;
+        [[nodiscard]] StoresErrorMessage(StoresErrorMessage &&other) noexcept : error_string(std::move(other.error_string)) {other.error_string = {};}
+
+        StoresErrorMessage &operator=(const StoresErrorMessage &) = default;
+        StoresErrorMessage &operator=(StoresErrorMessage &&other) noexcept
+        {
+            if (&other != this) // I know this check isn't required, but it's more sane this way.
+            {
+                error_string = std::move(other.error_string);
+                other.error_string = {};
+            }
+            return *this;
+        }
+
+        // Is this instance in an invalid state, storing an error message?
+        [[nodiscard]] bool HasError() const noexcept {return !error_string.empty();}
+
+        // Returns the error message, or empty if `HasError() == false`.
+        [[nodiscard]] const std::string &ErrorMessage() const noexcept {return error_string;}
+    };
+
+#ifndef _WIN32
 
     // A base class for files, pipes, etc.
-    class BasicIoStream
+    class BasicIoStream : public StoresErrorMessage
     {
       public:
         #ifdef _WIN32
@@ -273,7 +688,7 @@ namespace em::Proc
         inline static const handle_t invalid_handle = INVALID_HANDLE_VALUE;
         #else
         using handle_t = int;
-        static constexpr handle_t invalid_handle = 0;
+        static constexpr handle_t invalid_handle = -1; // `0` is stdin.
         #endif
 
       private:
@@ -281,13 +696,13 @@ namespace em::Proc
         {
             handle_t handle = invalid_handle;
             bool owns_handle = false;
-
-            std::string error;
         };
         State state;
 
       public:
         [[nodiscard]] constexpr BasicIoStream() {}
+
+        using StoresErrorMessage::StoresErrorMessage;
 
         // Takes ownership of an existing handle. Mainly for internal use.
         [[nodiscard]] BasicIoStream(TagTakeOwnership, handle_t handle)
@@ -301,12 +716,6 @@ namespace em::Proc
         {
             state.handle = handle;
             state.owns_handle = false;
-        }
-
-        // Stores an error message. Mainly for internal use.
-        [[nodiscard]] BasicIoStream(TagErrorMessage, std::string message)
-        {
-            state.error = std::move(message);
         }
 
         [[nodiscard]] BasicIoStream(BasicIoStream &&other) noexcept : state(std::move(other.state)) {other.state = {};}
@@ -341,7 +750,7 @@ namespace em::Proc
             if (!*this)
             {
                 if (!HasError()) // Don't clobber the existing error, if any.
-                    state.error = "This IO stream instance is null.";
+                    error_string = "This IO stream instance is null.";
                 return true;
             }
             return false;
@@ -349,9 +758,6 @@ namespace em::Proc
 
         [[nodiscard]] handle_t Handle() const {return state.handle;}
         [[nodiscard]] bool IsOwning() const {return state.owns_handle;}
-
-        [[nodiscard]] bool HasError() const {return !state.error.empty();}
-        [[nodiscard]] const std::string &ErrorMessage() const {return state.error;}
 
         // Returns the current handle, and then releases ownership of it, if any, and resets this instance to null.
         // It's then your job to free it.
@@ -408,6 +814,10 @@ namespace em::Proc
             if (ErrorIfNull())
                 return false;
 
+            #ifdef _WIN32
+            #error implement me
+            #else
+
             // Note `F_{GET,SET}FL`, as opposed to `F_{GET,SET}FD`, which is a different thing.
 
             // Read existing flags.
@@ -431,6 +841,7 @@ namespace em::Proc
             }
 
             return true;
+            #endif
         }
 
       protected:
@@ -441,6 +852,11 @@ namespace em::Proc
         template <bool Read>
         bool ReadOrWriteUnbuffered(std::conditional_t<Read, std::span<unsigned char>, std::span<const unsigned char>> data, std::size_t &pos, IoResult *out_result)
         {
+            #ifdef _WIN32
+            #error implement me
+
+            #else
+
             if (ErrorIfNull())
             {
                 if (out_result)
@@ -523,6 +939,8 @@ namespace em::Proc
             if (out_result)
                 *out_result = IoResult::ok;
             return true;
+
+            #endif
         }
     };
 
@@ -581,6 +999,8 @@ namespace em::Proc
         ~BasicAsyncIoStream() = default;
     };
 
+#endif
+
     namespace detail
     {
         template <typename ...P>
@@ -588,30 +1008,11 @@ namespace em::Proc
         template <typename ...P>
         Overload(P...) -> Overload<P...>; // Keep this for older compilers, just in case.
 
-        // Returns the array size for `argv`-style arrays.
-        // If `ptr` is null, returns zero.
-        [[nodiscard]] inline std::size_t PtrArraySize(const auto *const *ptr)
-        {
-            std::size_t ret = 0;
-            if (ptr) // Return zero if `ptr` is null.
-            {
-                while (ptr[ret])
-                    ret++;
-            }
-            return ret;
-        }
-
         #ifdef _WIN32
-
-        template <typename T>
-        struct StringToCharType {using type = typename T::value_type;};
-        template <>
-        struct StringToCharType<NativeString> {using type = NativeChar;};
-
         // Combines multiple command-line arguments into one string. Can operate either on wide or on narrow strings, doesn't matter.
         // `executable` is the optional override for the executable name, that's otherwise taken from the first argument. We may modify it, and may reset it to null if needed. (Currently only resetting.)
         // `executable` is not an `std::optional<std::basic_string_view<...>>` for convenience, since we always pass an owning optional string to it.
-        // `executable` has to store a `NativeString` or a `std::string` or a `std::wstring`.
+        // `executable` has to store a either a `detail::MaybeOwningMaybeMutString<...>` or `MaybeOwningNativeString` which is derived from it.
         // `num_args` is the number of arguments, including the program name. Passing 0 is legal and means you don't want to specify this.
         // `get_arg(i)` is called for `0 <= i < num_args`, and must return something convertible to `std::basic_string_view<Char>`, matching the character type of `executable`.
         // `get_arg` can be called multiple times for the same index, make sure that works and is fast.
@@ -626,21 +1027,24 @@ namespace em::Proc
         // `out_error` is set to error on failure.
         // Returns true on success and false on failure. On success, `out_error` is left unchanged. On failure, `out_command` may be unmodified.
         // If this function fails, it writes the error message to `out_error`.
-        template <typename String, typename Char = typename StringToCharType<String>::type>
+        template <typename Char>
         [[nodiscard]] bool AssembleCommandLine(
-            std::optional<String> &executable,
+            std::optional<MaybeOwningMaybeMutString<const Char>> &executable,
             std::size_t num_args,
             bool batch_prepend_cmd,
             int batch_safety,
-            std::optional<String> &out_command,
+            std::optional<MaybeOwningMaybeMutString<Char>> &out_command,
             std::string &out_error,
             auto &&get_arg)
         {
+
             // This lambda returns the `i`th argument converted to `std::basic_string_view<...>`.
             auto GetArgView = [&](std::size_t i)
             {
-                if constexpr (std::is_same_v<std::remove_cvref_t<decltype(get_arg(std::size_t{}))>, NativeString>)
-                    return std::basic_string_view(get_arg(i).native);
+                using LambdaReturnType = decltype(get_arg(i));
+
+                if constexpr (is_MaybeOwningMaybeMutString<std::remove_cvref_t<LambdaReturnType>>)
+                    return get_arg(i).GetStringView();
                 else
                     return std::basic_string_view(get_arg(i));
             };
@@ -660,10 +1064,7 @@ namespace em::Proc
 
             auto GetExecutableView = [&]
             {
-                if constexpr (std::is_same_v<String, NativeString>)
-                    return std::basic_string_view(executable->native);
-                else
-                    return std::basic_string_view(*executable);
+                return executable->GetStringView();
             };
 
             // 1.2. Check for null characters.
@@ -805,10 +1206,7 @@ namespace em::Proc
             auto GetWritableOutCommand = [&]() -> auto &
             {
                 assert(out_command);
-                if constexpr (std::is_same_v<String, NativeString>)
-                    return out_command->native;
-                else
-                    return *out_command;
+                return out_command->GetOwnedString();
             };
 
             bool need_separator_before_next_arg = false;
@@ -1035,7 +1433,6 @@ namespace em::Proc
                 need_final_closing_quote = true;
 
                 assert(!out_command);
-                out_command.emplace();
                 if constexpr (std::is_same_v<Char, wchar_t>)
                     out_command = L"\"cmd\" /d /e:on /v:off /s /c \"";
                 else
@@ -1161,7 +1558,7 @@ namespace em::Proc
                     if (ret_wide.ends_with(L"\r\n"))
                         ret_wide.remove_suffix(2);
 
-                    std::string ret = ConvertString_Win(ret_wide);
+                    std::string ret = ConvertString(windows_only, ret_wide); // Ignoring encoding errors here, having placeholder characters in the string is fine.
                     std::erase(ret, '\r'); // For a good measure.
 
                     return ret;
@@ -1172,13 +1569,19 @@ namespace em::Proc
             return std::to_string(last_error) + " (no error message is available)";
         }
 
-        #else
+        #endif
+
+
+        #ifndef _WIN32
+
+        // Environment:
 
         #ifndef __APPLE__
         extern "C" char **environ;
         #endif
 
-        [[nodiscard]] inline const char *const *GetEnviron()
+        // This doesn't return `const char *const *` for convenience, but you probably shouldn't write to those pointers.
+        [[nodiscard]] inline char **GetEnviron()
         {
             #ifdef __APPLE__
             // Use `*_NSGetEnviron()` instead of `environ`.
@@ -1189,8 +1592,92 @@ namespace em::Proc
             return environ;
             #endif
         }
+
+
+        // The global `posix_spawnattr_t` instance.
+        // We currently don't need to customize it per process.
+
+        class PosixSpawnAttr : public StoresErrorMessage
+        {
+            struct State
+            {
+                #ifndef _WIN32
+                bool spawn_attr_alive = false;
+                posix_spawnattr_t spawn_attr{};
+                #endif
+            };
+            State state;
+
+          public:
+            constexpr PosixSpawnAttr() {}
+
+            PosixSpawnAttr(std::nullptr_t)
+                : PosixSpawnAttr() // Run destructor on failure.
+            {
+                // Construct spawn attributes.
+                if (int spawn_res = posix_spawnattr_init(&state.spawn_attr))
+                {
+                    // No useful messages for us to emit here, so just write the number.
+                    // The manual doesn't mention this setting `errno`, so we use the return value instead. At least for `posix_spawn`, glibc sets the errno anyway, even though the manual doesn't say so, but for this function I can't check, because it never fails in glibc.
+                    error_string = "`posix_spawnattr_init()` failed: " + std::to_string(spawn_res);
+                    return;
+                }
+                state.spawn_attr_alive = true;
+
+                { // Configure the signal mask for `POSIX_SPAWN_SETSIGMASK` below. See that for details.
+                    sigset_t new_sigmask{};
+                    if (sigemptyset(&new_sigmask))
+                    {
+                        error_string = std::string("`sigemptyset()` failed: ") + std::strerror(errno);
+                        return;
+                    }
+
+                    // This seems to perform a deep copy, at least in glibc.
+                    if (int error = posix_spawnattr_setsigmask(&state.spawn_attr, &new_sigmask))
+                    {
+                        error_string = std::string("`posix_spawnattr_setsigmask()` failed: ") + std::strerror(error);
+                        return;
+                    }
+                }
+
+                // Set flags.
+                // `POSIX_SPAWN_SETSIGMASK` uses the mask we set with `posix_spawnattr_setsigmask` above.
+                //   We need this for two reasons. Firstly, general sanity. Secondly, for detached background processes we temporarily disable signals before forking, and this restores them.
+                // `POSIX_SPAWN_SETSIGDEF` resets the signal handling modes to the default values. Note that custom handlers seem to be detached automatically even without this.
+                if (int error = posix_spawnattr_setflags(&state.spawn_attr, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF))
+                {
+                    error_string = std::string("`posix_spawnattr_setflags()` failed: ") + std::strerror(error);
+                    return;
+                }
+            }
+
+            [[nodiscard]] PosixSpawnAttr(PosixSpawnAttr &&other) noexcept : state(std::move(other.state)) {other.state = {};}
+            PosixSpawnAttr &operator=(PosixSpawnAttr other) noexcept {std::swap(state, other.state); return *this;}
+
+            ~PosixSpawnAttr()
+            {
+                if (state.spawn_attr_alive)
+                    posix_spawnattr_destroy(&state.spawn_attr);
+            }
+
+            const posix_spawnattr_t &Underlying() const
+            {
+                assert(state.spawn_attr_alive && !HasError());
+                return state.spawn_attr;
+            }
+        };
+
+        // Returns the single global instance. Check it for errors before using!
+        [[nodiscard]] inline const PosixSpawnAttr &CommonPosixSpawnAttr()
+        {
+            static PosixSpawnAttr ret = nullptr;
+            return ret;
+        }
+
         #endif
     }
+
+#ifndef _WIN32
 
     // Creates a pipe, assigning the two ends to `read` and `write`, which should be initially empty. If they aren't empty, their existing values are discarded.
     // On success, returns true and makes `read` and `write` non-null.
@@ -1293,6 +1780,112 @@ namespace em::Proc
         return ret;
     }
 
+    // What to do if we're trying to open a file and it already exists?
+    enum class ExistingFile
+    {
+        // Open the file but discard the old contents.
+        overwrite,
+        // Open the file and keep the contents. Write operations will append to the end.
+        keep,
+        // Refuse to open an existing the file.
+        error,
+    };
+
+    using IoStreamRefVar = std::variant<std::reference_wrapper<InputStream>, std::reference_wrapper<OutputStream>>;
+
+    // This is a low-level function combining the effects of `OpenInputFile()` and `OpenOutputFile()`. Prefer one of those, and see them for more information.
+    // Opens a file and assigns it to `target`. `target` should initially be empty. If it isn't, its existing value is discarded.
+    // Returns true on success. Then makes `target` non-null.
+    // On failure returns false, and makes `target` null, and stores the error message in `target`.
+    // For input streams, it's also an error to pass `existing != keep`.
+    inline bool OpenFile(IoStreamRefVar target, NativeCStringViewParam filename, bool allow_creating, ExistingFile existing = ExistingFile::keep)
+    {
+        // In any case, reset the target first.
+        // This also throws if it was `valueless_by_exception()`.
+        std::visit([](auto &elem) {elem.get() = {};}, target);
+
+        // Validate `existing` enum.
+        bool existing_mode_valid = existing == ExistingFile::overwrite || existing == ExistingFile::keep || existing == ExistingFile::error;
+        assert(existing_mode_valid);
+        if (!existing_mode_valid)
+        {
+            std::visit([](auto &elem){elem.get() = {error_message, "Invalid `ExistingFile` enum value."};}, target);
+            return false;
+        }
+
+        // Perform stream-type-specific validation on the parameters.
+        if (!std::visit(detail::Overload{
+            [&](const std::reference_wrapper<InputStream> &elem)
+            {
+                // Input streams only allow one specific set of parameters.
+                if (allow_creating || existing != ExistingFile::keep)
+                {
+                    elem.get() = {error_message, "Input streams requires `allow_creating == false && existing == keep`."};
+                    return false;
+                }
+                return true;
+            },
+            [&](const std::reference_wrapper<OutputStream> &elem)
+            {
+                // This specific combination would never allow the file to be opened, so we error on it ourselves.
+                if (!allow_creating && existing == ExistingFile::error)
+                {
+                    elem.get() = {error_message, "Illegal mode combination for a stream: `allow_creating == false && existing == error`."};
+                    return false;
+                }
+                return true;
+            },
+        }, target))
+        {
+            return false;
+        }
+
+        #ifdef _WIN32
+        #error implement me
+        #else
+        int handle = open(
+            filename.GetPointer(),
+            // Here always pass append. Firstly it's simpler than manually seeking to the end of file, and secondly I hope it'll give better behavior if multiple processes open the same file (if that's legal in the first place?).
+            std::visit(detail::Overload{[](const InputStream &){return O_RDONLY;}, [](const OutputStream &){return O_WRONLY | O_APPEND;}}, target) |
+                (O_CREAT * allow_creating) |
+                (existing == ExistingFile::keep ? 0 : existing == ExistingFile::overwrite ? O_TRUNC : O_EXCL),
+            0777 // Rely on umask to set the mode. This `...` parameter is unused if `O_CREAT` is not passed, but it's easier to pass unconditionally.
+        );
+
+        if (handle < 0)
+        {
+            // Failed to open.
+            std::visit([](auto &elem){elem.get() = {error_message, std::string("`open()` failed: ") + std::strerror(errno)};}, target);
+            return false;
+        }
+
+        // Success.
+        std::visit([&](auto &elem){elem.get() = {take_ownership, handle};}, target);
+        return true;
+        #endif
+    }
+
+    // Opens a file for reading. Returns a null instance with an error stored in it on failure, call `.ErrorMessage()` for details.
+    [[nodiscard]] inline InputStream OpenInputFile(NativeCStringViewParam filename)
+    {
+        InputStream ret;
+        OpenFile(ret, std::move(filename), false, ExistingFile::keep);
+        return ret;
+    }
+
+    // Opens a file for writing. Returns a null instance with an error stored in it on failure, call `.ErrorMessage()` for details.
+    // `allow_creating` controls what happens if no such file exists. `true` means it's created, `false` means this function fails.
+    // `existing` controls what happens if such file already exists. `keep` means it's opened, `trucate` means its opened but the existing contents are destroyed, `error` means this function fails.
+    // It's an error to pass `!allow_creating && existing == error`.
+    [[nodiscard]] inline OutputStream OpenOutputFile(NativeCStringViewParam filename, bool allow_creating, ExistingFile existing = ExistingFile::keep)
+    {
+        OutputStream ret;
+        OpenFile(ret, std::move(filename), allow_creating, existing);
+        return ret;
+    }
+
+#endif
+
     // A list of environment variables.
     using EnvMap = std::map<NativeString, NativeString, std::less<>>;
 
@@ -1373,13 +1966,13 @@ namespace em::Proc
         [[nodiscard]] std::string ToString() const
         {
             return std::visit(detail::Overload{
-                [](const Background &) -> std::string {return "Detached background process.";},
-                [](const Code &elem)   -> std::string {return "Exited with code " + std::to_string(elem.code) + ".";},
+                [](const Detached &) -> std::string {return "Detached background process.";},
+                [](const Code &elem) -> std::string {return "Exited with code " + std::to_string(elem.code) + ".";},
                 #ifndef _WIN32
                 [](const Signal_Posix &elem) -> std::string {std::string ret = "Exited due to signal " + std::to_string(elem.signal) + "."; if (elem.core_dumped) ret += " Core dumped."; return ret;},
                 [](const Other_Posix &elem)  -> std::string {return "Exited for an unknown reason: " + std::to_string(elem.status) + ".";},
                 #endif
-                [](const Error &)      -> std::string {return "Library error.";},
+                [](const Error &)    -> std::string {return "Library error.";},
             }, var);
         }
 
@@ -1412,10 +2005,10 @@ namespace em::Proc
         };
         #endif
 
-        // Don't know if exited or not, this is a background process.
-        struct Background
+        // Don't know if exited or not, this is a detached background process.
+        struct Detached
         {
-            friend auto operator<=>(Background, Background) = default;
+            friend auto operator<=>(Detached, Detached) = default;
         };
 
         // Something is wrong with our library. No error message here, check `Process::ErrorMessage()` for more details.
@@ -1425,8 +2018,8 @@ namespace em::Proc
         };
 
         using Var = std::variant<
-            // `Background` is listed first because of the dumb default constructibility checks failing for nested classes with member initializers.
-            Background,
+            // `Detached` is listed first because of the dumb default constructibility checks failing for nested classes with member initializers.
+            Detached,
             Code,
             #ifndef _WIN32
             Signal_Posix,
@@ -1440,94 +2033,13 @@ namespace em::Proc
         ExitReason(Var var) : var(std::move(var)) {}
     };
 
-    // Process creation params.
-    class Params
+    // A part of parameters of a process. Stores the command line of a process being created.
+    class Command : public StoresErrorMessage
     {
       public:
-        // Call some setters after this.
-        [[nodiscard]] Params() noexcept
-        {
-            #ifndef _WIN32
-            // Those are dirt cheap to initialize, so no separate constructor.
+        [[nodiscard]] constexpr Command() {}
 
-            // Construct spawn attributes.
-            if (int spawn_res = posix_spawnattr_init(&state.spawn_attr))
-            {
-                // No useful messages for us to emit here, so just write the number.
-                // The manual doesn't mention this setting `errno`, so we use the return value instead. At least for `posix_spawn`, glibc sets the errno anyway, even though the manual doesn't say so, but for this function I can't check, because it never fails in glibc.
-                state.error = "`posix_spawnattr_init()` failed: " + std::to_string(spawn_res);
-                return;
-            }
-            state.spawn_attr_alive = true;
-
-            { // Configure the signal mask for `POSIX_SPAWN_SETSIGMASK` below. See that for details.
-                sigset_t new_sigmask{};
-                if (sigemptyset(&new_sigmask))
-                {
-                    state.error = std::string("`sigemptyset()` failed: ") + std::strerror(errno);
-                    return;
-                }
-
-                // This seems to perform a deep copy, at least in glibc.
-                if (int error = posix_spawnattr_setsigmask(&state.spawn_attr, &new_sigmask))
-                {
-                    state.error = std::string("`posix_spawnattr_setsigmask()` failed: ") + std::strerror(error);
-                    return;
-                }
-
-            }
-
-            // Set flags.
-            // `POSIX_SPAWN_SETSIGMASK` uses the mask we set with `posix_spawnattr_setsigmask` above.
-            //   We need this for two reasons. Firstly, general sanity. Secondly, for background processes we temporarily disable signals before forking, and this restores them.
-            // `POSIX_SPAWN_SETSIGDEF` resets the signal handling modes to the default values. Note that custom handlers seem to be detached automatically even without this.
-            if (int error = posix_spawnattr_setflags(&state.spawn_attr, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF))
-            {
-                state.error = std::string("`posix_spawnattr_setflags()` failed: ") + std::strerror(error);
-                return;
-            }
-
-            // Construct spawn file actions.
-            if (int spawn_res = posix_spawn_file_actions_init(&state.spawn_fa))
-            {
-                // No useful messages for us to emit here, so just write the number.
-                // The manual doesn't mention this setting `errno`, so we use the return value instead. At least for `posix_spawn`, glibc sets the errno anyway, even though the manual doesn't say so, but for this function I can't check, because it never fails in glibc.
-                state.error = "`posix_spawn_file_actions_init()` failed: " + std::to_string(spawn_res);
-                return;
-            }
-            state.spawn_fa_alive = true;
-            #endif
-        }
-
-        // If something fails, you'll get an error here.
-        // You don't have to check those, creating the process will do it for you.
-        [[nodiscard]] bool HasError() const {return !state.error.empty();}
-        [[nodiscard]] const std::string &ErrorMessage() const {return state.error;}
-
-        // Non-movable for now, this is simpler to implement.
-        Params(const Params &) = delete;
-        Params &operator=(const Params &) = delete;
-
-        ~Params()
-        {
-            #ifndef _WIN32
-            if (state.spawn_attr_alive)
-                posix_spawnattr_destroy(&state.spawn_attr);
-            if (state.spawn_fa_alive)
-                posix_spawn_file_actions_destroy(&state.spawn_fa);
-            #endif
-        }
-
-        // Returns true on a non-null instance.
-        // This becomes false if moved from.
-        [[nodiscard]] explicit operator bool() const
-        {
-            #ifdef _WIN32
-            return true;
-            #else
-            return state.spawn_attr_alive && state.spawn_fa_alive;
-            #endif
-        }
+        using StoresErrorMessage::StoresErrorMessage;
 
         #ifdef _WIN32
         // How to handle special symbols in CMD and batch arguments.
@@ -1536,13 +2048,13 @@ namespace em::Proc
             // Always error on `%`, because while it's possible to escape, certain batch files still allow it to be misused even when escaped. (E.g. those that run nested `cmd /c ...` instances.)
             // Only allow `!` if `/v:off` is specified, since otherwise `!` can have special behavior that can be unsafe. (`/v:on` would enable this unsafe behavior, and omitting it would take the default from the registry,
             //   which defaults to off, but we don't check the registry and just don't allow `!` in that case).
-            // When `CommandExtras::cmd_batch_override_registry == true`, we add our own `/v:off`, making sure `!` is allowed by default.
+            // When `Extras::cmd_batch_override_registry == true`, we add our own `/v:off`, making sure `!` is allowed by default.
             safe,
             // For `!`, same behavior as `safe`.
             // For `%`, allow and escape it, but only if `/e:on` is specified, which is necessary for the escape to work. (`e:off` would break our escape mechanism. Omitting it would take the default from the registry,
             //   which defaults to on, but we don't check the registry and just don't allow `%` in that case).
             // If `/e:on` is not specified, will error on `%`.
-            // When `CommandExtras::cmd_batch_override_registry == true`, we add our own `/e:on`, making sure `%` is allowed by default.
+            // When `Extras::cmd_batch_override_registry == true`, we add our own `/e:on`, making sure `%` is allowed by default.
             relaxed,
             // Allow both `%` and `!` unconditionally, and don't escape them.
             unsafe_as_is,
@@ -1551,14 +2063,15 @@ namespace em::Proc
         };
         #endif
 
-        struct CommandExtras
+        struct Extras
         {
             #ifdef _WIN32
             // When running `cmd ... /c`, add some flags at `...` to ignore certain registry overrides, ensuring sane consistent behavior even if the user has something weird in the registry.
             // Will also prepend `cmd ... /c` when running batch files to prepend the same flags.
+            // Note that this is only respect on constructor overloads that take a list of arguments. Those that take a single long string ignore this.
             bool cmd_batch_override_registry_win = true;
 
-            // Defined unconditionally for simplicity. Because of that we don't suffix it `_win`.
+            // Note that this is only respect on constructor overloads that take a list of arguments. Those that take a single long string ignore this.
             CmdBatchSafety_Win cmd_safety_win = CmdBatchSafety_Win::safe;
             #endif
         };
@@ -1571,317 +2084,134 @@ namespace em::Proc
         // Also on Windows `executable` allows passing overly long executable names. (Those must be prefixed with `\\?\` and canonicalized to use `\` instead of `/`,
         //   don't use multiple adjacent `\`, don't use `.` or `..` directory names, etc. But they remain case-insensitive.)
         #ifdef _WIN32
-        Params &Command(std::span<const NativeString> argv, std::optional<NativeString> executable = {}, CommandExtras extras = DefaultCommandExtras())
+        [[nodiscard]] Command(std::span<const MaybeOwningNativeString> argv, std::optional<MaybeOwningNativeString> executable = {}, Extras extras = DefaultExtras())
         {
-            detail_SetCommand_Win(executable, extras, argv.size(), [&](std::size_t i) -> const auto & {return argv[i];});
-            return *this;
+            detail_InitCommand_Win(executable, extras, argv.size(), [&](std::size_t i) -> const auto & {return argv[i];});
         }
-        Params &Command(std::initializer_list<NativeString> argv, std::optional<NativeString> executable = {}, CommandExtras extras = DefaultCommandExtras())
-        {
-            return Command(std::span(argv), std::move(executable), std::move(extras));
-        }
+        [[nodiscard]] Command(std::initializer_list<MaybeOwningNativeString> argv, std::optional<MaybeOwningNativeString> executable = {}, Extras extras = DefaultExtras())
+            : Command(std::span(argv), std::move(executable), std::move(extras))
+        {}
         #else
-        Params &Command(std::vector<NativeString> argv, std::optional<NativeString> executable = {}, CommandExtras extras = DefaultCommandExtras())
+        [[nodiscard]] Command(std::vector<MaybeOwningNativeString> argv, std::optional<MaybeOwningNativeString> executable = {}, Extras extras = DefaultExtras())
         {
             (void)extras;
-            state.cmd_argv_storage = std::move(argv);
-            std::size_t argc = state.cmd_argv_storage.size();
-            // A direct resize should be faster than reserve?
-            state.cmd_argv_ptrs_storage.resize(argc + 1); // +1 for the terminating null pointer.
-            for (std::size_t i = 0; i < argc; i++)
-                state.cmd_argv_ptrs_storage[i] = state.cmd_argv_storage[i].native.c_str();
-            state.cmd_argv_ptrs_storage.back() = nullptr; // Zero explicitly in case the vector wasn't empty before.
-            state.cmd_argv = state.cmd_argv_ptrs_storage.data();
-
-            state.exe_path = std::move(executable);
-            return *this;
+            resulting_command = std::move(argv);
+            resulting_executable = std::move(executable);
+        }
+        // Since those are constructors, having the `std::initializer_list` version allows `.command = {"foo", "bar"}`, which is nice.
+        // Otherwise this would be unnecessary. Unlike on Windows, where the other overload takes a span rather than a vector, and spans still don't have a constructor from `initializer_list`.
+        [[nodiscard]] Command(std::initializer_list<MaybeOwningNativeString> argv, std::optional<MaybeOwningNativeString> executable = {}, Extras extras = DefaultExtras())
+        {
+            (void)extras;
+            resulting_command = std::vector<MaybeOwningNativeString>(std::move(argv)); // If only the init_list could actually be moved...
+            resulting_executable = std::move(executable);
         }
         #endif
-        // This version doesn't copy `argv` on POSIX, make sure it doesn't dangle until the process starts.
-        // Naming this `Command` means that `Command({})` will call this overload and not the vector one. This isn't a big deal.
-        // Note, the `executable is narrow here to match `argv`. This is to simplify our implementation, since the command line is assembled narrow here,
+        // From `argv`. Note that this version copies the strings. There's another overload below that doesn't copy them (on POSIX).
+        // Note, the `executable` is narrow here to match `argv`. This is to simplify our implementation, since the command line is assembled narrow here,
         //   and we might need to copy `executable` into the command line. I guess we could overload this with a `NativeString` executable, and narrow that
         //   ourselves, but it's probably not worth it. You can do it yourself if you need.
-        Params &Command(const char *const *argv, std::optional<std::string> executable = {}, CommandExtras extras = DefaultCommandExtras())
+        // `Command({})` happens to call this overload and not the vector one. This isn't a big deal.
+        [[nodiscard]] Command(const char *const *argv, std::optional<MaybeOwningString> executable = {}, Extras extras = DefaultExtras())
         {
             #ifdef _WIN32
-            detail_SetCommand_Win(executable, extras, detail::PtrArraySize(argv), [&](std::size_t i) {return argv[i];});
+            detail_InitCommand_Win(executable, extras, detail::PtrArraySize(argv), [&](std::size_t i) {return argv[i];});
             #else
             (void)extras;
-
-            state.cmd_argv_storage.clear();
-            state.cmd_argv_ptrs_storage.clear();
-            state.cmd_argv = argv;
-
-            state.exe_path = std::move(executable);
+            resulting_command = argv;
+            resulting_executable = std::move(executable);
             #endif
+        }
 
-            return *this;
+        // This version doesn't copy `argv` on POSIX, make sure it doesn't dangle until the process starts.
+        // Note, the `executable` is narrow here to match `argv`. This is to simplify our implementation, since the command line is assembled narrow here,
+        //   and we might need to copy `executable` into the command line. I guess we could overload this with a `NativeString` executable, and narrow that
+        //   ourselves, but it's probably not worth it. You can do it yourself if you need.
+        [[nodiscard]] Command(TagNonOwning, const char *const *argv, std::optional<MaybeOwningString> executable = {}, Extras extras = DefaultExtras())
+        {
+            #ifdef _WIN32
+            detail_InitCommand_Win(executable, extras, detail::PtrArraySize(argv), [&](std::size_t i) {return argv[i];});
+            #else
+            (void)extras;
+            resulting_command = {non_owning, argv};
+            resulting_executable = std::move(executable);
+            #endif
         }
 
         #ifdef _WIN32
         // Windows special: Command as a single string. Like `argv`, `command_str` must start with the executable name, which can be overridden with `executable`.
         // On Windows, if `executable` is specified, then `command` can be null. It's unclear if this does anything different compared to just passing 0 arguments.
-        // This ignores `extras.cmd_batch_mode`, but we're still passing `extras` for consistency.
-        Params &CommandString_Win(std::optional<NativeString> command, std::optional<NativeString> executable = {}, CommandExtras extras = DefaultCommandExtras())
+        // NOTE: This ignores `extras.cmd_batch_override_registry_win` and `extras.cmd_safety_win`, but we're still passing `extras` for consistency.
+        [[nodiscard]] Command(TagWindowsOnly, std::optional<MaybeOwningMutNativeString> command, std::optional<MaybeOwningNativeString> executable = {}, Extras extras = DefaultExtras())
         {
             (void)extras;
-            state.cmd_string = std::move(command);
-            state.exe_path = std::move(executable);
-            return *this;
+            resulting_command = std::move(command);
+            resulting_executable = std::move(executable);
         }
 
-        // Windows special: Command as a wide `argv`. Unlike the narrow `argv` version on POSIX, this is consumed immediately and can't dangle.
+        // Windows special: Command as a wide `argv`.
         // On Windows, if `executable` is specified, then `argv` can be null. It's unclear if this does anything different compared to just passing 0 arguments.
-        Params &Command_Win(const wchar_t *const *argv, std::optional<NativeString> executable, CommandExtras extras = DefaultCommandExtras())
+        [[nodiscard]] Command(TagWindowsOnly, const wchar_t *const *argv, std::optional<MaybeOwningNativeString> executable, Extras extras = DefaultExtras())
         {
-            detail_SetCommand_Win(executable, extras, detail::PtrArraySize(argv), [&](std::size_t i) {return argv[i];});
-            return *this;
+            detail_InitCommand_Win(executable, extras, detail::PtrArraySize(argv), [&](std::size_t i) {return argv[i];});
+        }
+
+        // Windows special: Command as a non-owning string.
+        // Note that the command is clobbered when the process is started, so the pointer is non-const.
+        // The updated string is not useful and should be discarded.
+        // NOTE: This ignores `extras.cmd_batch_override_registry_win` and `extras.cmd_safety_win`, but we're still passing `extras` for consistency.
+        [[nodiscard]] Command(TagWindowsOnly, TagNonOwning, wchar_t *command, std::optional<MaybeOwningNativeString> executable, Extras extras = DefaultExtras())
+        {
+            (void)extras;
+            if (command) // `resulting_command` doesn't mind being assigned `nullptr`, but that's treated as an empty string, and we'd rather have it treated as an absence of a command.
+                resulting_command = command;
+            resulting_executable = std::move(executable);
         }
         #endif
-
-
-        // Set the environment variables. This overrides all variables. Use `CurrentEnv()` to get the variables of the current process, if you only want to modify some.
-        // If this is not called, the default behavior is to use the variables of the current process, reading them right when starting the new process (not when constructing `Params`).
-        Params &Env(EnvMap env_vars)
-        {
-            // Validate.
-            for (const auto &elem : env_vars)
-            {
-                // `=` in the key.
-                // If we wanted to check both `=` and `\0` in one line, we could do `.find_first_of(std::basic_string_view(EM_PROC_NATIVE("="), 2))`, but I'd rather have separate nice errors.
-                if (elem.first.native.find_first_of('=') != std::size_t(-1))
-                {
-                    // See above for why we don't report the variable name.
-                    state.error = "Some environment variables had `=` in the names.";
-                    return *this;
-                }
-                // `\0` in the key.
-                if (elem.first.native.find_first_of('\0') != std::size_t(-1))
-                {
-                    // See above for why we don't report the variable name.
-                    state.error = "Some environment variables had null characters in the names.";
-                    return *this;
-                }
-                // `\0` in the value.
-                if (elem.second.native.find_first_of('\0') != std::size_t(-1))
-                {
-                    // See above for why we don't report the variable name.
-                    state.error = "Some environment variables had null characters in the values.";
-                    return *this;
-                }
-            }
-
-            #ifdef _WIN32
-
-            std::size_t needed_size = 0;
-            for (const auto &elem : env_vars)
-                needed_size += elem.first.native.size() + elem.second.native.size() + 2; // +1 for `=` and +1 for the separating `\0`.
-
-            state.env_string.native.clear();
-            state.env_string.native.reserve(needed_size); // This way we get `\0\0` at the end, which is exactly what we want.
-            for (const auto &elem : env_vars)
-            {
-                state.env_string.native += elem.first.native;
-                state.env_string.native += '=';
-                state.env_string.native += elem.second.native;
-                state.env_string.native += '\0'; // Intentional even after the last element. We want `\0\0` after the last element.
-            }
-
-            state.env_ptr = state.env_string.native.c_str();
-
-            #else
-
-            std::size_t count = env_vars.size();
-
-            state.env_storage.reserve(count);
-            for (const auto &elem : env_vars)
-                state.env_storage.push_back(elem.first.native + '=' + elem.second.native);
-
-            // A direct resize should be faster than reserve?
-            state.env_ptrs_storage.resize(count + 1); // +1 for the terminating null pointer.
-            for (std::size_t i = 0; i < count; i++)
-                state.env_ptrs_storage[i] = state.env_storage[i].c_str();
-            state.env_ptrs_storage.back() = nullptr; // Zero explicitly in case the vector wasn't empty before.
-
-            state.env_ptr = state.env_ptrs_storage.data();
-            #endif
-
-            return *this;
-        }
-        // This version doesn't copy the strings on POSIX, so make sure they don't dangle.
-        // This can't be named `Env()` because then `Env({})` would call this overload, rather than passing an empty map, which is error-prone (unlike the similar `Command()` situation).
-        Params &EnvPtr(const char *const *env_vars)
-        {
-            #ifdef _WIN32
-            if (env_vars)
-                return EnvString_Win(detail::AssembleEnvironmentFromPtr(env_vars));
-            else
-                return EnvStringPtr_Win(nullptr); // Special-case this to uncustomize the environment, to mirror the POSIX behavior. Why not.
-            #else
-            state.env_storage.clear();
-            state.env_ptrs_storage.clear();
-            state.env_ptr = env_vars;
-            return *this;
-            #endif
-        }
 
         #ifdef _WIN32
-        // Windows special: Environment from a single string, of the form `A=B \0 C=D \0 E=F \0\0`.
-        Params &EnvString_Win(NativeString env)
+        // Returns the command string generated from the constructor arguments. Mostly for internal use.
+        // This is non-const because on Windows the command is clobbered when ran.
+        [[nodiscard]] wchar_t *ResultingCommand_Win()
         {
-            state.env_string = std::move(env.native);
-            state.env_ptr = state.env_string.native.c_str();
-            return *this;
+            return resulting_command ? resulting_command->GetMutPointer() : nullptr;
         }
-        // Windows special: Environment from a single non-owning pointer. Same format as `EnvString_Win()`, but can dangle.
-        // There's no narrow version, because that's just `EnvString_Win()`.
-        Params &EnvStringPtr_Win(const wchar_t *env)
+        #else
+        // Returns the command arguments as passed to a constructor. Mostly for internal use.
+        [[nodiscard]] const char *const *ResultingCommand_Posix() const
         {
-            state.env_string = {};
-            state.env_ptr = env;
-            return *this;
-        }
-        // Windows special: From pointer array. Copies the contents, never dangles.
-        Params &EnvPtr_Win(const wchar_t *const *env_vars)
-        {
-            return EnvString_Win(detail::AssembleEnvironmentFromPtr(env_vars));
+            return resulting_command.GetPointer();
         }
         #endif
 
-
-        // This causes us to immediately release the process handle after starting it, so you can't wait for it to terminate and can't get its exit code.
-        //   (In theory, on POSIX we could still wait using the PID, using `kill(pid, 0)`. But that seems unreliable, because the PID could be reused by another process. And not very useful in the first place.)
-        //
-        // This prevents the mandatory wait for the process in the destructor. (Without this, the destructor is forced to wait on POSIX, otherwise we'd leak resources, look up so-called "zombie processes".
-        //   And on Windows it doesn't seem to be the case, but we replicate the POSIX behavior for consistency.)
-        //
-        // Also on POSIX this has a special effect of ensuring that this child won't get the terminal of the current process if the current process dies before the child, so it couldn't be Ctrl+C'ed in that case.
-        //
-        // What this does on POSIX is called "double forking" of "daemonizing" the new process, see this for more details: https://stackoverflow.com/q/881388/2752075
-        // You can still wait for its completion since we know its PID, but enabling this theoretically makes it not reliable anymore, since something could've reused it, I think?
-        Params &Background(bool enable = true)
+        // Returns the executable filename as passed to a constructor. Mostly for internal use.
+        [[nodiscard]] const std::optional<MaybeOwningNativeString> &ResultingExecutable() const
         {
-            state.background = enable;
-            return *this;
+            return resulting_executable;
         }
-
-        #ifdef _WIN32
-        // Windows special! Add or remove process creation flags, as documented here: https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags
-        Params &AddFlags_Win(DWORD flags)
-        {
-            state.process_flags |= flags;
-            return *this;
-        }
-        Params &RemoveFlags_Win(DWORD flags)
-        {
-            state.process_flags &= ~flags;
-            return *this;
-        }
-        #endif
-
-        // Sets the current directory (aka working directory).
-        // If not specified, the default behavior is to copy the working directory of the current process (when starting the subprocess, not when creating the `Params` instance, just like we do when mirroring environment).
-        Params &CurrentDirectory(std::optional<NativeString> working_dir)
-        {
-            #ifdef _WIN32
-            state.working_dir = std::move(working_dir);
-            #else
-            if (state.spawn_fa_alive)
-            {
-                // `_np` suffix means "non-portable" and marks experimental functions.
-                // Modern glibc has a version of it without the suffix, and so does MacOS. MacOS marks the `_np` version as deprecated.
-                // Android NDK doesn't have a non-`_np` version though (at v29, which is what I'm looking at).
-                // So I'm using the `_np` version just in case.
-                posix_spawn_file_actions_addchdir_np(&state.spawn_fa, working_dir->native.c_str());
-            }
-            else
-            {
-                // Silently ignoring this in release builds. Starting the process will catch this being null anyway.
-                // Since initializing `posix_spawn_file_actions_t` apparently can't fail on glibc, this should only happen in practice if it's moved from.
-                assert(false && "Operating on a null `posix_spawn_file_actions_t`, is this instance moved from?");
-            }
-            #endif
-            return *this;
-        }
-
-        // Inherit `stdin` from the parent application. This is the default behavior.
-        Params &Stdin_Inherit() {state.stdin_var = StreamInherit{}; return *this;}
-        // Disable `stdin`.
-        Params &Stdin_Null() {state.stdin_var = StreamNull{}; return *this;}
-        // Attach `stdin` to something.
-        // One of the things you can pass here is `MakePipe(output)`.
-        Params &Stdin_Attach(InputStream input) {state.stdin_var = std::move(input); return *this;}
 
       private:
-        struct StreamInherit {};
-        struct StreamNull {};
-        struct StreamMergeIntoOtherOutput {}; // Mark one of the two output streams (`stdout` or `stderr`) with this to merge it into the other one.
+        #ifdef _WIN32
+        // This is optional if `exe_path` is specified.
+        // We could drop the `optional` and instead treat the empty string as no command, but meh. Would have to do the same for the executable...
+        // This uses non-const `wchar_t` because starting the process clobbers it.
+        std::optional<detail::MaybeOwningMaybeMutString<wchar_t>> resulting_command;
+        #else
+        // The element type is `MaybeOwningNativeString` rather than `std::string` to allow moving in `std::vector<MaybeOwningNativeString>` as is.
+        detail::StringPtrArray<MaybeOwningNativeString> resulting_command;
+        #endif
 
-        // In those, "inherit" is first to keep it the default behavior.
-        using InputStreamVar = std::variant<StreamInherit, StreamNull, InputStream>;
-        using OutputStreamVar = std::variant<StreamInherit, StreamNull, OutputStream, StreamMergeIntoOtherOutput>;
+        std::optional<MaybeOwningNativeString> resulting_executable;
 
-        struct State
-        {
-            // Having those in a struct isn't strictly necessary anymore. Leaving it in case we decide to make this movable later.
-
-            // If this is non-empty, the object is in an error state.
-            // When we assign to this, we don't immediately destroy the resources we already created.
-            // This is easier to implement, and also lets the user check for errors faster.
-            std::string error;
-
-
-            #ifndef _WIN32
-            bool spawn_attr_alive = false;
-            posix_spawnattr_t spawn_attr{};
-            bool spawn_fa_alive = false;
-            posix_spawn_file_actions_t spawn_fa{};
-            #endif
-
-
-            #ifdef _WIN32
-            // This is optional if `exe_path` is specified.
-            std::optional<NativeString> cmd_string;
-            #else
-            const char *const *cmd_argv = nullptr;
-            std::vector<NativeString> cmd_argv_storage; // Not `std::vector<std::string>` for simplicity, since the user argument comes in this type.
-            std::vector<const char *> cmd_argv_ptrs_storage;
-            #endif
-
-            // There's no non-owning version of this for pure convenience. Who needs long paths?
-            std::optional<NativeString> exe_path;
-
-
-            #ifdef _WIN32
-            const wchar_t *env_ptr = nullptr; // Non-owning.
-            NativeString env_string;
-            #else
-            const char *const *env_ptr = nullptr; // Non-owning.
-            std::vector<std::string> env_storage;
-            std::vector<const char *> env_ptrs_storage;
-            #endif
-
-
-            bool background = false;
-
-
-            #ifdef _WIN32
-            DWORD process_flags = CREATE_UNICODE_ENVIRONMENT;
-            std::optional<NativeString> working_dir; // On POSIX this is baked into `spawn_attr`.
-            #endif
-
-
-            InputStreamVar stdin_var;
-        };
-        State state;
+        [[nodiscard]] static Extras DefaultExtras() {return {};} // Make Clang happy.
 
         #ifdef _WIN32
-        // If `String` is `NativeString`, then `get_arg(i)` should return that, possibly by reference.
-        // Otherwise `String` has to be `std::basic_string<T>`, then `get_arg(i)` should return something convertible to `std::basic_string_view<T>`.
+        // Here `String` is either `MaybeOwningNativeString` or `MaybeOwningString`.
+        // `get_arg(i)` should return something string-like of matching character width.
         // This is a little wrapper for `detail::AssembleCommandLine()`. Maybe we could merge them, but it's currently easier not to.
+        // This function is always called from constructors, so it doesn't reset the existing values of the fields.
         template <typename String>
-        void detail_SetCommand_Win(std::optional<String> executable, CommandExtras extras, std::size_t num_args, auto &&get_arg)
+        void detail_InitCommand_Win(std::optional<String> executable, Extras extras, std::size_t num_args, auto &&get_arg)
         {
             bool ok = false;
 
@@ -1893,143 +2223,397 @@ namespace em::Proc
                     extras.cmd_batch_override_registry_win,
                     extras.cmd_safety_win == CmdBatchSafety_Win::unsafe_as_is ? 0 : extras.cmd_safety_win == CmdBatchSafety_Win::relaxed ? 1 : 2,
                     out_command,
-                    state.error,
+                    error_string,
                     decltype(get_arg)(get_arg)
                 );
             };
 
-            if constexpr (std::is_same_v<String, NativeString>)
+            if constexpr (std::is_same_v<String, MaybeOwningNativeString>)
             {
-                MakeCommand(state.cmd_string);
+                MakeCommand(resulting_command);
+                if (ok)
+                    resulting_executable = std::move(executable); // This correctly handles null optionals.
             }
             else
             {
-                std::optional<String> out_command; // Have to use a temporary output variable of the specific type.
+                std::optional<detail::MaybeOwningMaybeMutString<detail::StringToCharType<String>>> out_command; // Have to use a temporary output variable of the specific type.
                 MakeCommand(out_command);
-                state.cmd_string = std::move(out_command); // This correctly handles null optionals.
+
+                if (ok)
+                {
+                    if (out_command)
+                        resulting_command = out_command->GetStringView();
+
+                    if (executable)
+                        resulting_executable = executable->GetStringView();
+                }
             }
 
-            // Write the updated executable name.
-            if (ok)
-                state.exe_path = std::move(executable); // This correctly handles null optionals.
+        }
+        #endif
+    };
+
+    // A part of parameters of a process. Stores the environment variables.
+    class Environment : public StoresErrorMessage
+    {
+      public:
+        // Only this constructor means keeping the environment variables of the parent process.
+        [[nodiscard]] constexpr Environment() {}
+
+        using StoresErrorMessage::StoresErrorMessage;
+
+        // Set the environment variables. This overrides all variables. Use `CurrentEnv()` to get the variables of the current process, if you only want to modify some.
+        // If this is not called, the default behavior is to use the variables of the current process, reading them right when starting the new process (not when constructing `Params`).
+        [[nodiscard]] Environment(EnvMap env_vars)
+        {
+            // Validate.
+            for (const auto &elem : env_vars)
+            {
+                // `=` in the key.
+                // If we wanted to check both `=` and `\0` in one line, we could do `.find_first_of(std::basic_string_view(EM_PROC_NATIVE("="), 2))`, but I'd rather have separate nice errors.
+                if (elem.first.native.find_first_of('=') != std::size_t(-1))
+                {
+                    // See above for why we don't report the variable name.
+                    error_string = "Some environment variables had `=` in the names.";
+                    return;
+                }
+                // `\0` in the key.
+                if (elem.first.native.find_first_of('\0') != std::size_t(-1))
+                {
+                    // See above for why we don't report the variable name.
+                    error_string = "Some environment variables had null characters in the names.";
+                    return;
+                }
+                // `\0` in the value.
+                if (elem.second.native.find_first_of('\0') != std::size_t(-1))
+                {
+                    // See above for why we don't report the variable name.
+                    error_string = "Some environment variables had null characters in the values.";
+                    return;
+                }
+            }
+
+            #ifdef _WIN32
+
+            std::size_t needed_size = 0;
+            for (const auto &elem : env_vars)
+                needed_size += elem.first.native.size() + elem.second.native.size() + 2; // +1 for `=` and +1 for the separating `\0`.
+
+            std::wstring str;
+            str.reserve(needed_size); // This way we get `\0\0` at the end, which is exactly what we want.
+            for (const auto &elem : env_vars)
+            {
+                str += elem.first.native;
+                str += '=';
+                str += elem.second.native;
+                str += '\0'; // Intentional even after the last element. We want `\0\0` after the last element.
+            }
+
+            resulting_env = std::move(str);
+
+            #else
+            resulting_env = {env_vars.size(), [iter = env_vars.begin()](std::size_t) mutable {return iter->first.native + '=' + iter->second.native;}};
+            #endif
+        }
+
+        // This is only meaningful on Windows, but defined unconditionally for simplicity (so no `_Win` suffix).
+        // It's a bit weird that this enum is specific to `class Environment`, but everything else uses `bool *out_success`, and here it doesn't fit because this class stores its own errors.
+        enum class EncodingMode
+        {
+            relaxed, // Insert placeholder characters on encoding errors.
+            error, // Fail on encoding errors.
+        };
+
+        // This version copies the strings. There's another non-owning one below.
+        // Passing null here means no variables.
+        [[nodiscard]] Environment(const char *const *env_vars, EncodingMode encoding = EncodingMode::relaxed)
+        {
+            #ifdef _WIN32
+            if (env_vars)
+            {
+                bool success = false;
+                resulting_env = ConvertString(windows_only, detail::AssembleEnvironmentFromPtr(env_vars), encoding == EncodingMode::error ? &success : nullptr);
+                if (encoding == EncodingMode::error && !success)
+                    error_string = "Encoding error.";
+            }
+            #else
+            (void)encoding;
+
+            // Validate that all variables have `=` in them.
+            if (env_vars)
+            {
+                for (auto copy = env_vars; *copy; copy++)
+                {
+                    if (std::string_view(*copy).find('=') == std::string_view::npos)
+                    {
+                        error_string = "Missing `=` in environment variable.";
+                        return;
+                    }
+                }
+            }
+
+            resulting_env = env_vars;
+            #endif
+        }
+
+        // This version doesn't copy the strings on POSIX, so make sure they don't dangle.
+        // Passing null here means no variables.
+        [[nodiscard]] Environment(TagNonOwning, const char *const *env_vars, EncodingMode encoding = EncodingMode::relaxed)
+        #ifdef _WIN32
+            : Environment(env_vars, encoding)
+        {}
+        #else
+        {
+            (void)encoding;
+
+            // No validation here, use the pointer as is.
+            resulting_env = {non_owning, env_vars};
         }
         #endif
 
-        [[nodiscard]] static CommandExtras DefaultCommandExtras() {return {};} // Make Clang happy.
+        #ifdef _WIN32
+        // Windows special: Environment from a single string, of the form `A=B \0 C=D \0 E=F \0\0`.
+        [[nodiscard]] Environment(TagWindowsOnly, MaybeOwningNativeString env)
+        {
+            // Trust the string validity.
+            resulting_env = std::move(env);
+        }
+        // Windows special: From pointer array. Copies the contents, never dangles.
+        [[nodiscard]] Environment(TagWindowsOnly, const wchar_t *const *env_vars)
+        {
+            resulting_env = detail::AssembleEnvironmentFromPtr(env_vars);
+        }
+        #endif
 
-        friend class Process;
+
+        #ifdef _WIN32
+        // Returns the command string generated from the constructor arguments. Mostly for internal use.
+        // This is non-const because on Windows the command is clobbered when ran.
+        [[nodiscard]] const wchar_t *ResultingEnvironment_Win() const
+        {
+            return resulting_env ? resulting_env->GetPointer() : nullptr;
+        }
+        #else
+        // Returns the command arguments as passed to a constructor. Mostly for internal use.
+        [[nodiscard]] const char *const *ResultingEnvironment_Posix() const
+        {
+            return resulting_env ? resulting_env->GetPointer() : nullptr;
+        }
+        #endif
+
+      private:
+        #ifdef _WIN32
+        std::optional<MaybeOwningNativeString> resulting_env;
+        #else
+        // Using `MaybeOwningNativeString` here instead of `std::string`, because why not.
+        std::optional<detail::StringPtrArray<MaybeOwningNativeString>> resulting_env;
+        #endif
+    };
+
+    // A part of parameters of a process. Stores misc stuff that doesn't fit anywhere else.
+    class MiscParams : public StoresErrorMessage
+    {
+      public:
+        [[nodiscard]] constexpr MiscParams() {}
+
+        using StoresErrorMessage::StoresErrorMessage;
+
+        // This causes us to immediately release the process handle after starting it, so you can't wait for it to terminate and can't get its exit code.
+        //   (In theory, on POSIX we could still wait using the PID, using `kill(pid, 0)`. But that seems unreliable, because the PID could be reused by another process. And not very useful in the first place.)
+        //
+        // This prevents the mandatory wait for the process in the destructor. (Without this, the destructor is forced to wait on POSIX, otherwise we'd leak resources, look up so-called "zombie processes".
+        //   And on Windows it doesn't seem to be the case, but we replicate the POSIX behavior for consistency.)
+        //
+        // Also on POSIX this has a special effect of ensuring that this child won't get the terminal of the current process if the current process dies before the child, so it couldn't be Ctrl+C'ed in that case.
+        //
+        // What this does on POSIX is called "double forking" of "daemonizing" the new process, see this for more details: https://stackoverflow.com/q/881388/2752075
+        bool detach = false;
+
+        std::optional<MaybeOwningNativeString> working_directory;
+    };
+
+    // A baked form of `MiscParams`.
+    class BakedMiscParams : public StoresErrorMessage
+    {
+      public:
+        [[nodiscard]] constexpr BakedMiscParams() {}
+
+        // Move-only.
+        [[nodiscard]] BakedMiscParams(BakedMiscParams &&other) noexcept : state(std::move(other.state)) {other.state = {};}
+        BakedMiscParams &operator=(BakedMiscParams other) noexcept {std::swap(state, other.state); return *this;}
+
+        ~BakedMiscParams()
+        {
+            #ifndef _WIN32
+            if (state.spawn_fa_alive)
+                posix_spawn_file_actions_destroy(&state.spawn_fa);
+            #endif
+        }
+
+
+        using StoresErrorMessage::StoresErrorMessage;
+
+        [[nodiscard]] BakedMiscParams(MiscParams &&params)
+            : BakedMiscParams() // Call destructor on throw.
+        {
+            // Construct spawn file actions.
+            #ifndef _WIN32
+            // Returns true on error, then the constructor should return too.
+            // Constructs the `posix_spawn_file_actions_t` on the first call. Repeated calls do nothing.
+            auto ConstructFileActionsIfNeeded = [&]() -> bool
+            {
+                if (int error = posix_spawn_file_actions_init(&state.spawn_fa))
+                {
+                    // No useful messages for us to emit here, so just write the number.
+                    // The manual doesn't mention this setting `errno`, so we use the return value instead. At least for `posix_spawn`, glibc sets the errno anyway, even though the manual doesn't say so, but for this function I can't check, because it never fails in glibc.
+                    error_string = "`posix_spawn_file_actions_init()` failed: " + std::to_string(error);
+                    return true;
+                }
+                state.spawn_fa_alive = true;
+                return false;
+            };
+            #endif
+
+            // Working directory.
+            #ifdef _WIN32
+            state.working_directory = std::move(params.working_directory);
+            #else
+            // `_np` suffix means "non-portable" and marks experimental functions.
+            // Modern glibc has a version of it without the suffix, and so does MacOS. MacOS marks the `_np` version as deprecated.
+            // Android NDK doesn't have a non-`_np` version though (at v29, which is what I'm looking at).
+            // So I'm using the `_np` version just in case.
+            if (params.working_directory)
+            {
+                ConstructFileActionsIfNeeded();
+                if (int error = posix_spawn_file_actions_addchdir_np(&state.spawn_fa, params.working_directory->GetPointer()))
+                {
+                    error_string = "`posix_spawn_file_actions_addchdir()` failed: " + std::to_string(error);
+                }
+            }
+            #endif
+
+
+            // Lastly, reset the parameters.
+            params = {};
+        }
+
+
+        [[nodiscard]] bool ShouldDetach() const
+        {
+            return state.detach;
+        }
+
+        #ifdef _WIN32
+        [[nodiscard]] const std::optional<MaybeOwningNativeString> &ResultingWorkingDir_Win() const
+        {
+            return state.working_directory;
+        }
+        #else
+        [[nodiscard]] const posix_spawn_file_actions_t *ResultingFileActions_Posix() const
+        {
+            // `spawn_fa_alive == false` is not an error here. It can mean that we didn't need any custom file actions.
+            return state.spawn_fa_alive ? &state.spawn_fa : nullptr;
+        }
+        #endif
+
+      private:
+        struct State
+        {
+            bool detach = false;
+
+            #ifdef _WIN32
+            std::optional<MaybeOwningNativeString> working_directory;
+            #else
+            bool spawn_fa_alive = false;
+            posix_spawn_file_actions_t spawn_fa{};
+            #endif
+        };
+        State state;
+    };
+
+    // The combined process parameters.
+    // Normally you want to use this, but you can also create the individual parameter classes separately, if you want to reuse some of them between several processes.
+    struct Params : MiscParams
+    {
+        Command command;
+        Environment env;
     };
 
     // A single subprocess.
-    class Process
+    class Process : public StoresErrorMessage
     {
       public:
         [[nodiscard]] constexpr Process() {}
 
+        using StoresErrorMessage::StoresErrorMessage;
+
+        // The high-level constructor taking the parameter struct.
         [[nodiscard]] Process(const Params &params)
-            : Process() // Run the destructor on throw.
-        {
-            StartProcess(params);
-        }
-
+            : Process(params.command, params.env, BakedMiscParams(Params(params)))
+        {}
         [[nodiscard]] Process(Params &&params)
-            : Process() // Run the destructor on throw.
+            : Process(std::move(params.command), params.env, BakedMiscParams(std::move(params)))
+        {}
+
+        // The low-level constructor from separate parameter classes.
+        // This has two versions: taking `const Command &` and `Command &&`. On Windows, the command is consumed by starting the process,
+        //   so there if you don't move it, it has to be copied. (Copying the whole `Command` is not entirely optimal,
+        //   since the executable name is not consumed but we copy it anyway, but I don't see a good solution to this. Who cares anyway.)
+
+        #ifdef _WIN32
+        [[nodiscard]] Process(const Command &command, const Environment &env, const BakedMiscParams &misc)
+            : Process(Command(command), env, misc)
+        {}
+
+        [[nodiscard]] Process(Command &&command, const Environment &env, const BakedMiscParams &misc)
+        #else
+        [[nodiscard]] Process(Command &&command, const Environment &env, const BakedMiscParams &misc)
+            : Process(command, env, misc)
+        {}
+
+        [[nodiscard]] Process(const Command &command, const Environment &env, const BakedMiscParams &misc)
+        #endif
         {
-            StartProcess(std::move(params));
-        }
-
-        // This is move-only.
-        [[nodiscard]] Process(Process &&other) noexcept : state(std::move(other.state)) {other.state = {};}
-        Process &operator=(Process other) noexcept {std::swap(state, other.state); return *this;}
-
-        // The default behavior is to wait for the process (if `IsBackground() == false`).
-        // We have to wait to clean up the process, otherwise it remains as a "zombie", because we never consumed its exit status.
-        ~Process()
-        {
-            // Not checking `HasError()`, it shouldn't stop us from calling `waitpid()` to clean up the process.
-
-            // We can either check `operator bool` or `OwnsProcess()` here (the latter being more strict). At least one of them is needed,
-            //   because `CheckOrWait()` asserts on that. But it does nothing if `bool(*this) == true && !OwnsProcess()` anyway, so it doesn't matter which one we check.
-
-            if (OwnsProcess())
-                CheckOrWait(true);
-        }
-
-        // Returns true if this instance owns a process, or used to own one.
-        [[nodiscard]] explicit operator bool() const {return state.pid != 0;}
-
-        // Returns true if this instance is an error state, due to the underlying API failing.
-        [[nodiscard]] bool HasError() const {return !state.error.empty();}
-        // Returns the error message. If `HasError() == false`, then always returns an empty string.
-        [[nodiscard]] const std::string ErrorMessage() const {return state.error;}
-
-        // This is zero for null processes.
-        [[nodiscard]] Proc::Pid Pid() const {return state.pid;}
-
-        // Returns true if this instance owns a process handle. This is a subset of `operator bool`.
-        // This is only true for non-background processes, which we didn't observe to exit yet. This means the destructor will have to do something to clean up the process handle/pid that we own.
-        [[nodiscard]] bool OwnsProcess() const
-        {
-            #ifdef _WIN32
-            return state.process_handle != INVALID_HANDLE_VALUE;
-            #else
-            return state.owns_pid;
-            #endif
-        }
-
-        // Returns true if this is a background process. See `Params::Background()` for more details.
-        [[nodiscard]] bool IsBackground() const
-        {
-            return state.exit_reason && std::holds_alternative<Proc::ExitReason::Background>(state.exit_reason->var);
-        }
-
-        // Update the process state. Check `ExitReason()` and `HasError()` after this.
-        void UpdateState()
-        {
-            CheckOrWait(false);
-        }
-
-        // Wait until the process exits.
-        // Note! This can deadlock if you have pipes open to this process, because you need to be manually poking those pipes.
-        void BlockUntilExit()
-        {
-            CheckOrWait(true);
-        }
-
-        // Returns the exit reason of the process, or false if it's not known to be exited.
-        [[nodiscard]] const std::optional<Proc::ExitReason> &ExitReason() const
-        {
-            return state.exit_reason;
-        }
-
-      private:
-        void StartProcess(auto &&params_ref)
-        {
-            const Params &params = params_ref;
-
             // Mark as background process before doing anything else, so that this information is not lost on error.
-            if (params.state.background)
-                state.exit_reason = Proc::ExitReason(Proc::ExitReason::Background{});
+            if (misc.ShouldDetach())
+                state.exit_reason = Proc::ExitReason(Proc::ExitReason::Detached{});
 
-            if (!params.state.error.empty())
+            // Then check for errors in parameters.
+            if (command.HasError())
             {
-                state.error = "Error in parameters: " + params.state.error;
+                error_string = "Bad command: " + command.ErrorMessage();
+                return;
+            }
+            if (env.HasError())
+            {
+                error_string = "Bad environment: " + env.ErrorMessage();
+                return;
+            }
+            if (misc.HasError())
+            {
+                error_string = "Bad parameters: " + misc.ErrorMessage();
                 return;
             }
 
 
             #ifdef _WIN32
 
-            if (!params.state.cmd_string && !params.state.exe_path)
+            wchar_t *command_ptr = command.ResultingCommand_Win();
+
+            const wchar_t *executable_ptr = nullptr;
+            if (const auto &opt = command.ResultingExecutable())
+                executable_ptr = opt->GetPointer();
+
+            if (!command_ptr && !executable_ptr)
             {
                 // WinAPI needs at least one.
-                state.error = "No command or executable path specified for process.";
+                error_string = "No command and no executable path specified for process.";
                 return;
             }
 
-            // Copy or move `cmd_string` from the parameters. `CreateProcessW()` is documented to clobber it (!!), so unlike on POSIX, we can't just `const_cast` the command line.
-            // This is the entire reason we have separate constructors for `const Params &` and `Params &&`.
-            auto cmd_string_copy = decltype(params_ref)(params_ref).state.cmd_string;
+            const wchar_t *working_dir_ptr = nullptr;
+            if (const auto &opt = misc.ResultingWorkingDir_Win())
+                working_dir_ptr = opt->GetPointer();
 
             STARTUPINFOW startup_info{};
             startup_info.cb = sizeof(startup_info);
@@ -2055,22 +2639,24 @@ namespace em::Proc
 
             // Here if `env_ptr` is not specified, WinAPI copies the environment of this process, which is exactly what we want.
             bool ok = CreateProcessW(
-                params.state.exe_path ? params.state.exe_path->native.c_str() : nullptr,
-                cmd_string_copy ? cmd_string_copy->native.data() : nullptr,
+                executable_ptr,
+                command_ptr,
                 nullptr, // Process attributes.
                 nullptr, // Thread attributes.
                 true, // Inherit handles.
-                params.state.process_flags,
+                CREATE_UNICODE_ENVIRONMENT |
+                    // Randomly stumbled upon this flag, seems helpful.
+                    (CREATE_NEW_PROCESS_GROUP * misc.ShouldDetach()),
                 // It's mildly sus that `env_ptr` needs a `const_cast`. The function parameter is of type `void *`. Unlike for the command line, the documentation (at https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw)
                 //   doesn't say that the environment is clobbered, so I think the `const_cast` is fine.
-                const_cast<wchar_t *>(params.state.env_ptr),
-                params.state.working_dir ? params.state.working_dir->native.c_str() : nullptr,
+                const_cast<wchar_t *>(env.ResultingEnvironment_Win()),
+                working_dir_ptr,
                 &startup_info,
                 &proc_info.value
             );
             if (!ok)
             {
-                state.error = "`CreateProcessW()` failed: " + detail::GetLastWinApiErrorMessage();
+                error_string = "Failed to start process: " + detail::GetLastWinApiErrorMessage(); // This specific error message doesn't mention the function name, since it happens often and is considered user-facing.
                 return;
             }
 
@@ -2079,32 +2665,52 @@ namespace em::Proc
 
 
             // Lastly, for non-background processes, preserve the handle.
-            if (!params.state.background)
+            if (!misc.ShouldDetach())
                 state.process_handle = std::exchange(proc_info.value.hProcess, INVALID_HANDLE_VALUE);
 
             #else
-            if (!params.state.cmd_argv)
+            // Note the `const_cast` here. It's needed because the POSIX API takes `char *const *` instead of `const char *const *`, because the C pointer conversion rules are more strict than the C++ ones,
+            //   and they figured it would be more convenient. They don't actually modify those strings.
+            // Similarly for `env_ptr` below.
+            char **command_ptr = const_cast<char **>(command.ResultingCommand_Posix());
+            if (!command_ptr)
             {
                 // We check it here, because we sometimes use `cmd_argv[0]` below and it better not be null.
-                state.error = "Null `argv` specified for process.";
+                error_string = "Null `argv` specified for process.";
                 return;
             }
-
-            if (!params)
+            if (!command_ptr[0])
             {
-                // This can only mean moved-from at this point, sinc we checked `params.state.error` earlier.
-                assert(false && "Null params struct, was it moved from?");
-                state.error = "Trying to create a process from a null params struct.";
+                // We check it here, because we sometimes use `cmd_argv[0]` below and it better not be null.
+                error_string = "Empty `argv` specified for process.";
                 return;
             }
 
+            const detail::PosixSpawnAttr &spawn_attr_holder = detail::CommonPosixSpawnAttr();
+            if (spawn_attr_holder.HasError())
+            {
+                error_string = "Bad `posix_spawnattr_t`: " + spawn_attr_holder.ErrorMessage();
+                return;
+            }
+            // Calling it here rather than after `vfork()`, just in case.
+            const posix_spawnattr_t *spawn_attr = &spawn_attr_holder.Underlying();
 
-            // Note the `const_cast` here and on `argv` below. It's needed because the POSIX API takes `char *const *` instead of `const char *const *`, because the C pointer conversion rules are more strict than the C++ ones,
-            //   and they figured it would be more convenient. They don't actually modify those strings.
-            char *const *env_ptr = const_cast<char *const *>(params.state.env_ptr ? params.state.env_ptr : detail::GetEnviron());
-            char *exe_path = const_cast<char *>(params.state.exe_path ? params.state.exe_path->native.c_str() : params.state.cmd_argv[0]);
+            // This can be null.
+            const posix_spawn_file_actions_t *spawn_fa_opt = misc.ResultingFileActions_Posix();
 
-            if (params.state.background)
+
+            // See `command_ptr` above for why we `const_cast` here and why it's safe.
+            char *const *env_ptr = const_cast<char *const *>(env.ResultingEnvironment_Posix());
+            if (!env_ptr)
+                env_ptr = detail::GetEnviron(); // User didn't override the environment, get the current one.
+
+            const char *executable_ptr = nullptr;
+            if (const auto &opt = command.ResultingExecutable())
+                executable_ptr = opt->GetPointer();
+            if (!executable_ptr)
+                executable_ptr = command_ptr[0]; // Unlike on Windows, the executable name can't be null, or the child process segfaults on start.
+
+            if (misc.ShouldDetach())
             {
                 // This is similar to what SDL does. Except they don't block signals.
 
@@ -2123,7 +2729,7 @@ namespace em::Proc
                         // Set the new mask to all ones.
                         if (sigfillset(&new_sigmask))
                         {
-                            self->state.error = std::string("`sigfillset()` failed: ") + std::strerror(errno);
+                            self->error_string = std::string("`sigfillset()` failed: ") + std::strerror(errno);
                             error = true;
                             return;
                         }
@@ -2136,7 +2742,7 @@ namespace em::Proc
                         // NOTE: Their API is slightly different. `pthread_sigmask()` returns the error code on failure, while `sigprocmask()` returns -1 on failure and writes to `errno`.
                         if (int sigmask_status = pthread_sigmask(SIG_SETMASK, &new_sigmask, &old_sigmask); sigmask_status < 0)
                         {
-                            self->state.error = std::string("`pthread_sigmask()` failed to disable signals before forking: ") + std::strerror(sigmask_status);
+                            self->error_string = std::string("`pthread_sigmask()` failed to disable signals before forking: ") + std::strerror(sigmask_status);
                             error = true;
                             return;
                         }
@@ -2152,7 +2758,7 @@ namespace em::Proc
 
                         if (int sigmask_status = pthread_sigmask(SIG_SETMASK, &old_sigmask, nullptr); sigmask_status < 0)
                         {
-                            self->state.error = std::string("`pthread_sigmask()` failed to restore signals after forking: ") + std::strerror(sigmask_status);
+                            self->error_string = std::string("`pthread_sigmask()` failed to restore signals after forking: ") + std::strerror(sigmask_status);
                             error = true;
                             return;
                         }
@@ -2171,17 +2777,17 @@ namespace em::Proc
 
                 #ifdef __APPLE__ // SDL says:  Apple has vfork marked as deprecated and (as of macOS 10.12) is almost identical to calling fork() anyhow.
                 const pid_t pid = fork();
-                const char *forkname = "fork";
+                const char *fork_error_prefix = "`fork()` failed: ";
                 #else
                 // `vfork` makes us share memory with the parent (unless implemented as `fork`), which means we must be extra careful to not touch anything. See manual: https://linux.die.net/man/3/vfork
                 const pid_t pid = vfork();
-                const char *forkname = "vfork";
+                const char *fork_error_prefix = "`vfork()` failed: ";
                 #endif
                 switch (pid)
                 {
                   case -1:
                     // Forking failed.
-                    state.error = std::string("`") + forkname + "()` failed: " + std::strerror(errno);
+                    error_string = std::string(fork_error_prefix) + std::strerror(errno);
                     return;
 
                   case 0:
@@ -2196,15 +2802,10 @@ namespace em::Proc
                     // Note the use of `_exit()` as opposed to `std::exit()`.
                     // `vfork` manual says we must use this specific function.
 
-                    // The manual doesn't mention `posix_spawnp` setting `errno`. It still does at least in glibc, but it's more correct to use the return value.
-
-                    // Note the `const_cast` here and on `env_ptr` above. It's needed because the POSIX API takes `char *const *` instead of `const char *const *`, because the C pointer conversion rules are more strict than the C++ ones,
-                    //   and they figured it would be more convenient. They don't actually modify those strings.
-
                     // It's technically undefined `posix_spawnp()` in `vfork()` (it's not in the list of allowed functions), but SDL does it anyway, and it seems to be fine in practice.
 
-                    // `posix_spawnp` returns 0 on success, or error code on failure.
-                    _exit(posix_spawnp(&state.pid, exe_path, &params.state.spawn_fa, &params.state.spawn_attr, const_cast<char **>(params.state.cmd_argv), env_ptr));
+                    // See the other call to `posix_spawnp()` below for more helpful comments.
+                    _exit(posix_spawnp(&state.pid, executable_ptr, spawn_fa_opt, spawn_attr, command_ptr, env_ptr));
 
                   default:
                     // Firstly, allow signals again.
@@ -2217,7 +2818,7 @@ namespace em::Proc
                     int status = -1;
                     if (waitpid(pid, &status, 0) < 0)
                     {
-                        state.error = std::string("`waitpid()` failed: ") + std::strerror(errno);
+                        error_string = std::string("`waitpid()` failed: ") + std::strerror(errno);
                         return;
                     }
 
@@ -2227,13 +2828,13 @@ namespace em::Proc
                         if (int exit_code = WEXITSTATUS(status))
                         {
                             // We use the exit code to propagate the error code from `posix_spawnp` above.
-                            state.error = std::string("`posix_spawnp()` failed: ") + std::strerror(exit_code);
+                            error_string = std::string("Failed to start process: ") + std::strerror(exit_code); // This specific error message doesn't mention the function name, since it happens often and is considered user-facing.
                             return;
                         }
                     }
                     else
                     {
-                        state.error = "Forked process exited abnormally. Status integer: " + std::to_string(status);
+                        error_string = "Forked process exited abnormally. Status integer: " + std::to_string(status);
                         return;
                     }
 
@@ -2254,9 +2855,11 @@ namespace em::Proc
                 // Note the `const_cast` here and on `env_ptr` above. It's needed because the POSIX API takes `char *const *` instead of `const char *const *`, because the C pointer conversion rules are more strict than the C++ ones,
                 //   and they figured it would be more convenient. They don't actually modify those strings.
 
-                if (int error = posix_spawnp(&state.pid, exe_path, &params.state.spawn_fa, &params.state.spawn_attr, const_cast<char **>(params.state.cmd_argv), env_ptr))
+                // Note that here the second parameter can't be null. If we don't have a custom executable name, we have to pass `argv[0]` ourselves, or the child will segfault.
+
+                if (int error = posix_spawnp(&state.pid, executable_ptr, spawn_fa_opt, spawn_attr, command_ptr, env_ptr))
                 {
-                    state.error = std::string("`posix_spawnp()` failed: ") + std::strerror(error);
+                    error_string = std::string("Failed to start process: ") + std::strerror(error); // This specific error message doesn't mention the function name, since it happens often and is considered user-facing.
                     return;
                 }
 
@@ -2267,6 +2870,66 @@ namespace em::Proc
             #endif
         }
 
+        // This is move-only.
+        [[nodiscard]] Process(Process &&other) noexcept : state(std::move(other.state)) {other.state = {};}
+        Process &operator=(Process other) noexcept {std::swap(state, other.state); return *this;}
+
+        // The default behavior is to wait for the process (if `IsBackground() == false`).
+        // We have to wait to clean up the process, otherwise it remains as a "zombie", because we never consumed its exit status.
+        ~Process()
+        {
+            // Not checking `HasError()`, it shouldn't stop us from calling `waitpid()` to clean up the process.
+
+            // We can either check `operator bool` or `OwnsProcess()` here (the latter being more strict). At least one of them is needed,
+            //   because `CheckOrWait()` asserts on that. But it does nothing if `bool(*this) == true && !OwnsProcess()` anyway, so it doesn't matter which one we check.
+
+            if (OwnsProcess())
+                CheckOrWait(true);
+        }
+
+        // Returns true if this instance either owns a process (for non-detached processes), or was created by successfully starting a detached process.
+        [[nodiscard]] explicit operator bool() const {return state.pid != 0;}
+
+        // This is zero for null processes.
+        [[nodiscard]] Proc::Pid Pid() const {return state.pid;}
+
+        // Returns true if this instance owns a process handle. This is a subset of `operator bool`.
+        // This is only true for non-background processes, which we didn't observe to exit yet. This means the destructor will have to do something to clean up the process handle/pid that we own.
+        [[nodiscard]] bool OwnsProcess() const
+        {
+            #ifdef _WIN32
+            return state.process_handle != INVALID_HANDLE_VALUE;
+            #else
+            return state.owns_pid;
+            #endif
+        }
+
+        // Returns true if this is a background process. See `Params::Detached()` for more details.
+        [[nodiscard]] bool IsBackground() const
+        {
+            return state.exit_reason && std::holds_alternative<Proc::ExitReason::Detached>(state.exit_reason->var);
+        }
+
+        // Update the process state. Check `ExitReason()` and `HasError()` after this.
+        void UpdateState()
+        {
+            CheckOrWait(false);
+        }
+
+        // Wait until the process exits.
+        // Note! This can deadlock if you have pipes open to this process, because you need to be manually poking those pipes.
+        void BlockUntilExit()
+        {
+            CheckOrWait(true);
+        }
+
+        // Returns the exit reason of the process, or false if it's not known to be exited.
+        [[nodiscard]] const std::optional<Proc::ExitReason> &ExitReason() const
+        {
+            return state.exit_reason;
+        }
+
+      private:
         void CheckOrWait(bool wait)
         {
             // Intentionally don't check `HasError()`. If something random has failed, we should still be able to `waitpid()` the process to clean it up.
@@ -2302,9 +2965,21 @@ namespace em::Proc
 
             // At this point we know the process has exited.
 
-            // Release the process handle, for consistency with POSIX. The destructor also relies on this function doing it.
+            // First, get the exit code.
+            DWORD exit_code = DWORD(-1);
+            if (GetExitCodeProcess(state.process_handle, &exit_code) == 0)
+            {
+                error_string = "`GetExitCodeProcess()` failed: " + detail::GetLastWinApiErrorMessage();
+                // Don't `return` though, close the handle anyway.
+            }
+
+            // Then release the process handle, for consistency with POSIX. The destructor also relies on this function doing it.
             CloseHandle(state.process_handle);
             state.process_handle = INVALID_HANDLE_VALUE;
+
+            // Set the exit reason.
+            static_assert(sizeof(int) == sizeof(DWORD)); // I don't feel like making `ExitReason::Code` store `DWORD` on Windows. And the negative values for things like `0xC0000005` is more recongizable to me.
+            state.exit_reason = Proc::ExitReason(ExitReason::Code{int(exit_code)});
 
             #else
             int status = 0;
@@ -2313,7 +2988,7 @@ namespace em::Proc
             // It returns `-1` on error.
             if (wait_result < 0)
             {
-                state.error = std::string("`waitpid()` failed: ") + std::strerror(errno);
+                error_string = std::string("`waitpid()` failed: ") + std::strerror(errno);
                 // Mark the process as exited, I guess.
                 // So that nothing gets blocked on the user side, waiting for it to exit.
                 state.exit_reason = Proc::ExitReason(Proc::ExitReason::Error{});
@@ -2356,9 +3031,6 @@ namespace em::Proc
 
         struct State
         {
-            // I considered merging this into `ExitReason`, but since I also merged `Background` into that, I'm worried that we'd lose information if the error message replaced that.
-            std::string error;
-
             Proc::Pid pid = 0;
 
             #ifdef _WIN32

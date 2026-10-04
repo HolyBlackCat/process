@@ -23,15 +23,23 @@ void CheckEscaping(
     int line = __builtin_LINE()
 )
 {
-    // Converts any of: `std::string`, `std::wstring`, `NativeString` to `std::string`.
+    // Converts `detail::MaybeOwningMaybeMutString<const ??>` to a narrow `std::string`.
     static constexpr auto StrToQuotedNarrowStr = []<typename T>(const T &str) -> std::string
     {
-        if constexpr (std::is_same_v<T, em::Proc::NativeString>)
-            return '`' + str.get() + '`';
-        else if constexpr (std::is_same_v<T, std::wstring>)
-            return '`' + em::Proc::ConvertString_Win(std::basic_string_view(str)) + '`';
+        auto GetUnderlyingStr = [&]() -> decltype(auto)
+        {
+            if constexpr (em::Proc::detail::is_MaybeOwningMaybeMutString<T>)
+                return str.GetStringView();
+            else
+                return str;
+        };
+
+        using Char = std::remove_cvref_t<decltype(GetUnderlyingStr())>::value_type;
+
+        if constexpr (std::is_same_v<Char, wchar_t>)
+            return '`' + em::Proc::ConvertString(em::Proc::windows_only, GetUnderlyingStr()) + '`';
         else
-            return '`' + str + '`';
+            return '`' + std::string(GetUnderlyingStr()) + '`';
     };
     // Same but for optional strings.
     static constexpr auto OptStrToQuotedNarrowStr = []<typename T>(const std::optional<T> &opt) -> std::string
@@ -62,8 +70,8 @@ void CheckEscaping(
                 return __FILE__ ":" + std::to_string(line) + ": `AssembleCommandLine` (" + variant + ", 0b" + mask + " [prepend_cmd=" + (prepend_cmd ? "true" : "false") + ", batch_safety=" + std::to_string(batch_safety) + "]) ";
             };
 
-            std::optional<T> out_executable = executable; // Must copy this, since the function can change it.
-            std::optional<T> out_command;
+            std::optional<em::Proc::detail::MaybeOwningMaybeMutString<const typename T::value_type>> out_executable = executable; // Must copy this, since the function can change it. And also the type needs to be different.
+            std::optional<em::Proc::detail::MaybeOwningMaybeMutString<typename T::value_type>> out_command;
             std::string out_error;
             bool ok = em::Proc::detail::AssembleCommandLine(
                 out_executable,
@@ -89,10 +97,10 @@ void CheckEscaping(
 
             if (ok)
             {
-                if (out_executable != expected_executable)
+                if (bool(out_executable) != bool(expected_executable) || (out_executable && out_executable->GetStringView() != *expected_executable))
                     throw std::runtime_error(MakeErrorPrefix() + "produced an incorrect executable name, got " + OptStrToQuotedNarrowStr(out_executable) + " but expected " + OptStrToQuotedNarrowStr(expected_executable) + ".");
 
-                if (out_command != expected_command)
+                if (bool(out_command) != bool(expected_command) || (out_command && out_command->GetStringView() != *expected_command))
                     throw std::runtime_error(MakeErrorPrefix() + "produced an incorrect command, got " + OptStrToQuotedNarrowStr(out_command) + " but expected " + OptStrToQuotedNarrowStr(expected_command) + ".");
             }
             else
@@ -106,17 +114,11 @@ void CheckEscaping(
     CheckVariant("std::string", executable, command, expected_executable, expected_command);
 
     auto ToWstring = [](const auto &s){return em::Proc::NativeString(s).native;};
-    auto ToNstring = [](const auto &s){return em::Proc::NativeString(s);};
     std::vector<std::wstring> command_w;
-    std::vector<em::Proc::NativeString> command_n;
     for (const auto &arg : command)
-    {
         command_w.push_back(ToWstring(arg));
-        command_n.push_back(ToNstring(arg));
-    }
 
     CheckVariant("std::wstring", executable.transform(ToWstring), command_w, expected_executable.transform(ToWstring), expected_command.transform(ToWstring));
-    CheckVariant("NativeString", executable.transform(ToNstring), command_n, expected_executable.transform(ToNstring), expected_command.transform(ToNstring));
 }
 
 int main()
