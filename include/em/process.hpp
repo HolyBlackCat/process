@@ -80,6 +80,27 @@
 #define EM_PROC_PLATFORM_POSIX 1
 #endif
 
+// Synthesizes operators for a enum of flags: `&`, `|`, and `~`. Also multiplication by a bool.
+#define DETAIL_EM_PROC_FLAG_ENUM(name_) DETAIL_EM_PROC_FLAG_ENUM_CUSTOM(, name_)
+
+// Same, but works at class scope.
+#define DETAIL_EM_PROC_FLAG_ENUM_IN_CLASS(name_) DETAIL_EM_PROC_FLAG_ENUM_CUSTOM(friend, name_)
+
+// Same, but lets you specify a custom decl-specifier-seq.
+#define DETAIL_EM_PROC_FLAG_ENUM_CUSTOM(prefix_, name_) \
+    [[nodiscard, maybe_unused]] prefix_ constexpr name_ operator&(name_ a, name_ b) {return name_(::std::underlying_type_t<name_>(a) & ::std::underlying_type_t<name_>(b));} \
+    [[nodiscard, maybe_unused]] prefix_ constexpr name_ operator|(name_ a, name_ b) {return name_(::std::underlying_type_t<name_>(a) | ::std::underlying_type_t<name_>(b));} \
+    [[nodiscard, maybe_unused]] prefix_ constexpr name_ operator~(name_ a) {return name_(~::std::underlying_type_t<name_>(a));} \
+    [[maybe_unused]] prefix_ constexpr name_ &operator&=(name_ &a, name_ b) {return a = a & b;} \
+    [[maybe_unused]] prefix_ constexpr name_ &operator|=(name_ &a, name_ b) {return a = a | b;} \
+    [[nodiscard, maybe_unused]] prefix_ constexpr name_ operator*(name_ a, bool b) {return b ? a : name_{};} \
+    [[nodiscard, maybe_unused]] prefix_ constexpr name_ operator*(bool a, name_ b) {return a ? b : name_{};} \
+    [[maybe_unused]] prefix_ constexpr name_ &operator*=(name_ &a, bool b) {return a = a * b;} \
+    [[nodiscard, maybe_unused]] prefix_ constexpr name_ operator<<(name_ a, int b) {return name_(::std::underlying_type_t<name_>(a) << b);} \
+    [[nodiscard, maybe_unused]] prefix_ constexpr name_ operator>>(name_ a, int b) {return name_(::std::underlying_type_t<name_>(a) >> b);} \
+    [[maybe_unused]] prefix_ constexpr name_ &operator<<=(name_ &a, int b) {return a = a << b;} \
+    [[maybe_unused]] prefix_ constexpr name_ &operator>>=(name_ &a, int b) {return a = a >> b;} \
+
 // Changes here relative to SDL:
 // * Better error reporting from starting background (detached) processes. See: https://github.com/libsdl-org/SDL/issues/16188
 // * Use return values instead of `errno` in a few places. But it seems in glibc those functions do set errno, even though it's not documented in the manual, so I'm not sure this ever matters.
@@ -96,14 +117,17 @@
 
 namespace em::Proc
 {
-    // Some tag types.
+    // Some tag types:
 
+    // Construct an object in an invalid state, storing the provided error message.
     struct TagErrorMessage {explicit TagErrorMessage() = default;};
-    inline constexpr TagErrorMessage error_message;
+    inline constexpr TagErrorMessage error_message{};
+    // Take ownership of some owning handle.
     struct TagTakeOwnership {explicit TagTakeOwnership() = default;};
-    inline constexpr TagTakeOwnership take_ownership;
+    inline constexpr TagTakeOwnership take_ownership{};
+    // Store a handle or pointer without taking ownership of it.
     struct TagNonOwning {explicit TagNonOwning() = default;};
-    inline constexpr TagNonOwning non_owning;
+    inline constexpr TagNonOwning non_owning{};
 
 
     #ifdef _WIN32
@@ -638,7 +662,8 @@ namespace em::Proc
 
     // A base class that stores an optional error string.
     // Primarily for internal use. A lot of our classes inherit from this.
-    // When inheriting from this, you probably want to inherit ctors: `using StoresErrorMessage::StoresErrorMessage;`.
+    // NOTE: When inheriting from this, you probably want to inherit ctors: `using StoresErrorMessage::StoresErrorMessage;`.
+    // NOTE: When inheriting from this, if you override the move constructors, don't forget to move the message too!
     class StoresErrorMessage
     {
       protected:
@@ -674,8 +699,6 @@ namespace em::Proc
         // Returns the error message, or empty if `HasError() == false`.
         [[nodiscard]] const std::string &ErrorMessage() const noexcept {return error_string;}
     };
-
-#ifndef _WIN32
 
     // A base class for files, pipes, etc.
     class BasicIoStream : public StoresErrorMessage
@@ -718,19 +741,33 @@ namespace em::Proc
             state.owns_handle = false;
         }
 
-        [[nodiscard]] BasicIoStream(BasicIoStream &&other) noexcept : state(std::move(other.state)) {other.state = {};}
-        BasicIoStream &operator=(BasicIoStream &&other) noexcept {BasicIoStream copy = std::move(other); std::swap(state, copy.state); return *this;} // Can't use by-value parameter because of the protected dtor. Ugh.
+        [[nodiscard]] BasicIoStream(BasicIoStream &&other) noexcept
+            : StoresErrorMessage(std::move(other)),
+            state(std::move(other.state))
+        {
+            other.state = {};
+        }
+
+        // Can't use by-value parameter here because of the protected dtor. Ugh.
+        BasicIoStream &operator=(BasicIoStream &&other) noexcept
+        {
+            BasicIoStream copy = std::move(other);
+            std::swap(static_cast<StoresErrorMessage &>(*this), static_cast<StoresErrorMessage &>(copy));
+            std::swap(state, copy.state);
+            return *this;
+        }
 
       protected:
         ~BasicIoStream()
         {
             if (state.owns_handle)
             {
+                // Don't care about the error message at this point.
                 #ifdef _WIN32
-                [[maybe_unused]] bool ok = CloseHandle(state.handle);
+                [[maybe_unused]] bool ok = CloseHandle(state.handle); // Unlike POSIX `close()`, this returns non-zero on success.
                 assert(ok);
                 #else
-                [[maybe_unused]] bool ok = close(state.handle);
+                [[maybe_unused]] bool ok = close(state.handle) == 0;
                 assert(ok);
                 #endif
             }
@@ -745,7 +782,7 @@ namespace em::Proc
         // If this instance is null, writes a error message nothing this fact in `ErrorMessage()` and returns true.
         // If not null, returns false.
         // Mainly for internal use.
-        [[nodiscard]] bool ErrorIfNull()
+        [[nodiscard]] bool StoreErrorIfNull()
         {
             if (!*this)
             {
@@ -811,7 +848,7 @@ namespace em::Proc
         // Returns true on success, false on failure. On failure, resets this instance to null and stores the error on it, call `ErrorMessage()` to get it.
         bool SetBlocking(bool is_blocking)
         {
-            if (ErrorIfNull())
+            if (StoreErrorIfNull())
                 return false;
 
             #ifdef _WIN32
@@ -857,7 +894,7 @@ namespace em::Proc
 
             #else
 
-            if (ErrorIfNull())
+            if (StoreErrorIfNull())
             {
                 if (out_result)
                     *out_result = IoResult::error;
@@ -998,8 +1035,6 @@ namespace em::Proc
       protected:
         ~BasicAsyncIoStream() = default;
     };
-
-#endif
 
     namespace detail
     {
@@ -1518,11 +1553,9 @@ namespace em::Proc
             return ret;
         }
 
-        [[nodiscard]] inline std::string GetLastWinApiErrorMessage()
+        // The `error` parameter should come from `GetLastError()`.
+        [[nodiscard]] inline std::string WinApiErrorToString(DWORD error)
         {
-            // Get the error code first, since we might clobber it when trying to get the error message in English if it's not available, see below.
-            auto last_error = GetLastError();
-
             // Try getting the message in English first, and then try in the default language.
             // Discussion https://stackoverflow.com/q/12715646/2752075 shows that firstly `0` doesn't mean English, and secondly that it's not guaranteed that English strings are available at all.
             for (DWORD lang : {(DWORD)MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_US), DWORD(0)})
@@ -1541,7 +1574,7 @@ namespace em::Proc
                 auto status = FormatMessageW(
                     FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_ALLOCATE_BUFFER,
                     nullptr,
-                    last_error,
+                    error,
                     lang,
                     // When `FORMAT_MESSAGE_ALLOCATE_BUFFER` is specfieid, this parameter changes meaning from `wchar_t *` to `wchar_t **`, so the manual says we need the cast.
                     (wchar_t *)&guard.message,
@@ -1566,7 +1599,7 @@ namespace em::Proc
             }
 
             // If the message wasn't available in any language:
-            return std::to_string(last_error) + " (no error message is available)";
+            return std::to_string(error) + " (no error message is available)";
         }
 
         #endif
@@ -1651,8 +1684,19 @@ namespace em::Proc
                 }
             }
 
-            [[nodiscard]] PosixSpawnAttr(PosixSpawnAttr &&other) noexcept : state(std::move(other.state)) {other.state = {};}
-            PosixSpawnAttr &operator=(PosixSpawnAttr other) noexcept {std::swap(state, other.state); return *this;}
+            [[nodiscard]] PosixSpawnAttr(PosixSpawnAttr &&other) noexcept
+                : StoresErrorMessage(std::move(other)),
+                state(std::move(other.state))
+            {
+                other.state = {};
+            }
+
+            PosixSpawnAttr &operator=(PosixSpawnAttr other) noexcept
+            {
+                std::swap(static_cast<StoresErrorMessage &>(*this), static_cast<StoresErrorMessage &>(other));
+                std::swap(state, other.state);
+                return *this;
+            }
 
             ~PosixSpawnAttr()
             {
@@ -1676,8 +1720,6 @@ namespace em::Proc
 
         #endif
     }
-
-#ifndef _WIN32
 
     // Creates a pipe, assigning the two ends to `read` and `write`, which should be initially empty. If they aren't empty, their existing values are discarded.
     // On success, returns true and makes `read` and `write` non-null.
@@ -1705,7 +1747,7 @@ namespace em::Proc
         else
         {
             // Failure.
-            read = {error_message, detail::GetLastWinApiErrorMessage()};
+            read = {error_message, detail::WinApiErrorToString(GetLastError())};
             write = {error_message, read.ErrorMessage()};
             return false;
         }
@@ -1791,6 +1833,16 @@ namespace em::Proc
         error,
     };
 
+    // Additional settings for opening output files.
+    enum class OutputFileFlags
+    {
+        // Don't pass the append flag to the file.
+        // For `ExistingFile::keep`, this will cause writes to the file to overwrite data starting from the beginning, as opposed to appending at the end.
+        // For `ExistingFile::overwrite` this shouldn't make a difference, unless perhaps several things write to the same file? Didn't test.
+        no_append = 1 << 0,
+    };
+    DETAIL_EM_PROC_FLAG_ENUM(OutputFileFlags)
+
     using IoStreamRefVar = std::variant<std::reference_wrapper<InputStream>, std::reference_wrapper<OutputStream>>;
 
     // This is a low-level function combining the effects of `OpenInputFile()` and `OpenOutputFile()`. Prefer one of those, and see them for more information.
@@ -1798,7 +1850,9 @@ namespace em::Proc
     // Returns true on success. Then makes `target` non-null.
     // On failure returns false, and makes `target` null, and stores the error message in `target`.
     // For input streams, it's also an error to pass `existing != keep`.
-    inline bool OpenFile(IoStreamRefVar target, NativeCStringViewParam filename, bool allow_creating, ExistingFile existing = ExistingFile::keep)
+    // NOTE: `allow_creating` doesn't have a default value here, since input streams are required to pass false, while output streams will usually pass true.
+    //   This is also why it's placed before other parameters with default arguments.
+    inline bool OpenFile(IoStreamRefVar target, NativeCStringViewParam filename, bool allow_creating, ExistingFile existing = ExistingFile::overwrite, OutputFileFlags flags = {})
     {
         // In any case, reset the target first.
         // This also throws if it was `valueless_by_exception()`.
@@ -1818,9 +1872,9 @@ namespace em::Proc
             [&](const std::reference_wrapper<InputStream> &elem)
             {
                 // Input streams only allow one specific set of parameters.
-                if (allow_creating || existing != ExistingFile::keep)
+                if (allow_creating || existing != ExistingFile::keep || flags != OutputFileFlags{})
                 {
-                    elem.get() = {error_message, "Input streams requires `allow_creating == false && existing == keep`."};
+                    elem.get() = {error_message, "Input files require `allow_creating == false && existing == keep && flags == 0`."};
                     return false;
                 }
                 return true;
@@ -1830,7 +1884,7 @@ namespace em::Proc
                 // This specific combination would never allow the file to be opened, so we error on it ourselves.
                 if (!allow_creating && existing == ExistingFile::error)
                 {
-                    elem.get() = {error_message, "Illegal mode combination for a stream: `allow_creating == false && existing == error`."};
+                    elem.get() = {error_message, "Illegal mode combination for a file: `allow_creating == false && existing == error`."};
                     return false;
                 }
                 return true;
@@ -1846,7 +1900,7 @@ namespace em::Proc
         int handle = open(
             filename.GetPointer(),
             // Here always pass append. Firstly it's simpler than manually seeking to the end of file, and secondly I hope it'll give better behavior if multiple processes open the same file (if that's legal in the first place?).
-            std::visit(detail::Overload{[](const InputStream &){return O_RDONLY;}, [](const OutputStream &){return O_WRONLY | O_APPEND;}}, target) |
+            std::visit(detail::Overload{[](const InputStream &){return O_RDONLY;}, [&](const OutputStream &){return O_WRONLY | (O_APPEND * !bool(flags & OutputFileFlags::no_append));}}, target) |
                 (O_CREAT * allow_creating) |
                 (existing == ExistingFile::keep ? 0 : existing == ExistingFile::overwrite ? O_TRUNC : O_EXCL),
             0777 // Rely on umask to set the mode. This `...` parameter is unused if `O_CREAT` is not passed, but it's easier to pass unconditionally.
@@ -1874,17 +1928,16 @@ namespace em::Proc
     }
 
     // Opens a file for writing. Returns a null instance with an error stored in it on failure, call `.ErrorMessage()` for details.
-    // `allow_creating` controls what happens if no such file exists. `true` means it's created, `false` means this function fails.
     // `existing` controls what happens if such file already exists. `keep` means it's opened, `trucate` means its opened but the existing contents are destroyed, `error` means this function fails.
+    // `allow_creating` controls what happens if no such file exists. `true` means it's created, `false` means this function fails.
     // It's an error to pass `!allow_creating && existing == error`.
-    [[nodiscard]] inline OutputStream OpenOutputFile(NativeCStringViewParam filename, bool allow_creating, ExistingFile existing = ExistingFile::keep)
+    // NOTE: Here the parameter order is different than in `OpenFile()`, because this one makes more sense, and we're not constrained by having to provide decent API for input files too.
+    [[nodiscard]] inline OutputStream OpenOutputFile(NativeCStringViewParam filename, ExistingFile existing = ExistingFile::overwrite, bool allow_creating = true, OutputFileFlags flags = {})
     {
         OutputStream ret;
-        OpenFile(ret, std::move(filename), allow_creating, existing);
+        OpenFile(ret, std::move(filename), allow_creating, existing, flags);
         return ret;
     }
-
-#endif
 
     // A list of environment variables.
     using EnvMap = std::map<NativeString, NativeString, std::less<>>;
@@ -2410,7 +2463,24 @@ namespace em::Proc
         #endif
     };
 
-    // A part of parameters of a process. Stores misc stuff that doesn't fit anywhere else.
+    // Inherit an IO stream from the parent process instead of attaching a custom one. This is the default behavior.
+    struct TagInherit {explicit TagInherit() = default;};
+    inline constexpr TagInherit inherit{};
+
+    // Merge one output stream into the other. Usually you put this on `stderr` to merge it into `stdout`, and then attach a custom stream to `stdout`.
+    struct TagMergeOutput {explicit TagMergeOutput() = default;};
+    inline constexpr TagMergeOutput merge_output{};
+
+    // What to do with the input stream of a process.
+    // `InputStream` is intentionally listed first, to make `= {}` submit a null stream.
+    using InputStreamAttachment = std::variant<InputStream, TagInherit>;
+
+    // What to do with one of the output streams of a process.
+    // `OutputStream` is intentionally listed first, to make `= {}` submit a null stream.
+    using OutputStreamAttachment = std::variant<OutputStream, TagInherit, TagMergeOutput>;
+
+    // A part of parameters of a process. Stores misc stuff that doesn't fit anywhere else, including IO redirects.
+    // This is move-only because of the stored IO streams.
     class MiscParams : public StoresErrorMessage
     {
       public:
@@ -2419,7 +2489,10 @@ namespace em::Proc
         using StoresErrorMessage::StoresErrorMessage;
 
         // This causes us to immediately release the process handle after starting it, so you can't wait for it to terminate and can't get its exit code.
-        //   (In theory, on POSIX we could still wait using the PID, using `kill(pid, 0)`. But that seems unreliable, because the PID could be reused by another process. And not very useful in the first place.)
+        // Also does a few things to separate the child process from the parent.
+        // This also doesn't work with `inherit` IO redirects. Those get implicitly replaced with null streams.
+        //
+        // In theory, on POSIX we could still wait using the PID, using `kill(pid, 0)`. But that seems unreliable, because the PID could be reused by another process. And this is not very useful in the first place.
         //
         // This prevents the mandatory wait for the process in the destructor. (Without this, the destructor is forced to wait on POSIX, otherwise we'd leak resources, look up so-called "zombie processes".
         //   And on Windows it doesn't seem to be the case, but we replicate the POSIX behavior for consistency.)
@@ -2429,18 +2502,48 @@ namespace em::Proc
         // What this does on POSIX is called "double forking" of "daemonizing" the new process, see this for more details: https://stackoverflow.com/q/881388/2752075
         bool detach = false;
 
+        // If specified, replaced the working directory. Otherwise it's inherited from the parent process.
         std::optional<MaybeOwningNativeString> working_directory;
+
+
+        // What to do with `stdin`. The default behavior is to have it null.
+        // Pass `em::Proc::inherit` to inherit from the parent process. If you do that, make sure the parent doesn't touch the input streams while the child runs.
+        // Pass an `InputStream` to attach a custom stream.
+        InputStreamAttachment stdin_stream = {};
+
+        // What to do with `stdout`. The default behavior is to inherit it from the parent process.
+        // Pass `{}` or `nullptr` to make it null.
+        // Pass an `OutputStream` to attach a custom stream.
+        // Pass `merge_output` to redirect it to `stderr` (rarely useful), then `stderr_stream` controls both streams.
+        OutputStreamAttachment stdout_stream = inherit;
+
+        // What to do with `stderr`. The default behavior is to inherit it from the parent process.
+        // Pass `{}` or `nullptr` to make it null.
+        // Pass an `OutputStream` to attach a custom stream.
+        // Pass `merge_output` to redirect it to `stdout`, then `stderr_stream` controls both streams. This is useful if you want to read both streams combined.
+        OutputStreamAttachment stderr_stream = inherit;
     };
 
-    // A baked form of `MiscParams`.
+    // A baked form of `MiscParams`. This is move-only.
     class BakedMiscParams : public StoresErrorMessage
     {
       public:
         [[nodiscard]] constexpr BakedMiscParams() {}
 
         // Move-only.
-        [[nodiscard]] BakedMiscParams(BakedMiscParams &&other) noexcept : state(std::move(other.state)) {other.state = {};}
-        BakedMiscParams &operator=(BakedMiscParams other) noexcept {std::swap(state, other.state); return *this;}
+        [[nodiscard]] BakedMiscParams(BakedMiscParams &&other) noexcept
+            : StoresErrorMessage(std::move(other)),
+            state(std::move(other.state))
+        {
+            other.state = {};
+        }
+
+        BakedMiscParams &operator=(BakedMiscParams other) noexcept
+        {
+            std::swap(static_cast<StoresErrorMessage &>(*this), static_cast<StoresErrorMessage &>(other));
+            std::swap(state, other.state);
+            return *this;
+        }
 
         ~BakedMiscParams()
         {
@@ -2456,9 +2559,9 @@ namespace em::Proc
         [[nodiscard]] BakedMiscParams(MiscParams &&params)
             : BakedMiscParams() // Call destructor on throw.
         {
-            // Construct spawn file actions.
             #ifndef _WIN32
-            // Returns true on error, then the constructor should return too.
+            // Construct spawn file actions.
+            // Returns true on error, then this constructor should exit too.
             // Constructs the `posix_spawn_file_actions_t` on the first call. Repeated calls do nothing.
             auto ConstructFileActionsIfNeeded = [&]() -> bool
             {
@@ -2473,6 +2576,96 @@ namespace em::Proc
                 return false;
             };
             #endif
+
+            { // IO handles.
+                // Complain if both `stdout` and `stderr` are set to `merge_output`.
+                if (std::holds_alternative<TagMergeOutput>(params.stdout_stream) && std::holds_alternative<TagMergeOutput>(params.stderr_stream))
+                {
+                    error_string = "Both `stdout` and `stderr` are set to `merge_output`. At most one output stream can be in this mode.";
+                    return;
+                }
+
+                #ifndef _WIN32
+                // Returns true on error, then this constructor should exit too.
+                auto AddDup2 = [&](int source_handle, int target_handle) -> bool
+                {
+                    if (ConstructFileActionsIfNeeded())
+                        return true;
+
+                    if (int error = posix_spawn_file_actions_adddup2(&state.spawn_fa, source_handle, target_handle))
+                    {
+                        // Not adding the stream name to the error message. This shouldn't normally fail, so it's not particularly important.
+                        error_string = std::string("`posix_spawn_file_actions_adddup2()` failed: ") + std::strerror(error);
+                        return true;
+                    }
+
+                    return false;
+                };
+                #endif
+
+                // Stdin.
+                state.stdin_stream = std::visit(detail::Overload{
+                    #ifdef _WIN32
+                    #error hmm
+                    #else
+                    // Note that we propagate `elem` on error here and below!
+                    [](InputStream &&elem) -> InputStream {return elem || elem.HasError() ? std::move(elem) : OpenInputFile("/dev/null");},
+                    #endif
+                    [](TagInherit) -> InputStream {return {};},
+                }, std::move(params.stdin_stream));
+                if (state.stdin_stream.HasError())
+                {
+                    error_string = "Bad `stdin`: " + state.stdin_stream.ErrorMessage();
+                    return;
+                }
+                if (state.stdin_stream)
+                {
+                    if (AddDup2(state.stdin_stream.Handle(), STDIN_FILENO))
+                        return;
+                }
+
+                // Stdout.
+                state.stdout_stream = std::visit(detail::Overload{
+                    #ifdef _WIN32
+                    #error hmm
+                    #else
+                    [](OutputStream &&elem) -> OutputStream {return elem || elem.HasError() ? std::move(elem) : OpenOutputFile("/dev/null", ExistingFile::keep, false, OutputFileFlags::no_append);}, // Passing no `no_append` just in case. Writing to `/dev/null` shouldn't need the append flag, so less work?
+                    [](TagInherit) -> OutputStream {return {};},
+                    [](TagMergeOutput) -> OutputStream {return {non_owning, STDERR_FILENO};},
+                    #endif
+                }, std::move(params.stdout_stream));
+                if (state.stdout_stream.HasError())
+                {
+                    error_string = "Bad `stdout`: " + state.stdout_stream.ErrorMessage();
+                    return;
+                }
+                if (state.stdout_stream)
+                {
+                    if (AddDup2(state.stdout_stream.Handle(), STDOUT_FILENO))
+                        return;
+                }
+
+                // Stderr.
+                state.stderr_stream = std::visit(detail::Overload{
+                    #ifdef _WIN32
+                    #error hmm
+                    #else
+                    [](OutputStream &&elem) -> OutputStream {return elem || elem.HasError() ? std::move(elem) : OpenOutputFile("/dev/null", ExistingFile::keep, false, OutputFileFlags::no_append);}, // Same as in `stdout` above.
+                    [](TagInherit) -> OutputStream {return {};},
+                    [](TagMergeOutput) -> OutputStream {return {non_owning, STDOUT_FILENO};},
+                    #endif
+                }, std::move(params.stderr_stream));
+                if (state.stderr_stream.HasError())
+                {
+                    error_string = "Bad `stderr`: " + state.stderr_stream.ErrorMessage();
+                    return;
+                }
+                if (state.stderr_stream)
+                {
+                    if (AddDup2(state.stderr_stream.Handle(), STDERR_FILENO))
+                        return;
+                }
+            }
 
             // Working directory.
             #ifdef _WIN32
@@ -2526,6 +2719,11 @@ namespace em::Proc
             #else
             bool spawn_fa_alive = false;
             posix_spawn_file_actions_t spawn_fa{};
+
+            // In those handles, null means inherit, and anything else should be used as is.
+            InputStream stdin_stream;
+            OutputStream stdout_stream;
+            OutputStream stderr_stream;
             #endif
         };
         State state;
@@ -2533,6 +2731,7 @@ namespace em::Proc
 
     // The combined process parameters.
     // Normally you want to use this, but you can also create the individual parameter classes separately, if you want to reuse some of them between several processes.
+    // This is move-only because of `MiscParams`.
     struct Params : MiscParams
     {
         Command command;
@@ -2547,10 +2746,7 @@ namespace em::Proc
 
         using StoresErrorMessage::StoresErrorMessage;
 
-        // The high-level constructor taking the parameter struct.
-        [[nodiscard]] Process(const Params &params)
-            : Process(params.command, params.env, BakedMiscParams(Params(params)))
-        {}
+        // The high-level constructor taking the parameter struct. The params aren't copyable.
         [[nodiscard]] Process(Params &&params)
             : Process(std::move(params.command), params.env, BakedMiscParams(std::move(params)))
         {}
@@ -2656,7 +2852,7 @@ namespace em::Proc
             );
             if (!ok)
             {
-                error_string = "Failed to start process: " + detail::GetLastWinApiErrorMessage(); // This specific error message doesn't mention the function name, since it happens often and is considered user-facing.
+                error_string = "Failed to start process: " + detail::WinApiErrorToString(GetLastError()); // This specific error message doesn't mention the function name, since it happens often and is considered user-facing.
                 return;
             }
 
@@ -2871,8 +3067,19 @@ namespace em::Proc
         }
 
         // This is move-only.
-        [[nodiscard]] Process(Process &&other) noexcept : state(std::move(other.state)) {other.state = {};}
-        Process &operator=(Process other) noexcept {std::swap(state, other.state); return *this;}
+        [[nodiscard]] Process(Process &&other) noexcept
+            : StoresErrorMessage(std::move(other)),
+            state(std::move(other.state))
+        {
+            other.state = {};
+        }
+
+        Process &operator=(Process other) noexcept
+        {
+            std::swap(static_cast<StoresErrorMessage &>(*this), static_cast<StoresErrorMessage &>(other));
+            std::swap(state, other.state);
+            return *this;
+        }
 
         // The default behavior is to wait for the process (if `IsBackground() == false`).
         // We have to wait to clean up the process, otherwise it remains as a "zombie", because we never consumed its exit status.
@@ -2967,18 +3174,24 @@ namespace em::Proc
 
             // First, get the exit code.
             DWORD exit_code = DWORD(-1);
-            if (GetExitCodeProcess(state.process_handle, &exit_code) == 0)
-            {
-                error_string = "`GetExitCodeProcess()` failed: " + detail::GetLastWinApiErrorMessage();
-                // Don't `return` though, close the handle anyway.
-            }
+            // Don't check this for errors immediately, close the handle first.
+            bool exit_code_ok = GetExitCodeProcess(state.process_handle, &exit_code) != 0;
+            DWORD exit_code_error = exit_code_ok ? 0 : GetLastError();
 
-            // Then release the process handle, for consistency with POSIX. The destructor also relies on this function doing it.
+            // Release the process handle, for consistency with POSIX. The destructor also relies on this function doing it.
             CloseHandle(state.process_handle);
             state.process_handle = INVALID_HANDLE_VALUE;
 
+            // Now check that `exit_code` was obtained successfully.
+            if (!exit_code_ok)
+            {
+                error_string = "`GetExitCodeProcess()` failed: " + detail::WinApiErrorToString(exit_code_error);
+                state.exit_reason = Proc::ExitReason(ExitReason::Error{}); // The process is considered exited.
+                return;
+            }
+
             // Set the exit reason.
-            static_assert(sizeof(int) == sizeof(DWORD)); // I don't feel like making `ExitReason::Code` store `DWORD` on Windows. And the negative values for things like `0xC0000005` is more recongizable to me.
+            static_assert(sizeof(int) == sizeof(DWORD)); // I don't feel like making `ExitReason::Code` store `DWORD` on Windows. And the negative values for things like `0xC0000005` are more recongizable to me.
             state.exit_reason = Proc::ExitReason(ExitReason::Code{int(exit_code)});
 
             #else

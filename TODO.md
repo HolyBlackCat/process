@@ -1,19 +1,3 @@
-Stdout_Null
-Stdout_Inherit
-Stdout_Attach
-Stdout_ToStderr
-
-Stderr_Null
-Stderr_Inherit
-Stderr_Attach
-Stderr_ToStdout
-
-Stderr_Null
-Stderr_Inherit
-Stderr_Attach
-
-
-
 
                   allows new?    when existing:
 CREATE_ALWAYS         yes           truncate
@@ -70,12 +54,16 @@ Compilation tests:
     with and without EM_PROC_HAVE_PIPE2
     with and without EM_PROC_CAN_DETECT_CORE_DUMPS
 
+Tests:
+    environment
+    chdir
+    no_append behavior on different systems
+    merging output streams: check both stdout and stderr
+
 
 Maybe later:
 
 * Test what happens if parent dies before child on Windows and on POSIX. Do we need to configure that?
-
-* A maybe-owning type to pass the executable path./
 
 * Polling.
 
@@ -90,3 +78,5 @@ Maybe later:
   * To debug print POSIX command lines in a way runnable from shell.
 
   * To print names of env variables in error messages on encoding failures.
+
+* `posix_spawn_file_actions_addopen` instead of having the user open the files for redirects. This requires putting all file parameters in structs to store in the redirect `variant`s.
