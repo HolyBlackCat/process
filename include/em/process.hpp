@@ -658,6 +658,10 @@ namespace em::Proc
         [[nodiscard]] NativeCStringViewParam(const std::wstring &str) : MaybeOwningNativeString(non_owning, str.c_str()) {}
         [[nodiscard]] NativeCStringViewParam(const wchar_t *str) : MaybeOwningNativeString(non_owning, str) {}
         #endif
+
+        // This preserves owning-ness.
+        // Note that the reverse operation is implicit because of the inheritance.
+        [[nodiscard]] NativeCStringViewParam(MaybeOwningNativeString other) : MaybeOwningNativeString(std::move(other)) {}
     };
 
     // A base class that stores an optional error string.
@@ -1836,12 +1840,59 @@ namespace em::Proc
     // Additional settings for opening output files.
     enum class OutputFileFlags
     {
+        #ifndef _WIN32
+        // If specified, and `allow_creating == true`, the created file will have custom permissions, instead of our default 0644 (owner can read and write, group and others can only read).
+        // In addition to this flag, you must also store the desired permissions in this enum, as the lowest 12 bits.
+        // Note that `open()` automatically bitwise-subtracts something called `umask` from those bits, which is a per-process setting that defaults to 0022.
+        //   So if you want to set those bits (write permissions for group and others), you will need to disable them in the umask first, using `umask()` function.
+        custom_permissions_posix = 1 << 12,
+
+        // The lowest 12 bits of this enum are reserved for POSIX permission flags, see `custom_permissions_posix` above.
+        _custom_permissions_mask_posix = (1 << 12) - 12,
+        #endif
+
         // Don't pass the append flag to the file.
         // For `ExistingFile::keep`, this will cause writes to the file to overwrite data starting from the beginning, as opposed to appending at the end.
         // For `ExistingFile::overwrite` this shouldn't make a difference, unless perhaps several things write to the same file? Didn't test.
-        no_append = 1 << 0,
+        no_append = 1 << 13,
     };
     DETAIL_EM_PROC_FLAG_ENUM(OutputFileFlags)
+
+    // This mirrors the parameter list of `OpenOutputFile()` for delayed calls, see below.
+    struct OutputFileDesc
+    {
+        // The default values here matter, they should match what `OpenOutputFile()` defaults to.
+
+        MaybeOwningNativeString filename;
+        ExistingFile existing = ExistingFile::overwrite;
+        bool allow_creating = true;
+        OutputFileFlags flags = {};
+
+        #ifdef _WIN32
+        #error hmm
+        #else
+        // Mainly for internal use. Returns the flags for `open()` corresponding to this struct.
+        // This carries information from all the fields, except `filename`.
+        // There's no equivalent for input files. Those should just pass `O_RDONLY` as flags, and `0` as file permissions (since the permissions are unused if `O_CREAT` is not specified).
+        [[nodiscard]] int ToOpenFlags_Posix() const
+        {
+            return
+                O_WRONLY |
+                (O_APPEND * !bool(flags & OutputFileFlags::no_append)) |
+                (O_CREAT * allow_creating) |
+                (existing == ExistingFile::keep ? 0 : existing == ExistingFile::overwrite ? O_TRUNC : O_EXCL);
+        }
+
+        // Mainly for internal use. Returns the file permission bits for `open()` corresponding to this struct.
+        // This only uses `flags` from this struct.
+        // `mode_t` is `unsigned int`. That's what `posix_spawn_file_actions_addopen()` takes.
+        [[nodiscard]] mode_t ToOpenPermissions_Posix() const
+        {
+            constexpr mode_t default_permissions = 0644; // Sync this default value with the comment on `OutputFileFlags::custom_permissions_posix`.
+            return bool(flags & OutputFileFlags::custom_permissions_posix) ? mode_t(flags & OutputFileFlags::_custom_permissions_mask_posix) : default_permissions;
+        }
+        #endif
+    };
 
     using IoStreamRefVar = std::variant<std::reference_wrapper<InputStream>, std::reference_wrapper<OutputStream>>;
 
@@ -1897,13 +1948,27 @@ namespace em::Proc
         #ifdef _WIN32
         #error implement me
         #else
+
+        OutputFileDesc output_file_desc;
+        if (std::holds_alternative<std::reference_wrapper<OutputStream>>(target))
+            output_file_desc = {.filename = {}/*Not needed to get the flags.*/, .existing = existing, .allow_creating = allow_creating, .flags = flags};
+
         int handle = open(
             filename.GetPointer(),
             // Here always pass append. Firstly it's simpler than manually seeking to the end of file, and secondly I hope it'll give better behavior if multiple processes open the same file (if that's legal in the first place?).
-            std::visit(detail::Overload{[](const InputStream &){return O_RDONLY;}, [&](const OutputStream &){return O_WRONLY | (O_APPEND * !bool(flags & OutputFileFlags::no_append));}}, target) |
-                (O_CREAT * allow_creating) |
-                (existing == ExistingFile::keep ? 0 : existing == ExistingFile::overwrite ? O_TRUNC : O_EXCL),
-            0777 // Rely on umask to set the mode. This `...` parameter is unused if `O_CREAT` is not passed, but it's easier to pass unconditionally.
+            std::visit(detail::Overload{
+                [](const InputStream &)
+                {
+                    return O_RDONLY;
+                },
+                [&](const OutputStream &)
+                {
+                    return output_file_desc.ToOpenFlags_Posix();
+                }
+            }, target),
+            // This `...` parameter is unused if `O_CREAT` is not passed, but it's easier to pass unconditionally.
+            // Calling it when `output_file_desc` is default-constructed (so for input streams) should be fine too.
+            output_file_desc.ToOpenPermissions_Posix()
         );
 
         if (handle < 0)
@@ -1920,6 +1985,7 @@ namespace em::Proc
     }
 
     // Opens a file for reading. Returns a null instance with an error stored in it on failure, call `.ErrorMessage()` for details.
+    // Note that this function isn't very useful for redirecting process input, since that API also accepts a path direclty, and that's more optimal. This function exists only for completeness.
     [[nodiscard]] inline InputStream OpenInputFile(NativeCStringViewParam filename)
     {
         InputStream ret;
@@ -1928,6 +1994,7 @@ namespace em::Proc
     }
 
     // Opens a file for writing. Returns a null instance with an error stored in it on failure, call `.ErrorMessage()` for details.
+    // Note that this function isn't very useful for redirecting process output, since that API also accepts a path direclty, and that's more optimal. This function exists only for completeness.
     // `existing` controls what happens if such file already exists. `keep` means it's opened, `trucate` means its opened but the existing contents are destroyed, `error` means this function fails.
     // `allow_creating` controls what happens if no such file exists. `true` means it's created, `false` means this function fails.
     // It's an error to pass `!allow_creating && existing == error`.
@@ -1936,6 +2003,12 @@ namespace em::Proc
     {
         OutputStream ret;
         OpenFile(ret, std::move(filename), allow_creating, existing, flags);
+        return ret;
+    }
+    [[nodiscard]] inline OutputStream OpenOutputFile(const OutputFileDesc &desc)
+    {
+        OutputStream ret;
+        OpenFile(ret, std::move(desc.filename), desc.allow_creating, desc.existing, desc.flags);
         return ret;
     }
 
@@ -2473,11 +2546,12 @@ namespace em::Proc
 
     // What to do with the input stream of a process.
     // `InputStream` is intentionally listed first, to make `= {}` submit a null stream.
-    using InputStreamAttachment = std::variant<InputStream, TagInherit>;
+    using InputStreamAttachment = std::variant<InputStream, TagInherit, MaybeOwningNativeString>;
 
     // What to do with one of the output streams of a process.
     // `OutputStream` is intentionally listed first, to make `= {}` submit a null stream.
-    using OutputStreamAttachment = std::variant<OutputStream, TagInherit, TagMergeOutput>;
+    // Listing `MaybeOwningNativeString` for convenience. It's equivalent to passing the filename to `OutputFileDesc`.
+    using OutputStreamAttachment = std::variant<OutputStream, TagInherit, TagMergeOutput, MaybeOwningNativeString, OutputFileDesc>;
 
     // A part of parameters of a process. Stores misc stuff that doesn't fit anywhere else, including IO redirects.
     // This is move-only because of the stored IO streams.
@@ -2506,22 +2580,37 @@ namespace em::Proc
         std::optional<MaybeOwningNativeString> working_directory;
 
 
-        // What to do with `stdin`. The default behavior is to have it null.
-        // Pass `em::Proc::inherit` to inherit from the parent process. If you do that, make sure the parent doesn't touch the input streams while the child runs.
-        // Pass an `InputStream` to attach a custom stream.
-        InputStreamAttachment stdin_stream = {};
+        // What to do with `stdin`. The default behavior is to inherit it from the parent process.
+        // Pass `{}` or `nullptr` to make it null.
+        // Pass a string to open a file with that path and attach it.
+        // Pass an `InputStream` to attach a custom stream. This usually should be used with `MakePipe()`. While you could pass the result of `OpenInputFile()` as a stream too,
+        //   that's less optimal than passing the path here as a string.
+        InputStreamAttachment stdin_stream = inherit;
 
         // What to do with `stdout`. The default behavior is to inherit it from the parent process.
         // Pass `{}` or `nullptr` to make it null.
-        // Pass an `OutputStream` to attach a custom stream.
+        // Pass a string to open a file with that path and attach it. You can also pass `OutputFileDesc` which stores a file path with some extra settings.
+        // Pass an `OutputStream` to attach a custom stream. This usually should be used with `MakePipe()`. While you could pass the result of `OpenOutputFile()` as a stream too,
+        //   that's less optimal than passing the path here as a string.
         // Pass `merge_output` to redirect it to `stderr` (rarely useful), then `stderr_stream` controls both streams.
         OutputStreamAttachment stdout_stream = inherit;
 
         // What to do with `stderr`. The default behavior is to inherit it from the parent process.
         // Pass `{}` or `nullptr` to make it null.
-        // Pass an `OutputStream` to attach a custom stream.
+        // Pass a string to open a file with that path and attach it. You can also pass `OutputFileDesc` which stores a file path with some extra settings.
+        // Pass an `OutputStream` to attach a custom stream. This usually should be used with `MakePipe()`. While you could pass the result of `OpenOutputFile()` as a stream too,
+        //   that's less optimal than passing the path here as a string.
         // Pass `merge_output` to redirect it to `stdout`, then `stderr_stream` controls both streams. This is useful if you want to read both streams combined.
         OutputStreamAttachment stderr_stream = inherit;
+    };
+
+    // The combined process parameters.
+    // Normally you want to use this, but you can also create the individual parameter classes separately, if you want to reuse some of them between several processes.
+    // This is move-only because of `MiscParams`.
+    struct Params : MiscParams
+    {
+        Command command;
+        Environment env;
     };
 
     // A baked form of `MiscParams`. This is move-only.
@@ -2565,6 +2654,9 @@ namespace em::Proc
             // Constructs the `posix_spawn_file_actions_t` on the first call. Repeated calls do nothing.
             auto ConstructFileActionsIfNeeded = [&]() -> bool
             {
+                if (state.spawn_fa_alive)
+                    return false; // Already constructed.
+
                 if (int error = posix_spawn_file_actions_init(&state.spawn_fa))
                 {
                     // No useful messages for us to emit here, so just write the number.
@@ -2585,9 +2677,13 @@ namespace em::Proc
                     return;
                 }
 
-                #ifndef _WIN32
+                #ifdef _WIN32
+                #error hmm
+                #else
                 // Returns true on error, then this constructor should exit too.
-                auto AddDup2 = [&](int source_handle, int target_handle) -> bool
+                // `target_handle` is the desired handle in the new process, one of `STD{IN,OUT,ERR}_FILENO`.
+                // `source_handle` is the existing handle in the current process.
+                auto AddDup2 = [&](int target_handle, int source_handle) -> bool
                 {
                     if (ConstructFileActionsIfNeeded())
                         return true;
@@ -2601,70 +2697,113 @@ namespace em::Proc
 
                     return false;
                 };
-                #endif
+                // Returns true on error, then this constructor should exit too.
+                // `target_handle` is the desired handle in the new process, one of `STD{IN,OUT,ERR}_FILENO`.
+                auto AddOpen = [&](int target_handle, const char *filename, int flags, mode_t new_file_permissions) -> bool
+                {
+                    if (ConstructFileActionsIfNeeded())
+                        return true;
+
+                    if (int error = posix_spawn_file_actions_addopen(&state.spawn_fa, target_handle, filename, flags, new_file_permissions))
+                    {
+                        // Not adding the stream name to the error message. This shouldn't normally fail, so it's not particularly important.
+                        error_string = std::string("`posix_spawn_file_actions_adddup2()` failed: ") + std::strerror(error);
+                        return true;
+                    }
+
+                    return false;
+                };
 
                 // Stdin.
-                state.stdin_stream = std::visit(detail::Overload{
-                    #ifdef _WIN32
-                    #error hmm
-                    #else
-                    // Note that we propagate `elem` on error here and below!
-                    [](InputStream &&elem) -> InputStream {return elem || elem.HasError() ? std::move(elem) : OpenInputFile("/dev/null");},
-                    #endif
-                    [](TagInherit) -> InputStream {return {};},
-                }, std::move(params.stdin_stream));
-                if (state.stdin_stream.HasError())
+                if (std::visit(detail::Overload{
+                    [&](InputStream &&elem)
+                    {
+                        // The order matters here. A null stream with a error inside should trigger the error message, instead of silently opening `/dev/null`.
+                        if (elem.HasError())
+                        {
+                            error_string = "Bad `stdin`: " + elem.ErrorMessage();
+                            return true;
+                        }
+
+                        if (!elem)
+                            return AddOpen(STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+
+                        state.stdin_stream = std::move(elem);
+                        return AddDup2(STDIN_FILENO, state.stdin_stream.Handle());
+                    },
+                    [&](TagInherit)
+                    {
+                        return false;
+                    },
+                    [&](MaybeOwningNativeString &&elem)
+                    {
+                        return AddOpen(STDIN_FILENO, elem.GetPointer(), O_RDONLY, 0);
+                    },
+                }, std::move(params.stdin_stream)))
                 {
-                    error_string = "Bad `stdin`: " + state.stdin_stream.ErrorMessage();
                     return;
-                }
-                if (state.stdin_stream)
-                {
-                    if (AddDup2(state.stdin_stream.Handle(), STDIN_FILENO))
-                        return;
                 }
 
                 // Stdout.
-                state.stdout_stream = std::visit(detail::Overload{
-                    #ifdef _WIN32
-                    #error hmm
-                    #else
-                    [](OutputStream &&elem) -> OutputStream {return elem || elem.HasError() ? std::move(elem) : OpenOutputFile("/dev/null", ExistingFile::keep, false, OutputFileFlags::no_append);}, // Passing no `no_append` just in case. Writing to `/dev/null` shouldn't need the append flag, so less work?
-                    [](TagInherit) -> OutputStream {return {};},
-                    [](TagMergeOutput) -> OutputStream {return {non_owning, STDERR_FILENO};},
-                    #endif
-                }, std::move(params.stdout_stream));
-                if (state.stdout_stream.HasError())
+                auto HandleOutputStream = [&](bool is_stderr) -> bool
                 {
-                    error_string = "Bad `stdout`: " + state.stdout_stream.ErrorMessage();
-                    return;
-                }
-                if (state.stdout_stream)
-                {
-                    if (AddDup2(state.stdout_stream.Handle(), STDOUT_FILENO))
-                        return;
-                }
+                    const int target_handle = is_stderr ? STDERR_FILENO : STDOUT_FILENO;
 
-                // Stderr.
-                state.stderr_stream = std::visit(detail::Overload{
-                    #ifdef _WIN32
-                    #error hmm
-                    #else
-                    [](OutputStream &&elem) -> OutputStream {return elem || elem.HasError() ? std::move(elem) : OpenOutputFile("/dev/null", ExistingFile::keep, false, OutputFileFlags::no_append);}, // Same as in `stdout` above.
-                    [](TagInherit) -> OutputStream {return {};},
-                    [](TagMergeOutput) -> OutputStream {return {non_owning, STDOUT_FILENO};},
-                    #endif
-                }, std::move(params.stderr_stream));
-                if (state.stderr_stream.HasError())
+                    return std::visit(detail::Overload{
+                        [&](OutputStream &&elem)
+                        {
+                            // The order matters here. A null stream with a error inside should trigger the error message, instead of silently opening `/dev/null`.
+                            if (elem.HasError())
+                            {
+                                error_string = (is_stderr ? "Bad `stderr`: " : "Bad `stdout`: ") + elem.ErrorMessage();
+                                return true;
+                            }
+
+                            if (!elem && !elem.HasError())
+                                return AddOpen(target_handle, "/dev/null", O_WRONLY, 0);
+
+                            auto &target_field = (is_stderr ? state.stderr_stream : state.stdout_stream);
+                            target_field = std::move(elem);
+
+                            return AddDup2(target_handle, target_field.Handle());
+                        },
+                        [&](TagInherit)
+                        {
+                            return false;
+                        },
+                        [&](TagMergeOutput)
+                        {
+                            return AddDup2(target_handle, is_stderr ? STDOUT_FILENO : STDERR_FILENO);
+                        },
+                        [&](MaybeOwningNativeString &&elem)
+                        {
+                            OutputFileDesc desc;
+                            return AddOpen(target_handle, elem.GetPointer(), desc.ToOpenFlags_Posix(), desc.ToOpenPermissions_Posix());
+                        },
+                        [&](OutputFileDesc &&desc)
+                        {
+                            return AddOpen(target_handle, desc.filename.GetPointer(), desc.ToOpenFlags_Posix(), desc.ToOpenPermissions_Posix());
+                        },
+                    }, std::move(is_stderr ? params.stderr_stream : params.stdout_stream));
+                };
+
+                if (std::holds_alternative<TagMergeOutput>(params.stdout_stream))
                 {
-                    error_string = "Bad `stderr`: " + state.stderr_stream.ErrorMessage();
-                    return;
-                }
-                if (state.stderr_stream)
-                {
-                    if (AddDup2(state.stderr_stream.Handle(), STDERR_FILENO))
+                    // This specific case requires reverse stream initialization order. Otherwise `stdout` gets redirect to the old value of `stderr`, not the new one.
+
+                    if (HandleOutputStream(true))
+                        return;
+                    if (HandleOutputStream(false))
                         return;
                 }
+                else
+                {
+                    if (HandleOutputStream(false))
+                        return;
+                    if (HandleOutputStream(true))
+                        return;
+                }
+                #endif
             }
 
             // Working directory.
@@ -2727,15 +2866,6 @@ namespace em::Proc
             #endif
         };
         State state;
-    };
-
-    // The combined process parameters.
-    // Normally you want to use this, but you can also create the individual parameter classes separately, if you want to reuse some of them between several processes.
-    // This is move-only because of `MiscParams`.
-    struct Params : MiscParams
-    {
-        Command command;
-        Environment env;
     };
 
     // A single subprocess.
