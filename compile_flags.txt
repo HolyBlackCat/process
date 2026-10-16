@@ -1,0 +1,17 @@
+-Iinclude
+-std=c++23
+-pedantic-errors
+-Wall
+-Wextra
+-Wdeprecated
+-Wextra-semi
+-Wconversion
+
+--target=x86_64-w64-mingw32
+--sysroot=/ucrt64
+-pthread
+-fuse-ld=lld
+-stdlib=libstdc++
+-fno-emulated-tls
+-rtlib=libgcc
+-unwindlib=libgcc
