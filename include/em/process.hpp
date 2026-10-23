@@ -1,7 +1,11 @@
 #pragma once
 
+#include <atomic>
 #include <cassert>
+#include <compare>
+#include <concepts>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <optional>
@@ -9,12 +13,14 @@
 #include <string_view>
 #include <string>
 #include <type_traits>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 
 #ifdef _WIN32
 
 #include <initializer_list>
+#include <memory>
 
 #pragma push_macro("NOMINMAX")
 #pragma push_macro("WIN32_LEAN_AND_MEAN")
@@ -117,6 +123,19 @@
 
 namespace em::Proc
 {
+    class BasicIoStream;
+}
+
+// Doing it here to avoid having to exit the namespace in the middle of the header.
+// Don't want to set up some generic customization point either, just for my library.
+template <>
+struct std::hash<em::Proc::BasicIoStream>
+{
+    [[nodiscard]] std::size_t operator()(const em::Proc::BasicIoStream &stream) const;
+};
+
+namespace em::Proc
+{
     // Some tag types:
 
     // Construct an object in an invalid state, storing the provided error message.
@@ -129,6 +148,13 @@ namespace em::Proc
     struct TagNonOwning {explicit TagNonOwning() = default;};
     inline constexpr TagNonOwning non_owning{};
 
+    #ifdef _WIN32
+    struct TagWindowsOnly {explicit TagWindowsOnly() = default;};
+    // This is passed as the first argument to constructors to acknowledge that you understand that they're Windows-specific, and need to be `#if`ed.
+    // Normal functions the the `_Win` suffix (or `_Posix` for POSIX) because it looks nicer.
+    inline constexpr TagWindowsOnly windows_only{};
+    #endif
+
 
     #ifdef _WIN32
     using NativeChar = wchar_t;
@@ -138,11 +164,95 @@ namespace em::Proc
     using Pid = pid_t; // Process ID type. This is always some integer type.
     #endif
 
-    #ifdef _WIN32
-    struct TagWindowsOnly {explicit TagWindowsOnly() = default;};
-    // This is passed as the first argument to some functions to acknowledge that you understand that they're Windows-specific, and need to be `#if`ed.
-    inline constexpr TagWindowsOnly windows_only{};
-    #endif
+
+    // Stores the global library settings. See `GlobalSettings()` below.
+    struct Settings
+    {
+        // Stores a single flag of the settings.
+        class Flag
+        {
+            // I don't know if this use of atomics makes sense. Should be good enough.
+
+          public:
+            Flag(bool value) : storage(value) {}
+
+            Flag(const Flag &) = delete;
+            Flag &operator=(const Flag &) = delete;
+
+            // Returns true on success, false if the flag was already consumed.
+            bool Set(bool value)
+            {
+                std::uint8_t cur = storage.load(std::memory_order_relaxed);
+
+                while (true)
+                {
+                    if (cur & 2)
+                        return false; // Already was consumed.
+
+                    if (storage.compare_exchange_weak(cur, value, std::memory_order_relaxed))
+                        return true;
+                }
+            }
+
+            // Returns the current value of the flag.
+            // If `out_already_consumed` is specified, updates it to indicate if the library already consumed the value of the flag. In that case it's too late to change it, and `Set()` will always fail.
+            [[nodiscard]] bool Get(bool *out_already_consumed = nullptr) const
+            {
+                std::uint8_t cur = storage.load(std::memory_order_relaxed);
+                if (out_already_consumed)
+                    *out_already_consumed = bool(cur & 2);
+                return bool(cur & 1);
+            }
+
+            // Returns the current value of the flag, same as `Get()`, but also prevents further changes to it.
+            // Normally you shouldn't call this yourself, the library will do it for you.
+            [[nodiscard]] bool Consume()
+            {
+                return bool(storage.fetch_or(2, std::memory_order_relaxed) & 1);
+            }
+
+          private:
+            // Lowest bit is value, second bit is whether it was already read.
+            std::atomic_uint8_t storage = 1;
+        };
+
+        #ifdef _WIN32
+        // Set to false to not call `SetErrorMode(SEM_NOOPENFILEERRORBOX | SEM_FAILCRITICALERRORS)`.
+        // Calling that prevents some implicit error messageboxes from being displayed (mainly when opening files?), and instead just reports the errors to the application.
+        // SDL sets this temporarily for opening files, but since this is process-wide, I think I'd rather do it once.
+        Flag disable_error_messageboxes_win = true;
+        #endif
+
+        // Sets all the flags to false, to opt out of this library touching any process-wide settings.
+        // Returns true on success, or false if some of the flags were already consumed.
+        bool DisableAllFlags()
+        {
+            bool ok = true;
+
+            #ifdef _WIN32
+            if (!disable_error_messageboxes_win.Set(false))
+                ok = false;
+            #endif
+
+            return ok;
+        }
+    };
+
+    // Returns the global library settings that you can modify. You should set them before the first use of the library.
+    //
+    // By default, this library will change some process-wide platform-specific settings to sane values.
+    // You can opt out of that by changing the respective flag to false, or `GlobalSettings().DisableAllFlags();` to set all flags to false.
+    //
+    // The library checks each flag exactly once, when it needs it. After that it can't be changed.
+    //
+    // If you use this library from multiple DLLs (possibly in a header included in multiple DLLs), each DLL will have its own copy of the settings, and will try to apply them again for itself too, even if another one already did.
+    // But the underlying settings are process-wide, not DLL-wide, so make sure you set the flags to the same values in every DLL to get sane behavior.
+    // (A false flag does nothing instead of undoing the process-wide changes, so if the settings are not consistent across DLLs, those process-wide settings should converge on the OR of the flags across DLLs.)
+    [[nodiscard]] inline Settings &GlobalSettings()
+    {
+        static Settings ret;
+        return ret;
+    }
 
 
     namespace detail
@@ -163,7 +273,7 @@ namespace em::Proc
     // By default, replaces invalid characters in the input with placeholders.
     // If `success` is specified, instead returns an empty string if the input has invalid characters, and writes `false` to `success`. On success, writes `true`.
     template <typename Char>
-    [[nodiscard]] std::basic_string<std::conditional_t<std::is_same_v<Char, char>, wchar_t, char>> ConvertString(TagWindowsOnly, std::basic_string_view<Char> in, bool *success = nullptr)
+    [[nodiscard]] std::basic_string<std::conditional_t<std::is_same_v<Char, char>, wchar_t, char>> ConvertString_Win(std::basic_string_view<Char> in, bool *success = nullptr)
     {
         using RetChar = std::conditional_t<std::is_same_v<Char, char>, wchar_t, char>;
 
@@ -223,9 +333,9 @@ namespace em::Proc
     }
 
     // A convenience overload to take things convertible to `std::basic_string_view` (as opposed to `std::basic_string_view` itself) without specifying the template argument.
-    [[nodiscard]] auto ConvertString(TagWindowsOnly, detail::ConvertibleToStringView auto &&in, bool *success = nullptr)
+    [[nodiscard]] auto ConvertString_Win(detail::ConvertibleToStringView auto &&in, bool *success = nullptr)
     {
-        return ConvertString(windows_only, std::basic_string_view(decltype(in)(in)), success);
+        return ConvertString_Win(std::basic_string_view(decltype(in)(in)), success);
     }
     #endif
 
@@ -251,7 +361,7 @@ namespace em::Proc
         // If `success` is not specified, then invalid characters in the input will be replaced with placeholders in the result.
         // If `success` is specfied, then invalid characters cause the result to be empty instead. Writes true to `success` on success and false on failure.
         // Not specifying `success` is completely fine.
-        [[nodiscard]] NativeString(std::string_view value, bool *success = nullptr) : native(ConvertString(windows_only, value, success)) {}
+        [[nodiscard]] NativeString(std::string_view value, bool *success = nullptr) : native(ConvertString_Win(value, success)) {}
         [[nodiscard]] NativeString(const std::string &value, bool *success = nullptr) : NativeString(std::string_view(value), success) {}
         [[nodiscard]] NativeString(const char *value, bool *success = nullptr) : NativeString(std::string_view(value), success) {}
 
@@ -277,7 +387,7 @@ namespace em::Proc
         // Not specifying `success` is completely fine.
         [[nodiscard]] std::string get(bool *success = nullptr) const
         {
-            return ConvertString(windows_only, native, success);
+            return ConvertString_Win(native, success);
         }
         #else
         // Returns the stored string.
@@ -314,6 +424,12 @@ namespace em::Proc
 
     namespace detail
     {
+        template <typename ...P>
+        struct Overload : P... {using P::operator()...;};
+        template <typename ...P>
+        Overload(P...) -> Overload<P...>; // Keep this for older compilers, just in case.
+
+
         // Returns the array size for `argv`-style arrays.
         // If `ptr` is null, returns zero.
         [[nodiscard]] inline std::size_t PtrArraySize(const auto *const *ptr)
@@ -367,9 +483,9 @@ namespace em::Proc
             // From narrow strings.
             // On Windows, those can run into encoding errors. By default, they replace bad characters with placeholders.
             // But if `success` is specified, they instead return an empty string on failure, and set `success` to `false`. On success, they set it to `true`.
-            [[nodiscard]] MaybeOwningMaybeMutString(const std::string &str, bool *success = nullptr) requires is_wide : string(ConvertString(windows_only, str, success)) {}
-            [[nodiscard]] MaybeOwningMaybeMutString(std::string_view str, bool *success = nullptr) requires is_wide : string(ConvertString(windows_only, str, success)) {}
-            [[nodiscard]] MaybeOwningMaybeMutString(const char *str, bool *success = nullptr) requires is_wide : string(ConvertString(windows_only, str, success)) {}
+            [[nodiscard]] MaybeOwningMaybeMutString(const std::string &str, bool *success = nullptr) requires is_wide : string(ConvertString_Win(str, success)) {}
+            [[nodiscard]] MaybeOwningMaybeMutString(std::string_view str, bool *success = nullptr) requires is_wide : string(ConvertString_Win(str, success)) {}
+            [[nodiscard]] MaybeOwningMaybeMutString(const char *str, bool *success = nullptr) requires is_wide : string(ConvertString_Win(str, success)) {}
             #endif
 
             // From narrow strings.
@@ -626,6 +742,58 @@ namespace em::Proc
             }
         };
         #endif
+
+
+        #ifdef _WIN32
+        // The `error` parameter should come from `GetLastError()`.
+        [[nodiscard]] inline std::string WinApiErrorToString(DWORD error)
+        {
+            // Try getting the message in English first, and then try in the default language.
+            // Discussion https://stackoverflow.com/q/12715646/2752075 shows that firstly `0` doesn't mean English, and secondly that it's not guaranteed that English strings are available at all.
+            for (DWORD lang : {(DWORD)MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_US), DWORD(0)})
+            {
+                struct Guard
+                {
+                    wchar_t *message = nullptr;
+                    ~Guard()
+                    {
+                        if (message)
+                            LocalFree(message);
+                    }
+                };
+                Guard guard;
+
+                auto status = FormatMessageW(
+                    FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_ALLOCATE_BUFFER,
+                    nullptr,
+                    error,
+                    lang,
+                    // When `FORMAT_MESSAGE_ALLOCATE_BUFFER` is specfieid, this parameter changes meaning from `wchar_t *` to `wchar_t **`, so the manual says we need the cast.
+                    (wchar_t *)&guard.message,
+                    // Output buffer size. When `FORMAT_MESSAGE_ALLOCATE_BUFFER` is specified, it instead means the minimum amount of memory to allocate in the result, so 0 is fine.
+                    0,
+                    nullptr
+                );
+
+                if (status > 0)
+                {
+                    std::wstring_view ret_wide(guard.message);
+
+                    // SDL says it can end with `\r\n`.
+                    if (ret_wide.ends_with(L"\r\n"))
+                        ret_wide.remove_suffix(2);
+
+                    std::string ret = ConvertString_Win(ret_wide); // Ignoring encoding errors here, having placeholder characters in the string is fine.
+                    std::erase(ret, '\r'); // For a good measure.
+
+                    return ret;
+                }
+            }
+
+            // If the message wasn't available in any language:
+            return std::to_string(error) + " (no error message is available)";
+        }
+        #endif
     }
 
     // Ugh. I might simplify all those to `NativeString` one day.
@@ -704,6 +872,41 @@ namespace em::Proc
         [[nodiscard]] const std::string &ErrorMessage() const noexcept {return error_string;}
     };
 
+    // Explains the result of a read or write operation.
+    enum class IoResult
+    {
+        // Read or write successful.
+        // This usually means that at least one byte was processed, but zero bytes is possible too (Windows docs say that it can happen when reading when the other end of the pipe calls `WriteFile()` with zero length).
+        ok,
+
+        // No data to read or write, try again later.
+        // This should only happen for non-blocking streams.
+        retry_later,
+
+        // Nothing more to read. For a pipe, this means the remote end is closed. For a file, this is EOF. For files this can only happen on read, but for pipes it can happen on both reads and writes.
+        end_reached,
+
+        // You passed zero bytes, nothing to do.
+        no_data,
+
+        // Something broke,
+        error,
+    };
+
+    [[nodiscard]] inline const char *to_string(IoResult result)
+    {
+        switch (result)
+        {
+            case IoResult::ok:           return "ok";
+            case IoResult::retry_later:  return "retry_later";
+            case IoResult::end_reached: return "end_reached";
+            case IoResult::no_data:      return "no_data";
+            case IoResult::error:        return "error";
+        }
+        assert(false && "Invalid enum.");
+        return "??";
+    }
+
     // A base class for files, pipes, etc.
     class BasicIoStream : public StoresErrorMessage
     {
@@ -733,16 +936,23 @@ namespace em::Proc
 
         // Takes ownership of an existing handle. Mainly for internal use.
         [[nodiscard]] BasicIoStream(TagTakeOwnership, handle_t handle)
+            : BasicIoStream(non_owning, handle)
         {
-            state.handle = handle;
-            state.owns_handle = true;
+            if (*this) // Only set the ownership flag on non-null handles.
+                state.owns_handle = true;
         }
 
         // Stores an existing handle without taking ownership. Rarely useful.
         [[nodiscard]] BasicIoStream(TagNonOwning, handle_t handle)
         {
             state.handle = handle;
-            state.owns_handle = false;
+
+            #if _WIN32
+            // On Windows, null is also an invalid handle, in addition to `INVALID_HANDLE_VALUE` which is `(HANDLE)-1`.
+            // Instead of expanding `operator bool` to check that, I'd rather adjust it here.
+            if (state.handle == nullptr)
+                state.handle = invalid_handle;
+            #endif
         }
 
         [[nodiscard]] BasicIoStream(BasicIoStream &&other) noexcept
@@ -752,16 +962,14 @@ namespace em::Proc
             other.state = {};
         }
 
-        // Can't use by-value parameter here because of the protected dtor. Ugh.
-        BasicIoStream &operator=(BasicIoStream &&other) noexcept
+        BasicIoStream &operator=(BasicIoStream other) noexcept
         {
-            BasicIoStream copy = std::move(other);
-            std::swap(static_cast<StoresErrorMessage &>(*this), static_cast<StoresErrorMessage &>(copy));
-            std::swap(state, copy.state);
+            std::swap(static_cast<StoresErrorMessage &>(*this), static_cast<StoresErrorMessage &>(other));
+            std::swap(state, other.state);
             return *this;
         }
 
-      protected:
+        // Not protected, because it's very useful to be able to do `= {...}` on `BasicIoStream &`, etc.
         ~BasicIoStream()
         {
             if (state.owns_handle)
@@ -777,7 +985,6 @@ namespace em::Proc
             }
         }
 
-      public:
         [[nodiscard]] explicit operator bool() const
         {
             return state.handle != invalid_handle;
@@ -807,31 +1014,191 @@ namespace em::Proc
             state.owns_handle = false;
             return std::exchange(state.handle, invalid_handle);
         }
-    };
 
-    // Explains the result of a read or write operation.
-    enum class IoResult
-    {
-        ok, // Read or wrote something. You can try sending more data immediately.
-        retry_later, // Can't read or write right now, try again later.
-        end_of_input, // Nothing more to read. For a pipe, this means the remote end is closed. For a file, this is EOF. Can only appear on read.
-        no_data, // You passed zero bytes, nothing to do.
-        error, // Something broke,
-    };
-
-    [[nodiscard]] inline const char *to_string(IoResult result)
-    {
-        switch (result)
+        [[nodiscard]] friend bool operator==(const BasicIoStream &a, const BasicIoStream &b)
         {
-            case IoResult::ok:           return "ok";
-            case IoResult::retry_later:  return "retry_later";
-            case IoResult::end_of_input: return "end_of_input";
-            case IoResult::no_data:      return "no_data";
-            case IoResult::error:        return "error";
+            return a.state.handle == b.state.handle;
         }
-        assert(false && "Invalid enum.");
-        return "??";
-    }
+        [[nodiscard]] friend std::strong_ordering operator<=>(const BasicIoStream &a, const BasicIoStream &b)
+        {
+            return a.state.handle <=> b.state.handle;
+        }
+
+      protected:
+        // Perform a read or write.
+        // `out_result` is optional.
+        // Returns true when the result is `IoResult::ok` (regardless of `out_result` being specified or not).
+        // On failure, resets the handle to null so you don't miss the error.
+        // Don't call this on the async streams on POSIX.
+        // On Windows, `async_data_win` must be non-null for async streams, and null for sync streams.
+        template <bool Read>
+        bool ReadOrWriteUnbuffered(
+            std::conditional_t<Read, std::span<unsigned char>, std::span<const unsigned char>> data,
+            std::size_t &pos,
+            IoResult *out_result
+            #ifdef _WIN32
+            , OVERLAPPED *async_data_win = nullptr
+            #endif
+        )
+        {
+            if (StoreErrorIfNull())
+            {
+                if (out_result)
+                    *out_result = IoResult::error;
+                return false;
+            }
+
+          [[maybe_unused]] retry:
+
+            // Note that `pos == data.size()` is a valid no-op, but `pos > data.size()` is an assert (and a no-op in release builds).
+            assert(pos <= data.size());
+            if (pos >= data.size())
+            {
+                if (out_result)
+                    *out_result = IoResult::no_data;
+                return false;
+            }
+
+            std::size_t remaining_size = data.size() - pos;
+
+            #ifdef _WIN32
+
+            if (remaining_size > 0xffff'ffff)
+                remaining_size = 0xffff'ffff; // This has to fit in 32-bit DWORD.
+
+            DWORD processed_size = 0;
+
+            bool ok = [&]{
+                if constexpr (Read)
+                    return ReadFile(Handle(), data.data() + pos, DWORD(remaining_size), &processed_size, async_data_win);
+                else
+                    return WriteFile(Handle(), data.data() + pos, DWORD(remaining_size), &processed_size, async_data_win);
+            }();
+
+            if (!ok)
+            {
+                auto error = GetLastError();
+
+                // Should retry later?
+                if (error == ERROR_NO_DATA)
+                {
+                    // This better not happen randomly on blocking pipes. It shouldn't.
+                    if (out_result)
+                        *out_result = IoResult::retry_later;
+                    return false;
+                }
+
+                // EOF or pipe disconnected?
+                if (
+                    // Mostly certain about those:
+                    error == ERROR_HANDLE_EOF || error == ERROR_BROKEN_PIPE ||
+                    // Less certain about this:
+                    error == ERROR_PIPE_NOT_CONNECTED
+                )
+                {
+                    if (out_result)
+                        *out_result = IoResult::end_reached;
+                    return false;
+                }
+
+                // Surely an error at this point.
+                *this = {error_message, std::string(Read ? "`ReadFile()` failed: " : "`WriteFile()` failed: ") + detail::WinApiErrorToString(error)};
+                if (out_result)
+                    *out_result = IoResult::error;
+                return false;
+            }
+
+            // Docs say that `processed_size == 0` is possible at this point on read, if the other end called `WriteFile` with zero length.
+            // We don't mind.
+
+            assert(std::size_t(processed_size) <= remaining_size);
+            pos += std::size_t(processed_size);
+
+            if (out_result)
+                *out_result = IoResult::ok;
+            return true;
+
+            #else
+
+            auto result = [&]{
+                if constexpr (Read)
+                    return read(Handle(), data.data() + pos, remaining_size);
+                else
+                    return write(Handle(), data.data() + pos, remaining_size);
+            }();
+
+            int errno_copy = 0;
+            if (result < 0)
+                errno_copy = errno;
+
+            // Just in case, protect against `write()` returning zero. This should never happen.
+            if constexpr (!Read)
+            {
+                if (result == 0)
+                {
+                    assert(false && "`write()` somehow returned zero."); // `write()` should never return zero, hmm. Only `read()` can return it, which indicates EOF.
+
+                    // Fix up the results.
+                    result = -1;
+                    errno_copy = EAGAIN;
+                }
+            }
+
+            // Error, or retry later, or writing to a broken pipe.
+            if (result < 0)
+            {
+                // Need to retry later?
+                if (
+                    errno_copy == EAGAIN
+                    #if EAGAIN != EWOULDBLOCK // It's unspecified if they're equal or not. `#if` just in case, to silence possible warnings.
+                    || errno_copy == EWOULDBLOCK
+                    #endif
+                )
+                {
+                    if (out_result)
+                        *out_result = IoResult::retry_later;
+                    return false;
+                }
+
+                // Is this a write to a broken pipe?
+                if constexpr (!Read)
+                {
+                    if (errno_copy == EPIPE)
+                    {
+                        if (out_result)
+                            *out_result = IoResult::end_reached;
+                        return false;
+                    }
+                }
+
+                // Surely an error at this point.
+                *this = {error_message, std::string(Read ? "`read()` failed: " : "`write()` failed: ") + std::strerror(errno_copy)};
+                if (out_result)
+                    *out_result = IoResult::error;
+                return false;
+            }
+
+            // EOF.
+            // We already ensured earlier that this is only possible if `Read == true`.
+            if (result == 0)
+            {
+                if (out_result)
+                    *out_result = IoResult::end_reached;
+                return false;
+            }
+
+            // Success.
+            // `result` is always positive at this point.
+            assert(std::size_t(result) <= remaining_size);
+            pos += std::size_t(result);
+
+            if (out_result)
+                *out_result = IoResult::ok;
+            return true;
+
+            #endif
+        }
+    };
 
     // A base class for non-async IO streams.
     class BasicSyncIoStream : public BasicIoStream
@@ -842,11 +1209,11 @@ namespace em::Proc
         BasicSyncIoStream(BasicSyncIoStream &&) = default;
         BasicSyncIoStream &operator=(BasicSyncIoStream &&) = default;
 
-      protected:
+        // Not protected, for the same reason as in `BasicIoStream`.
         ~BasicSyncIoStream() = default;
 
       public:
-        // NOTE: Don't call this on ends of pipes that you'll pass to child processes. You should only call this on the ends of pipes that you'll use yourself.
+        // NOTE: Don't call this on streams (including ends of pipes) that you'll pass to child processes. You should only call this on streams that you'll use yourself.
         // Set whether this stream is blocking. I.e. when there is nothing more to read or write, should the read/write call block until it can continue, or return immediately.
         // Defaults to true.
         // Returns true on success, false on failure. On failure, resets this instance to null and stores the error on it, call `ErrorMessage()` to get it.
@@ -856,7 +1223,23 @@ namespace em::Proc
                 return false;
 
             #ifdef _WIN32
-            #error implement me
+
+            DWORD new_mode = is_blocking ? 0 : PIPE_NOWAIT;
+
+            // We don't try to preserve the existing settings (by calling `GetNamedPipeHandleState()`) since that's convoluted,
+            //   and it seems there are no useful settings to preserve anyway. Especially on the handles we created ourselves.
+            // SDL also doesn't attempt that.
+
+            // This says "named pipe", but actually works fine on our unnamed pipes too. SDL does this too.
+            // The docs even claim that anonymous pipes are internally implemented as named pipes, so they say that stuff like this tends to work.
+            if (!SetNamedPipeHandleState(Handle(), &new_mode, nullptr, nullptr))
+            {
+                *this = {error_message, std::string("`SetNamedPipeHandleState()` failed: ") + detail::WinApiErrorToString(GetLastError())};
+                return false;
+            }
+
+            return true;
+
             #else
 
             // Note `F_{GET,SET}FL`, as opposed to `F_{GET,SET}FD`, which is a different thing.
@@ -884,105 +1267,6 @@ namespace em::Proc
             return true;
             #endif
         }
-
-      protected:
-        // Perform a read or write.
-        // `out_result` is optional.
-        // Returns true when the result is `IoResult::ok` (regardless of `out_result` being specified or not).
-        // On failure, resets the handle to null so you don't miss the error.
-        template <bool Read>
-        bool ReadOrWriteUnbuffered(std::conditional_t<Read, std::span<unsigned char>, std::span<const unsigned char>> data, std::size_t &pos, IoResult *out_result)
-        {
-            #ifdef _WIN32
-            #error implement me
-
-            #else
-
-            if (StoreErrorIfNull())
-            {
-                if (out_result)
-                    *out_result = IoResult::error;
-                return false;
-            }
-
-            // Note that `pos == data.size()` is a valid no-op, but `pos > data.size()` is an assert (and a no-op in release builds).
-            assert(pos <= data.size());
-            if (pos >= data.size())
-            {
-                if (out_result)
-                    *out_result = IoResult::no_data;
-                return false;
-            }
-
-            std::size_t remaining_size = data.size() - pos;
-
-            auto result = [&]{
-                if constexpr (Read)
-                    return read(Handle(), data.data() + pos, remaining_size);
-                else
-                    return write(Handle(), data.data() + pos, remaining_size);
-            }();
-
-            int errno_copy = 0;
-            if (result < 0)
-                errno_copy = errno;
-
-            // Just in case, protect against `write()` returning zero. This should never happen.
-            if constexpr (!Read)
-            {
-                if (result == 0)
-                {
-                    assert(false && "`write()` somehow returned zero."); // `write()` should never return zero, hmm. Only `read()` can return it, which indicates EOF.
-
-                    // Fix up the results.
-                    result = -1;
-                    errno_copy = EAGAIN;
-                }
-            }
-
-            // Error or retry later.
-            if (result < 0)
-            {
-                // Need to retry later?
-                if (
-                    errno_copy == EAGAIN
-                    #if EAGAIN != EWOULDBLOCK // It's unspecified if they're equal or not. `#if` just in case, to silence possible warnings.
-                    || errno_copy == EWOULDBLOCK
-                    #endif
-                )
-                {
-                    if (out_result)
-                        *out_result = IoResult::retry_later;
-                    return false;
-                }
-
-                // Surely an error at this point.
-                *this = {error_message, std::string(Read ? "`read()` failed: " : "`write()` failed: ") + std::strerror(errno_copy)};
-                if (out_result)
-                    *out_result = IoResult::error;
-                return false;
-            }
-
-            // EOF.
-            // We already ensured earlier that this is only possible if `Read == true`.
-            if (result == 0)
-            {
-                if (out_result)
-                    *out_result = IoResult::end_of_input;
-                return false;
-            }
-
-            // Success.
-            // `result` is always positive at this point.
-            assert(std::size_t(result) <= remaining_size);
-            pos += std::size_t(result);
-
-            if (out_result)
-                *out_result = IoResult::ok;
-            return true;
-
-            #endif
-        }
     };
 
     // An input stream. Normally either the read end of a pipe, or a file opened for reading.
@@ -993,12 +1277,7 @@ namespace em::Proc
         // Tries to read some data, without any buffering.
         // You should probably set `pos` to zero initially.
         // Tries to fill `data` starting from `pos` and until the end. Increases `pos` to indicate how many bytes we were able to get.
-        // If `out_result` is specified, writes status to it:
-        // * `ok`           - Success. `pos` got increased.
-        // * `retry_later`  - No data yet, try again later. This is only possible if you called `SetBlocking(false)` before.
-        // * `end_of_input` - No more data. For pipes, this means the remote end got closed. For files, this is EOF.
-        // * `no_data`      - You passed `pos == data.size()`, nothing to do.
-        // * `error`        - Something went wrong. This instance becomes null, so you don't miss it. Call `ErrorMessage()` for the error message.
+        // If `out_result` is specified, writes status to it.
         // Returns true if the status is `ok` (regardless of `out_result` being null).
         // You can call this in a loop while it returns true if you prefer.
         bool ReadUnbuffered(std::span<unsigned char> data, std::size_t &pos, IoResult *out_result = nullptr)
@@ -1015,38 +1294,434 @@ namespace em::Proc
         // Tries to write some data, without any buffering.
         // You should probably set `pos` to zero initially.
         // Tries to write the part of `data` starting from `pos` and until the end. Increases `pos` to indicate how many bytes we were able to send.
-        // If `out_result` is specified, writes status to it:
-        // * `ok`           - Success. `pos` got increased.
-        // * `retry_later`  - No room to send more data, try again later. This is only possible if you called `SetBlocking(false)` before.
-        // * `no_data`      - You passed `pos == data.size()`, nothing to do.
-        // * `error`        - Something went wrong. This instance becomes null, so you don't miss it. Call `ErrorMessage()` for the error message.
+        // If `out_result` is specified, writes status to it.
         // Returns true if the status is `ok` (regardless of `out_result` being null).
         // You can call this in a loop while it returns true if you prefer.
-        bool ReadUnbuffered(std::span<unsigned char> data, std::size_t &pos, IoResult *out_result = nullptr)
+        bool WriteUnbuffered(std::span<unsigned char> data, std::size_t &pos, IoResult *out_result = nullptr)
         {
             return ReadOrWriteUnbuffered<true>(data, pos, out_result);
         }
     };
 
-    // A base class for async IO streams.
-    class BasicAsyncIoStream : public BasicIoStream
-    {
-        using BasicIoStream::BasicIoStream;
+    // // A base class for async IO streams.
+    // class BasicAsyncIoStream : public BasicIoStream
+    // {
+    //     using BasicIoStream::BasicIoStream;
 
-        BasicAsyncIoStream(BasicAsyncIoStream &&) = default;
-        BasicAsyncIoStream &operator=(BasicAsyncIoStream &&) = default;
+    //     BasicAsyncIoStream(BasicAsyncIoStream &&) = default;
+    //     BasicAsyncIoStream &operator=(BasicAsyncIoStream &&) = default;
 
-      protected:
-        ~BasicAsyncIoStream() = default;
-    };
+    //     // Not protected, for the same reason as in `BasicIoStream`.
+    //     ~BasicAsyncIoStream() = default;
+    // };
 
     namespace detail
     {
-        template <typename ...P>
-        struct Overload : P... {using P::operator()...;};
-        template <typename ...P>
-        Overload(P...) -> Overload<P...>; // Keep this for older compilers, just in case.
+        #ifdef _WIN32
+        [[nodiscard]] inline HANDLE CurrentProcessHandle()
+        {
+            // My understanding is that this can never fail.
+            // It should always return `(HANDLE)-1`.
+            static const HANDLE ret = GetCurrentProcess();
+            return ret;
+        }
+        #endif
 
+        inline bool CloneStreamLow(const BasicIoStream &from, BasicIoStream &to)
+        {
+            // Clear the output first.
+            to = {};
+
+            if (from.HasError())
+            {
+                // Just copy the error message.
+                to = {error_message, from.ErrorMessage()};
+                return false; // This is an error.
+            }
+
+            if (!from)
+                return true; // Not an error.
+
+            #ifdef _WIN32
+            BasicIoStream::handle_t new_handle = BasicIoStream::invalid_handle;
+            if (!DuplicateHandle(CurrentProcessHandle(), from.Handle(), CurrentProcessHandle(), &new_handle, 0, /*can inherit:*/true, DUPLICATE_SAME_ACCESS))
+            {
+                to = {error_message, std::string("`DuplicateHandle()` failed: ") + detail::WinApiErrorToString(GetLastError())};
+                return false;
+            }
+            to = {take_ownership, new_handle};
+            return true;
+            #else
+            BasicIoStream::handle_t new_handle = dup(from.Handle());
+            if (new_handle < 0)
+            {
+                to = {error_message, std::string("`dup()` failed: ") + std::strerror(errno)};
+                return false;
+            }
+            to = {take_ownership, new_handle};
+            return true;
+            #endif
+        }
+    }
+
+    template <typename T>
+    concept SyncIoStreamType = std::same_as<T, InputStream> || std::same_as<T, OutputStream>;
+
+    // Clones a stream, by cloning the underlying handle.
+    // Primarily for internal use, provided here as a courtesy. You shouldn't need this.
+    // Returns true on success. On failure writes an error message to `to`. Either way, the existing contents of `to` are destroyed.
+    // If `from` is null, sets `to` to null as well. That's no an error.
+    // One notable use of this is that on Windows, we set the "inheritable" flag for the copy even if the source doesn't have it.
+    template <SyncIoStreamType T>
+    bool CloneStream(const T &from, T &to)
+    {
+        return detail::CloneStreamLow(from, to);
+    }
+
+    // Creates a pipe, assigning the two ends to `read` and `write`, which should be initially empty. If they aren't empty, their existing values are discarded.
+    // On success, returns true and makes `read` and `write` non-null.
+    // On failure, returns false, makes `read` and `write` null, and stores the error message in `read` and `write`.
+    inline bool MakePipe(InputStream &read, OutputStream &write)
+    {
+        // Firstly, destroy existing handles, if any.
+        read = {};
+        write = {};
+
+        #ifdef _WIN32
+        BasicIoStream::handle_t read_handle = BasicIoStream::invalid_handle;
+        BasicIoStream::handle_t write_handle = BasicIoStream::invalid_handle;
+        SECURITY_ATTRIBUTES attrs{};
+        attrs.nLength = sizeof(attrs);
+        attrs.bInheritHandle = true; // Enable inheriting the handles by subprocesses.
+        // Note that on failure, `CreatePipe()` isn't guaranteed to leave the output parameters unchanged. So even if we allowed obtaining a pointer to the underlying handle from `BasicIoStream`,
+        //   we still wouldn't be able to pass that here directly, unless we also called `ReleaseHandle_Unsafe()` on failure.
+        if (CreatePipe(&read_handle, &write_handle, &attrs, 0)) // `0` is the buffer size. Passing zero leaves it defaulted.
+        {
+            // Success.
+            read = {take_ownership, read_handle};
+            write = {take_ownership, write_handle};
+        }
+        else
+        {
+            // Failure.
+            read = {error_message, detail::WinApiErrorToString(GetLastError())};
+            write = {error_message, read.ErrorMessage()};
+            return false;
+        }
+        return true;
+        #else
+        BasicIoStream::handle_t read_write_handles[2] = {BasicIoStream::invalid_handle, BasicIoStream::invalid_handle};
+
+        if (
+            #if EM_PROC_HAVE_PIPE2
+            // Note `O_CLOEXEC` rather than `FD_CLOEXEC`. The latter is for `fcntl()` only.
+            // We can't pass `O_NONBLOCK` here, since we don't always need it, and when we do, it's only for one end of the pipe.
+            pipe2(read_write_handles, O_CLOEXEC)
+            #else
+            pipe(read_write_handles)
+            #endif
+        )
+        {
+            // Failure.
+            read = {error_message, std::string("`pipe()` failed: ") + std::strerror(errno)};
+            write = {error_message, read.ErrorMessage()};
+            return false;
+        }
+        else
+        {
+            // Pipe created successfully.
+            read = {take_ownership, read_write_handles[0]};
+            write = {take_ownership, read_write_handles[1]};
+
+            #if !EM_PROC_HAVE_PIPE2
+            // Add `FD_CLOEXEC` flag. This prevents child processes from inheriting this handle by default.
+            for (BasicIoStream::handle_t handle : {read.Handle(), write.Handle()})
+            {
+                // Note `F_{GET,SET}FD`, as opposed to `F_{GET,SET}FL`, which is a different thing.
+
+                // Read existing flags.
+                int flags = fcntl(handle, F_GETFD);
+                if (flags == -1)
+                {
+                    read = {error_message, std::string("`fcntl(F_GETFD)` failed: ") + std::strerror(errno)};
+                    write = {error_message, read.ErrorMessage()}; // Store the same error in both instances for simplicity.
+                    return false;
+                }
+
+                flags |= FD_CLOEXEC;
+
+                // Write flags.
+                if (fcntl(handle, F_SETFD, flags))
+                {
+                    read = {error_message, std::string("`fcntl(F_SETFD)` failed: ") + std::strerror(errno)};
+                    write = {error_message, read.ErrorMessage()}; // Store the same error in both instances for simplicity.
+                    return false;
+                }
+            }
+            #endif
+        }
+        return true;
+        #endif
+    }
+
+    // A convenience variant of `MakePipe()` that returns the read end of the pipe and outputs the write end through a parameter.
+    [[nodiscard]] inline InputStream MakePipe(OutputStream &write)
+    {
+        InputStream ret;
+        (void)MakePipe(ret, write);
+        return ret;
+    }
+    // A convenience variant of `MakePipe()` that returns the write end of the pipe and outputs the read end through a parameter.
+    [[nodiscard]] inline OutputStream MakePipe(InputStream &read)
+    {
+        OutputStream ret;
+        (void)MakePipe(read, ret);
+        return ret;
+    }
+
+    // What to do if we're trying to open a file and it already exists?
+    enum class ExistingFile
+    {
+        // Open the file but discard the old contents.
+        overwrite,
+        // Open the file and keep the contents. Write operations will append to the end.
+        keep,
+        // Refuse to open an existing the file.
+        error,
+    };
+
+    // Additional settings for opening output files.
+    enum class OutputFileFlags
+    {
+        #ifndef _WIN32
+        // If specified, and `allow_creating == true`, the created file will have custom permissions, instead of our default 0644 (owner can read and write, group and others can only read).
+        // In addition to this flag, you must also store the desired permissions in this enum, as the lowest 12 bits.
+        // Note that `open()` automatically bitwise-subtracts something called `umask` from those bits, which is a per-process setting that defaults to 0022.
+        //   So if you want to set those bits (write permissions for group and others), you will need to disable them in the umask first, using `umask()` function.
+        custom_permissions_posix = 1 << 12,
+
+        // The lowest 12 bits of this enum are reserved for POSIX permission flags, see `custom_permissions_posix` above.
+        _custom_permissions_mask_posix = (1 << 12) - 12,
+        #endif
+
+        // Don't pass the append flag to the file.
+        // For `ExistingFile::keep`, this will cause writes to the file to overwrite data starting from the beginning, as opposed to appending at the end.
+        // For `ExistingFile::overwrite` this shouldn't make a difference, unless perhaps several things write to the same file? Didn't test.
+        no_append = 1 << 13,
+    };
+    DETAIL_EM_PROC_FLAG_ENUM(OutputFileFlags)
+
+    // This mirrors the parameter list of `OpenOutputFile()` for delayed calls, see below.
+    struct OutputFileDesc
+    {
+        // The default values here matter, they should match what `OpenOutputFile()` defaults to.
+
+        MaybeOwningNativeString filename;
+        ExistingFile existing = ExistingFile::overwrite;
+        bool allow_creating = true;
+        OutputFileFlags flags = {};
+
+        #ifndef _WIN32
+        // Those don't need Windows variants, because Windows doesn't have the equivalent of `posix_spawn_file_actions_addopen()`,
+        //   so we can always do everything in `OpenFile()`.
+
+        // Mainly for internal use. Returns the flags for `open()` corresponding to this struct.
+        // This carries information from all the fields, except `filename`.
+        // There's no equivalent for input files. Those should just pass `O_RDONLY` as flags, and `0` as file permissions (since the permissions are unused if `O_CREAT` is not specified).
+        [[nodiscard]] int ToOpenFlags_Posix() const
+        {
+            return
+                O_WRONLY |
+                (O_APPEND * !bool(flags & OutputFileFlags::no_append)) |
+                (O_CREAT * allow_creating) |
+                (existing == ExistingFile::keep ? 0 : existing == ExistingFile::overwrite ? O_TRUNC : O_EXCL);
+        }
+
+        // Mainly for internal use. Returns the file permission bits for `open()` corresponding to this struct.
+        // This only uses `flags` from this struct.
+        // `mode_t` is `unsigned int`. That's what `posix_spawn_file_actions_addopen()` takes.
+        [[nodiscard]] mode_t ToOpenPermissions_Posix() const
+        {
+            constexpr mode_t default_permissions = 0644; // Sync this default value with the comment on `OutputFileFlags::custom_permissions_posix`.
+            return bool(flags & OutputFileFlags::custom_permissions_posix) ? mode_t(flags & OutputFileFlags::_custom_permissions_mask_posix) : default_permissions;
+        }
+        #endif
+    };
+
+    using IoStreamRefVar = std::variant<std::reference_wrapper<InputStream>, std::reference_wrapper<OutputStream>>;
+
+    // This is a low-level function combining the effects of `OpenInputFile()` and `OpenOutputFile()`. Prefer one of those, and see them for more information.
+    // Opens a file and assigns it to `target`. `target` should initially be empty. If it isn't, its existing value is discarded.
+    // Returns true on success. Then makes `target` non-null.
+    // On failure returns false, and makes `target` null, and stores the error message in `target`.
+    // For input streams, it's also an error to pass `existing != keep`.
+    // NOTE: `allow_creating` doesn't have a default value here, since input streams are required to pass false, while output streams will usually pass true.
+    //   This is also why it's placed before other parameters with default arguments.
+    inline bool OpenFile(IoStreamRefVar target, NativeCStringViewParam filename, bool allow_creating, ExistingFile existing = ExistingFile::overwrite, OutputFileFlags flags = {})
+    {
+        BasicIoStream &target_base = std::visit([](auto &elem) -> BasicIoStream & {return elem;}, target);
+
+        // In any case, reset the target first.
+        // This also throws if it was `valueless_by_exception()`.
+        target_base = {};
+
+        // Validate `existing` enum.
+        bool existing_mode_valid = existing == ExistingFile::overwrite || existing == ExistingFile::keep || existing == ExistingFile::error;
+        assert(existing_mode_valid);
+        if (!existing_mode_valid)
+        {
+            target_base = {error_message, "Invalid `ExistingFile` enum value."};
+            return false;
+        }
+
+        // Perform stream-type-specific validation on the parameters.
+        if (!std::visit(detail::Overload{
+            [&](const std::reference_wrapper<InputStream> &elem)
+            {
+                // Input streams only allow one specific set of parameters.
+                if (allow_creating || existing != ExistingFile::keep || flags != OutputFileFlags{})
+                {
+                    elem.get() = {error_message, "Input files require `allow_creating == false && existing == keep && flags == 0`."};
+                    return false;
+                }
+                return true;
+            },
+            [&](const std::reference_wrapper<OutputStream> &elem)
+            {
+                // This specific combination would never allow the file to be opened, so we error on it ourselves.
+                if (!allow_creating && existing == ExistingFile::error)
+                {
+                    elem.get() = {error_message, "Illegal mode combination for a file: `allow_creating == false && existing == error`."};
+                    return false;
+                }
+                return true;
+            },
+        }, target))
+        {
+            return false;
+        }
+
+        #ifdef _WIN32
+
+        // Disable some weird error messageboxes. Here I'm copying what SDL does, except that I'm setting it only once and permanently, since it's a process-wide setting.
+        [[maybe_unused]] static const std::nullptr_t disable_error_messageboxes_once = []{
+            if (GlobalSettings().disable_error_messageboxes_win.Consume())
+                SetErrorMode(
+                    GetErrorMode() |
+                    // This seems reasonable to me.
+                    SEM_FAILCRITICALERRORS |
+                    // This I'm not sure about. SDL uses it, but it should only affect `OpenFile()`, not `CreateFile()`.
+                    SEM_NOOPENFILEERRORBOX
+                );
+            return nullptr;
+        }();
+
+        SECURITY_ATTRIBUTES sec_attrs{};
+        sec_attrs.nLength = sizeof sec_attrs;
+        sec_attrs.bInheritHandle = true; // Allow inheriting this, since we'll normally use those files to redirect IO.
+
+        HANDLE handle = CreateFileW(
+            filename.GetPointer(),
+            // Access mode.
+            std::visit(detail::Overload{
+                // Those are a bit moot. For reads and non-append writes we could alternatively use `GENERIC_READ` and `GENERIC_WRITE`,
+                //   but it's unclear to me what's the append equivalent of `GENERIC_WRITE`. Since apparently `GENERIC_WRITE` is a lone bit (as opposed to a mask including `FILE_WRITE_DATA`),
+                //   I can't just modify one bit in it. I could go to the docs and find what `GENERIC_WRITE` resolves to and paste that here, but eh.
+                //   I don't think we need those extra permissions for anything anyway (at least if Claude is to be trusted, and it's not like we're doing anything advanced with the files).
+                [](const InputStream &) -> DWORD {return FILE_READ_DATA;},
+                [&](const OutputStream &) -> DWORD {return bool(flags & OutputFileFlags::no_append) ? FILE_WRITE_DATA : FILE_APPEND_DATA;},
+            }, target),
+            // What shared access to the same file to allow.
+            std::visit(detail::Overload{
+                [](const InputStream &) -> DWORD {return FILE_SHARE_READ;}, // Others can also read. Should we also allow writes here? Probably not.
+                [&](const OutputStream &) -> DWORD {return bool(flags & OutputFileFlags::no_append) ? 0 : FILE_SHARE_WRITE;}, // If we're appending, I guess allow concurrent writes to also append?
+            }, target),
+            &sec_attrs,
+            allow_creating
+                ? (existing == ExistingFile::keep ? OPEN_ALWAYS : existing == ExistingFile::error ? CREATE_NEW : CREATE_ALWAYS)
+                : (existing == ExistingFile::keep ? OPEN_EXISTING : TRUNCATE_EXISTING),
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr
+        );
+
+        if (handle == INVALID_HANDLE_VALUE)
+        {
+            // Failed to open.
+            target_base = {error_message, std::string("`CreateFileW()` failed: ") + detail::WinApiErrorToString(GetLastError())};
+            return false;
+        }
+
+        // Success.
+        target_base = {take_ownership, handle};
+        return true;
+
+        #else
+
+        OutputFileDesc output_file_desc;
+        if (std::holds_alternative<std::reference_wrapper<OutputStream>>(target))
+            output_file_desc = {.filename = {}/*Not needed to get the flags.*/, .existing = existing, .allow_creating = allow_creating, .flags = flags};
+
+        int handle = open(
+            filename.GetPointer(),
+            // Here always pass append. Firstly it's simpler than manually seeking to the end of file, and secondly I hope it'll give better behavior if multiple processes open the same file (if that's legal in the first place?).
+            std::visit(detail::Overload{
+                [](const InputStream &)
+                {
+                    return O_RDONLY;
+                },
+                [&](const OutputStream &)
+                {
+                    return output_file_desc.ToOpenFlags_Posix();
+                }
+            }, target),
+            // This `...` parameter is unused if `O_CREAT` is not passed, but it's easier to pass unconditionally.
+            // Calling it when `output_file_desc` is default-constructed (so for input streams) should be fine too.
+            output_file_desc.ToOpenPermissions_Posix()
+        );
+
+        if (handle < 0)
+        {
+            // Failed to open.
+            target_base = {error_message, std::string("`open()` failed: ") + std::strerror(errno)};
+            return false;
+        }
+
+        // Success.
+        target_base = {take_ownership, handle};
+        return true;
+        #endif
+    }
+
+    // Opens a file for reading. Returns a null instance with an error stored in it on failure, call `.ErrorMessage()` for details.
+    // Note that this function isn't very useful for redirecting process input, since that API also accepts a path direclty, and that's more optimal. This function exists only for completeness.
+    [[nodiscard]] inline InputStream OpenInputFile(NativeCStringViewParam filename)
+    {
+        InputStream ret;
+        OpenFile(ret, std::move(filename), false, ExistingFile::keep);
+        return ret;
+    }
+
+    // Opens a file for writing. Returns a null instance with an error stored in it on failure, call `.ErrorMessage()` for details.
+    // Note that this function isn't very useful for redirecting process output, since that API also accepts a path direclty, and that's more optimal. This function exists only for completeness.
+    // `existing` controls what happens if such file already exists. `keep` means it's opened, `trucate` means its opened but the existing contents are destroyed, `error` means this function fails.
+    // `allow_creating` controls what happens if no such file exists. `true` means it's created, `false` means this function fails.
+    // It's an error to pass `!allow_creating && existing == error`.
+    // NOTE: Here the parameter order is different than in `OpenFile()`, because this one makes more sense, and we're not constrained by having to provide decent API for input files too.
+    [[nodiscard]] inline OutputStream OpenOutputFile(NativeCStringViewParam filename, ExistingFile existing = ExistingFile::overwrite, bool allow_creating = true, OutputFileFlags flags = {})
+    {
+        OutputStream ret;
+        OpenFile(ret, std::move(filename), allow_creating, existing, flags);
+        return ret;
+    }
+    [[nodiscard]] inline OutputStream OpenOutputFile(const OutputFileDesc &desc)
+    {
+        OutputStream ret;
+        OpenFile(ret, std::move(desc.filename), desc.allow_creating, desc.existing, desc.flags);
+        return ret;
+    }
+
+    namespace detail
+    {
         #ifdef _WIN32
         // Combines multiple command-line arguments into one string. Can operate either on wide or on narrow strings, doesn't matter.
         // `executable` is the optional override for the executable name, that's otherwise taken from the first argument. We may modify it, and may reset it to null if needed. (Currently only resetting.)
@@ -1557,55 +2232,6 @@ namespace em::Proc
             return ret;
         }
 
-        // The `error` parameter should come from `GetLastError()`.
-        [[nodiscard]] inline std::string WinApiErrorToString(DWORD error)
-        {
-            // Try getting the message in English first, and then try in the default language.
-            // Discussion https://stackoverflow.com/q/12715646/2752075 shows that firstly `0` doesn't mean English, and secondly that it's not guaranteed that English strings are available at all.
-            for (DWORD lang : {(DWORD)MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_US), DWORD(0)})
-            {
-                struct Guard
-                {
-                    wchar_t *message = nullptr;
-                    ~Guard()
-                    {
-                        if (message)
-                            LocalFree(message);
-                    }
-                };
-                Guard guard;
-
-                auto status = FormatMessageW(
-                    FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_ALLOCATE_BUFFER,
-                    nullptr,
-                    error,
-                    lang,
-                    // When `FORMAT_MESSAGE_ALLOCATE_BUFFER` is specfieid, this parameter changes meaning from `wchar_t *` to `wchar_t **`, so the manual says we need the cast.
-                    (wchar_t *)&guard.message,
-                    // Output buffer size. When `FORMAT_MESSAGE_ALLOCATE_BUFFER` is specified, it instead means the minimum amount of memory to allocate in the result, so 0 is fine.
-                    0,
-                    nullptr
-                );
-
-                if (status > 0)
-                {
-                    std::wstring_view ret_wide(guard.message);
-
-                    // SDL says it can end with `\r\n`.
-                    if (ret_wide.ends_with(L"\r\n"))
-                        ret_wide.remove_suffix(2);
-
-                    std::string ret = ConvertString(windows_only, ret_wide); // Ignoring encoding errors here, having placeholder characters in the string is fine.
-                    std::erase(ret, '\r'); // For a good measure.
-
-                    return ret;
-                }
-            }
-
-            // If the message wasn't available in any language:
-            return std::to_string(error) + " (no error message is available)";
-        }
-
         #endif
 
 
@@ -1723,293 +2349,6 @@ namespace em::Proc
         }
 
         #endif
-    }
-
-    // Creates a pipe, assigning the two ends to `read` and `write`, which should be initially empty. If they aren't empty, their existing values are discarded.
-    // On success, returns true and makes `read` and `write` non-null.
-    // On failure, returns false, makes `read` and `write` null, and stores the error message in `read` and `write`.
-    inline bool MakePipe(InputStream &read, OutputStream &write)
-    {
-        // Firstly, destroy existing handles, if any.
-        read = {};
-        write = {};
-
-        #ifdef _WIN32
-        BasicIoStream::handle_t read_handle = BasicIoStream::invalid_handle;
-        BasicIoStream::handle_t write_handle = BasicIoStream::invalid_handle;
-        SECURITY_ATTRIBUTES attrs{};
-        attrs.nLength = sizeof(attrs);
-        attrs.bInheritHandle = true; // Enable inheriting the handles by subprocesses.
-        // Note that on failure, `CreatePipe()` isn't guaranteed to leave the output parameters unchanged. So even if we allowed obtaining a pointer to the underlying handle from `BasicIoStream`,
-        //   we still wouldn't be able to pass that here directly, unless we also called `ReleaseHandle_Unsafe()` on failure.
-        if (CreatePipe(&read_handle, &write_handle, &attrs, 0)) // `0` is the buffer size. Passing zero leaves it defaulted.
-        {
-            // Success.
-            read = {take_ownership, read_handle};
-            write = {take_ownership, write_handle};
-        }
-        else
-        {
-            // Failure.
-            read = {error_message, detail::WinApiErrorToString(GetLastError())};
-            write = {error_message, read.ErrorMessage()};
-            return false;
-        }
-        return true;
-        #else
-        BasicIoStream::handle_t read_write_handles[2] = {BasicIoStream::invalid_handle, BasicIoStream::invalid_handle};
-
-        if (
-            #if EM_PROC_HAVE_PIPE2
-            // Note `O_CLOEXEC` rather than `FD_CLOEXEC`. The latter is for `fcntl()` only.
-            // We can't pass `O_NONBLOCK` here, since we don't always need it, and when we do, it's only for one end of the pipe.
-            pipe2(read_write_handles, O_CLOEXEC)
-            #else
-            pipe(read_write_handles)
-            #endif
-        )
-        {
-            // Failure.
-            read = {error_message, std::string("`pipe()` failed: ") + std::strerror(errno)};
-            write = {error_message, read.ErrorMessage()};
-            return false;
-        }
-        else
-        {
-            // Pipe created successfully.
-            read = {take_ownership, read_write_handles[0]};
-            write = {take_ownership, read_write_handles[1]};
-
-            #if !EM_PROC_HAVE_PIPE2
-            // Add `FD_CLOEXEC` flag. This prevents child processes from inheriting this handle by default.
-            for (BasicIoStream::handle_t handle : {read.Handle(), write.Handle()})
-            {
-                // Note `F_{GET,SET}FD`, as opposed to `F_{GET,SET}FL`, which is a different thing.
-
-                // Read existing flags.
-                int flags = fcntl(handle, F_GETFD);
-                if (flags == -1)
-                {
-                    read = {error_message, std::string("`fcntl(F_GETFD)` failed: ") + std::strerror(errno)};
-                    write = {error_message, read.ErrorMessage()}; // Store the same error in both instances for simplicity.
-                    return false;
-                }
-
-                flags |= FD_CLOEXEC;
-
-                // Write flags.
-                if (fcntl(handle, F_SETFD, flags))
-                {
-                    read = {error_message, std::string("`fcntl(F_SETFD)` failed: ") + std::strerror(errno)};
-                    write = {error_message, read.ErrorMessage()}; // Store the same error in both instances for simplicity.
-                    return false;
-                }
-            }
-            #endif
-        }
-        return true;
-        #endif
-    }
-
-    // A convenience variant of `MakePipe()` that returns the read end of the pipe and outputs the write end through a parameter.
-    [[nodiscard]] inline InputStream MakePipe(OutputStream &write)
-    {
-        InputStream ret;
-        (void)MakePipe(ret, write);
-        return ret;
-    }
-    // A convenience variant of `MakePipe()` that returns the write end of the pipe and outputs the read end through a parameter.
-    [[nodiscard]] inline OutputStream MakePipe(InputStream &read)
-    {
-        OutputStream ret;
-        (void)MakePipe(read, ret);
-        return ret;
-    }
-
-    // What to do if we're trying to open a file and it already exists?
-    enum class ExistingFile
-    {
-        // Open the file but discard the old contents.
-        overwrite,
-        // Open the file and keep the contents. Write operations will append to the end.
-        keep,
-        // Refuse to open an existing the file.
-        error,
-    };
-
-    // Additional settings for opening output files.
-    enum class OutputFileFlags
-    {
-        #ifndef _WIN32
-        // If specified, and `allow_creating == true`, the created file will have custom permissions, instead of our default 0644 (owner can read and write, group and others can only read).
-        // In addition to this flag, you must also store the desired permissions in this enum, as the lowest 12 bits.
-        // Note that `open()` automatically bitwise-subtracts something called `umask` from those bits, which is a per-process setting that defaults to 0022.
-        //   So if you want to set those bits (write permissions for group and others), you will need to disable them in the umask first, using `umask()` function.
-        custom_permissions_posix = 1 << 12,
-
-        // The lowest 12 bits of this enum are reserved for POSIX permission flags, see `custom_permissions_posix` above.
-        _custom_permissions_mask_posix = (1 << 12) - 12,
-        #endif
-
-        // Don't pass the append flag to the file.
-        // For `ExistingFile::keep`, this will cause writes to the file to overwrite data starting from the beginning, as opposed to appending at the end.
-        // For `ExistingFile::overwrite` this shouldn't make a difference, unless perhaps several things write to the same file? Didn't test.
-        no_append = 1 << 13,
-    };
-    DETAIL_EM_PROC_FLAG_ENUM(OutputFileFlags)
-
-    // This mirrors the parameter list of `OpenOutputFile()` for delayed calls, see below.
-    struct OutputFileDesc
-    {
-        // The default values here matter, they should match what `OpenOutputFile()` defaults to.
-
-        MaybeOwningNativeString filename;
-        ExistingFile existing = ExistingFile::overwrite;
-        bool allow_creating = true;
-        OutputFileFlags flags = {};
-
-        #ifdef _WIN32
-        #error hmm
-        #else
-        // Mainly for internal use. Returns the flags for `open()` corresponding to this struct.
-        // This carries information from all the fields, except `filename`.
-        // There's no equivalent for input files. Those should just pass `O_RDONLY` as flags, and `0` as file permissions (since the permissions are unused if `O_CREAT` is not specified).
-        [[nodiscard]] int ToOpenFlags_Posix() const
-        {
-            return
-                O_WRONLY |
-                (O_APPEND * !bool(flags & OutputFileFlags::no_append)) |
-                (O_CREAT * allow_creating) |
-                (existing == ExistingFile::keep ? 0 : existing == ExistingFile::overwrite ? O_TRUNC : O_EXCL);
-        }
-
-        // Mainly for internal use. Returns the file permission bits for `open()` corresponding to this struct.
-        // This only uses `flags` from this struct.
-        // `mode_t` is `unsigned int`. That's what `posix_spawn_file_actions_addopen()` takes.
-        [[nodiscard]] mode_t ToOpenPermissions_Posix() const
-        {
-            constexpr mode_t default_permissions = 0644; // Sync this default value with the comment on `OutputFileFlags::custom_permissions_posix`.
-            return bool(flags & OutputFileFlags::custom_permissions_posix) ? mode_t(flags & OutputFileFlags::_custom_permissions_mask_posix) : default_permissions;
-        }
-        #endif
-    };
-
-    using IoStreamRefVar = std::variant<std::reference_wrapper<InputStream>, std::reference_wrapper<OutputStream>>;
-
-    // This is a low-level function combining the effects of `OpenInputFile()` and `OpenOutputFile()`. Prefer one of those, and see them for more information.
-    // Opens a file and assigns it to `target`. `target` should initially be empty. If it isn't, its existing value is discarded.
-    // Returns true on success. Then makes `target` non-null.
-    // On failure returns false, and makes `target` null, and stores the error message in `target`.
-    // For input streams, it's also an error to pass `existing != keep`.
-    // NOTE: `allow_creating` doesn't have a default value here, since input streams are required to pass false, while output streams will usually pass true.
-    //   This is also why it's placed before other parameters with default arguments.
-    inline bool OpenFile(IoStreamRefVar target, NativeCStringViewParam filename, bool allow_creating, ExistingFile existing = ExistingFile::overwrite, OutputFileFlags flags = {})
-    {
-        // In any case, reset the target first.
-        // This also throws if it was `valueless_by_exception()`.
-        std::visit([](auto &elem) {elem.get() = {};}, target);
-
-        // Validate `existing` enum.
-        bool existing_mode_valid = existing == ExistingFile::overwrite || existing == ExistingFile::keep || existing == ExistingFile::error;
-        assert(existing_mode_valid);
-        if (!existing_mode_valid)
-        {
-            std::visit([](auto &elem){elem.get() = {error_message, "Invalid `ExistingFile` enum value."};}, target);
-            return false;
-        }
-
-        // Perform stream-type-specific validation on the parameters.
-        if (!std::visit(detail::Overload{
-            [&](const std::reference_wrapper<InputStream> &elem)
-            {
-                // Input streams only allow one specific set of parameters.
-                if (allow_creating || existing != ExistingFile::keep || flags != OutputFileFlags{})
-                {
-                    elem.get() = {error_message, "Input files require `allow_creating == false && existing == keep && flags == 0`."};
-                    return false;
-                }
-                return true;
-            },
-            [&](const std::reference_wrapper<OutputStream> &elem)
-            {
-                // This specific combination would never allow the file to be opened, so we error on it ourselves.
-                if (!allow_creating && existing == ExistingFile::error)
-                {
-                    elem.get() = {error_message, "Illegal mode combination for a file: `allow_creating == false && existing == error`."};
-                    return false;
-                }
-                return true;
-            },
-        }, target))
-        {
-            return false;
-        }
-
-        #ifdef _WIN32
-        #error implement me
-        #else
-
-        OutputFileDesc output_file_desc;
-        if (std::holds_alternative<std::reference_wrapper<OutputStream>>(target))
-            output_file_desc = {.filename = {}/*Not needed to get the flags.*/, .existing = existing, .allow_creating = allow_creating, .flags = flags};
-
-        int handle = open(
-            filename.GetPointer(),
-            // Here always pass append. Firstly it's simpler than manually seeking to the end of file, and secondly I hope it'll give better behavior if multiple processes open the same file (if that's legal in the first place?).
-            std::visit(detail::Overload{
-                [](const InputStream &)
-                {
-                    return O_RDONLY;
-                },
-                [&](const OutputStream &)
-                {
-                    return output_file_desc.ToOpenFlags_Posix();
-                }
-            }, target),
-            // This `...` parameter is unused if `O_CREAT` is not passed, but it's easier to pass unconditionally.
-            // Calling it when `output_file_desc` is default-constructed (so for input streams) should be fine too.
-            output_file_desc.ToOpenPermissions_Posix()
-        );
-
-        if (handle < 0)
-        {
-            // Failed to open.
-            std::visit([](auto &elem){elem.get() = {error_message, std::string("`open()` failed: ") + std::strerror(errno)};}, target);
-            return false;
-        }
-
-        // Success.
-        std::visit([&](auto &elem){elem.get() = {take_ownership, handle};}, target);
-        return true;
-        #endif
-    }
-
-    // Opens a file for reading. Returns a null instance with an error stored in it on failure, call `.ErrorMessage()` for details.
-    // Note that this function isn't very useful for redirecting process input, since that API also accepts a path direclty, and that's more optimal. This function exists only for completeness.
-    [[nodiscard]] inline InputStream OpenInputFile(NativeCStringViewParam filename)
-    {
-        InputStream ret;
-        OpenFile(ret, std::move(filename), false, ExistingFile::keep);
-        return ret;
-    }
-
-    // Opens a file for writing. Returns a null instance with an error stored in it on failure, call `.ErrorMessage()` for details.
-    // Note that this function isn't very useful for redirecting process output, since that API also accepts a path direclty, and that's more optimal. This function exists only for completeness.
-    // `existing` controls what happens if such file already exists. `keep` means it's opened, `trucate` means its opened but the existing contents are destroyed, `error` means this function fails.
-    // `allow_creating` controls what happens if no such file exists. `true` means it's created, `false` means this function fails.
-    // It's an error to pass `!allow_creating && existing == error`.
-    // NOTE: Here the parameter order is different than in `OpenFile()`, because this one makes more sense, and we're not constrained by having to provide decent API for input files too.
-    [[nodiscard]] inline OutputStream OpenOutputFile(NativeCStringViewParam filename, ExistingFile existing = ExistingFile::overwrite, bool allow_creating = true, OutputFileFlags flags = {})
-    {
-        OutputStream ret;
-        OpenFile(ret, std::move(filename), allow_creating, existing, flags);
-        return ret;
-    }
-    [[nodiscard]] inline OutputStream OpenOutputFile(const OutputFileDesc &desc)
-    {
-        OutputStream ret;
-        OpenFile(ret, std::move(desc.filename), desc.allow_creating, desc.existing, desc.flags);
-        return ret;
     }
 
     // A list of environment variables.
@@ -2217,6 +2556,10 @@ namespace em::Proc
         [[nodiscard]] Command(std::initializer_list<MaybeOwningNativeString> argv, std::optional<MaybeOwningNativeString> executable = {}, Extras extras = DefaultExtras())
             : Command(std::span(argv), std::move(executable), std::move(extras))
         {}
+        // A vector version for consistency with POSIX.
+        [[nodiscard]] Command(const std::vector<MaybeOwningNativeString> &argv, std::optional<MaybeOwningNativeString> executable = {}, Extras extras = DefaultExtras())
+            : Command(std::span(argv), std::move(executable), std::move(extras))
+        {}
         #else
         [[nodiscard]] Command(std::vector<MaybeOwningNativeString> argv, std::optional<MaybeOwningNativeString> executable = {}, Extras extras = DefaultExtras())
         {
@@ -2230,6 +2573,13 @@ namespace em::Proc
         {
             (void)extras;
             resulting_command = std::vector<MaybeOwningNativeString>(std::move(argv)); // If only the init_list could actually be moved...
+            resulting_executable = std::move(executable);
+        }
+        // A span version for consistency with Windows.
+        [[nodiscard]] Command(std::span<const MaybeOwningNativeString> argv, std::optional<MaybeOwningNativeString> executable = {}, Extras extras = DefaultExtras())
+        {
+            (void)extras;
+            resulting_command = {argv.size(), [&](std::size_t i) -> const auto & {return argv[i];}};
             resulting_executable = std::move(executable);
         }
         #endif
@@ -2458,7 +2808,7 @@ namespace em::Proc
             if (env_vars)
             {
                 bool success = false;
-                resulting_env = ConvertString(windows_only, detail::AssembleEnvironmentFromPtr(env_vars), encoding == EncodingMode::error ? &success : nullptr);
+                resulting_env = ConvertString_Win(detail::AssembleEnvironmentFromPtr(env_vars), encoding == EncodingMode::error ? &success : nullptr);
                 if (encoding == EncodingMode::error && !success)
                     error_string = "Encoding error.";
             }
@@ -2553,6 +2903,15 @@ namespace em::Proc
     // Listing `MaybeOwningNativeString` for convenience. It's equivalent to passing the filename to `OutputFileDesc`.
     using OutputStreamAttachment = std::variant<OutputStream, TagInherit, TagMergeOutput, MaybeOwningNativeString, OutputFileDesc>;
 
+    // Inherit all file handles as opposed to only some. The main benefit of this is that it's faster to not filter them.
+    struct TagAllHandles {explicit TagAllHandles() = default;};
+    inline constexpr TagAllHandles all_handles{};
+
+    // Used to store handles inherited by the subprocess. See `inherit_handles` below.
+    // Wasn't sure if those should be `BasicIoStream::handle_t` or the whole `BasicIoStream`. I think storing whole streams is more convenient for ownership, even though it makes it less clear that on Windows those can be arbitrary handles.
+    using InheritedHandlesSet = std::unordered_set<BasicIoStream>;
+    using InheritedHandles = std::variant<InheritedHandlesSet, TagAllHandles>;
+
     // A part of parameters of a process. Stores misc stuff that doesn't fit anywhere else, including IO redirects.
     // This is move-only because of the stored IO streams.
     class MiscParams : public StoresErrorMessage
@@ -2602,6 +2961,15 @@ namespace em::Proc
         //   that's less optimal than passing the path here as a string.
         // Pass `merge_output` to redirect it to `stdout`, then `stderr_stream` controls both streams. This is useful if you want to read both streams combined.
         OutputStreamAttachment stderr_stream = inherit;
+
+
+        // Which handles should the subprocess inherit.
+        // On Windows, those are arbitrary `HANDLE`s. On POSIX, those are file descriptors.
+        // The default behavior is to inherit nothing. Insert handles into the set to inherit them, or pass `all_handles` to inherit all of them (which is faster than filtering the handles).
+        // The IO redirects (`*_stream`s above) must not be listed here, we inherit them implicitly.
+        // This list can only include handles that are inheritable (`bInheritHandle == true` on Windows, no `O_CLOEXEC` on POSIX). Non-inheritable handles are never inherited,
+        //   and inheritable handles are inherited only if allowed by this parameter.
+        InheritedHandles inherit_handles;
     };
 
     // The combined process parameters.
@@ -2619,24 +2987,17 @@ namespace em::Proc
       public:
         [[nodiscard]] constexpr BakedMiscParams() {}
 
-        // Move-only.
-        [[nodiscard]] BakedMiscParams(BakedMiscParams &&other) noexcept
-            : StoresErrorMessage(std::move(other)),
-            state(std::move(other.state))
-        {
-            other.state = {};
-        }
-
-        BakedMiscParams &operator=(BakedMiscParams other) noexcept
-        {
-            std::swap(static_cast<StoresErrorMessage &>(*this), static_cast<StoresErrorMessage &>(other));
-            std::swap(state, other.state);
-            return *this;
-        }
+        // Not movable, because we statically allocate some buffers on Windows (see `State` below for details).
+        // If you ever decide to make it movable, don't forget to also move the `StoresErrorMessage` base.
+        BakedMiscParams(const BakedMiscParams &) = delete;
+        BakedMiscParams &operator=(const BakedMiscParams &) = delete;
 
         ~BakedMiscParams()
         {
-            #ifndef _WIN32
+            #ifdef _WIN32
+            if (auto attrs = ResultingProcessAttributeList_Win())
+                DeleteProcThreadAttributeList(attrs);
+            #else
             if (state.spawn_fa_alive)
                 posix_spawn_file_actions_destroy(&state.spawn_fa);
             #endif
@@ -2677,9 +3038,277 @@ namespace em::Proc
                     return;
                 }
 
+                // Complain if any if the inherited handles are invalid.
+                if (auto opt = std::get_if<InheritedHandlesSet>(&params.inherit_handles))
+                {
+                    for (const auto &elem : *opt)
+                    {
+                        if (elem.HasError())
+                        {
+                            error_string = "One of the inherited handles is invalid: " + elem.ErrorMessage();
+                            return;
+                        }
+
+                        if (!elem)
+                        {
+                            // Apparently this is particualrly important to check.
+                            // `https://github.com/rprichard/win32-console-docs/blob/master/README.md#proc_thread_attribute_handle_list` says that passing a `NULL` handle makes the whole list look empty, interesting.
+                            // Not sure what passing `INVALID_HANDLE_VALUE` would do, the docs say it's not allowed. Doesn't really matter.
+                            error_string = "One of the inherited handles is null.";
+                            return;
+                        }
+                    }
+                }
+
                 #ifdef _WIN32
-                #error hmm
+
+                // Stdin.
+                if (std::visit(detail::Overload{
+                    [&](InputStream &&elem)
+                    {
+                        if (elem.HasError())
+                        {
+                            error_string = "Bad `stdin`: " + elem.ErrorMessage();
+                            return true;
+                        }
+
+                        // If the user passed null, open a handle to `\\.\NUL` instead. This is what SDL does.
+                        // We could open it once and store it, but that's mildly suspicious and probably isn't worth it.
+                        if (!elem)
+                        {
+                            state.stdin_stream = OpenInputFile(R"(\\.\NUL)");
+                            if (state.stdin_stream.HasError())
+                            {
+                                error_string = "Failed to open a `\\\\.\\NUL` handle for `stdin`: " + state.stdin_stream.ErrorMessage();
+                                return true;
+                            }
+                        }
+
+                        state.stdin_stream = std::move(elem);
+                        return false;
+                    },
+                    [&](TagInherit)
+                    {
+                        HANDLE handle = GetStdHandle(STD_INPUT_HANDLE);
+                        if (handle == INVALID_HANDLE_VALUE)
+                        {
+                            error_string = "`GetStdHandle(STD_INPUT_HANDLE)` failed: " + detail::WinApiErrorToString(GetLastError());
+                            return true;
+                        }
+
+                        // This handle can still be null. In that case we just pass that as is. (Even though this constructor converts null to `INVALID_HANDLE_VALUE`, we convert that back when passing it.)
+                        state.stdin_stream = {non_owning, handle};
+                        return false;
+                    },
+                    [&](MaybeOwningNativeString &&elem)
+                    {
+                        state.stdin_stream = OpenInputFile(std::move(elem));
+                        if (state.stdin_stream.HasError())
+                        {
+                            error_string = "Failed to open `stdin` file: " + state.stdin_stream.ErrorMessage();
+                            return true;
+                        }
+
+                        return false;
+                    },
+                }, std::move(params.stdin_stream)))
+                {
+                    return;
+                }
+
+                auto HandleOutputStream = [&](bool is_stderr) -> bool
+                {
+                    OutputStream &target_field = is_stderr ? state.stderr_stream : state.stdout_stream;
+                    const char *const stream_name = is_stderr ? "stderr" : "stdout";
+
+                    return std::visit(detail::Overload{
+                        [&](OutputStream &&elem)
+                        {
+                            if (elem.HasError())
+                            {
+                                error_string = std::string("Bad `") + stream_name + "`: " + elem.ErrorMessage();
+                                return true;
+                            }
+
+                            // If the user passed null, open a handle to `\\.\NUL` instead. This is what SDL does.
+                            // We could open it once and store it, but that's mildly suspicious and probably isn't worth it.
+                            if (!elem)
+                            {
+                                // No particular reason to pass `no_append`, just to hopefully do less work.
+                                target_field = OpenOutputFile(R"(\\.\NUL)", ExistingFile::keep, false, OutputFileFlags::no_append);
+                                if (target_field.HasError())
+                                {
+                                    error_string = std::string("Failed to open a `\\\\.\\NUL` handle for `") + stream_name + "`: " + target_field.ErrorMessage();
+                                    return true;
+                                }
+                            }
+
+                            target_field = std::move(elem);
+                            return false;
+                        },
+                        [&](TagInherit)
+                        {
+                            HANDLE handle = GetStdHandle(is_stderr ? STD_ERROR_HANDLE : STD_OUTPUT_HANDLE);
+                            if (handle == INVALID_HANDLE_VALUE)
+                            {
+                                error_string = std::string("`GetStdHandle(") + (is_stderr ? "STD_ERROR_HANDLE" : "STD_OUTPUT_HANDLE") + ")` failed: " + detail::WinApiErrorToString(GetLastError());
+                                return true;
+                            }
+
+                            // This handle can still be null. In that case we just pass that as is. (Even though this constructor converts null to `INVALID_HANDLE_VALUE`, we convert that back when passing it.)
+                            target_field = {non_owning, handle};
+                            return false;
+                        },
+                        [&](TagMergeOutput)
+                        {
+                            // We could just pass the same handle to both streams, but Claude has a good point that the started program might close one of the two handles and don't expect the other one to get closed at the same time. Didn't test this though, but SDL does the same.
+                            CloneStream(is_stderr ? state.stdout_stream : state.stderr_stream, target_field);
+                            if (target_field.HasError())
+                            {
+                                error_string = "Failed to merge the output streams: " + target_field.ErrorMessage();
+                                return true;
+                            }
+
+                            return false;
+                        },
+                        [&]<typename T>(T &&name_or_desc) requires std::is_same_v<T, MaybeOwningNativeString> || std::is_same_v<T, OutputFileDesc>
+                        {
+                            target_field = OpenOutputFile(name_or_desc);
+                            if (target_field.HasError())
+                            {
+                                error_string = std::string("Failed to open `") + (is_stderr ? "stderr" : "stdout") + "` file: " + target_field.ErrorMessage();
+                                return true;
+                            }
+
+                            return false;
+                        },
+                    }, std::move(is_stderr ? params.stderr_stream : params.stdout_stream));
+                };
+
+                if (std::holds_alternative<TagMergeOutput>(params.stdout_stream))
+                {
+                    // This specific case requires reverse stream initialization order, since we'll be duplicating the `stderr` handle into `stdout`.
+
+                    if (HandleOutputStream(true))
+                        return;
+                    if (HandleOutputStream(false))
+                        return;
+                }
+                else
+                {
+                    if (HandleOutputStream(false))
+                        return;
+                    if (HandleOutputStream(true))
+                        return;
+                }
+
+                // Handle inherited handles.
+                if (std::visit(detail::Overload{
+                    [&](InheritedHandlesSet &input_handle_set)
+                    {
+                        // Prepare the handle set:
+
+                        state.inherited_handle_set = std::move(input_handle_set);
+
+                        std::size_t num_handles = state.inherited_handle_set.size() + bool(state.stdin_stream) + bool(state.stdout_stream) + bool(state.stderr_stream);
+
+                        // Do we actually have any handles to inherit?
+                        if (num_handles == 0)
+                            return false;
+
+                        // Allocate the array.
+                        HANDLE *handle_arr = nullptr;
+                        if (num_handles <= num_preallocated_inherited_handles)
+                        {
+                            handle_arr = state.inherited_handles_storage_array;
+                        }
+                        else
+                        {
+                            state.inherited_handles_storage_ptr = std::make_unique<HANDLE[]>(num_handles);
+                            handle_arr = state.inherited_handles_storage_ptr.get();
+                        }
+
+                        // Fill the array.
+                        std::size_t handle_arr_pos = 0;
+
+                        if (state.stdin_stream)
+                            handle_arr[handle_arr_pos++] = state.stdin_stream.Handle();
+                        if (state.stdout_stream)
+                            handle_arr[handle_arr_pos++] = state.stdout_stream.Handle();
+                        if (state.stderr_stream)
+                            handle_arr[handle_arr_pos++] = state.stderr_stream.Handle();
+
+                        for (const auto &elem : state.inherited_handle_set)
+                            handle_arr[handle_arr_pos++] = elem.Handle(); // We already checked `HasError()` for those earlier, and also tested them for being null.
+
+                        assert(handle_arr_pos == num_handles);
+
+
+                        // Make the attribute list:
+
+                        // How many bytes do we need to allocate for the attribute list.
+                        // This depends on the max number of attributes we're planning to store inside, which in our case is one (the list of inherited handles).
+                        static const std::size_t attribute_list_byte_size = []{
+                            std::size_t ret = 0;
+                            // The docs say this always returns an error when querying the size, by design. So I'm not checking the return value.
+                            InitializeProcThreadAttributeList(nullptr, attrs_capacity, 0, &ret);
+                            assert(ret > 0);
+                            return ret;
+                        }();
+                        if (attribute_list_byte_size == 0)
+                        {
+                            error_string = "`InitializeProcThreadAttributeList()` failed when determining the needed capacity.";
+                            return true;
+                        }
+
+                        // We can't call `ResultingProcessAttributeList_Win()` to initialize this, since `state.attribute_list_alive` is still false.
+                        LPPROC_THREAD_ATTRIBUTE_LIST attr_list = nullptr;
+
+                        // If on this system `attribute_list_byte_size` is higher than expected, heap-allocate the thing, and also assert.
+                        if (attribute_list_byte_size > expected_attribute_list_byte_size)
+                        {
+                            assert(false && "`InitializeProcThreadAttributeList()` returns a larger value than expected on your Windows version, go bump `expected_attribute_list_byte_size` in the library and report this to me. This is not a bug.");
+                            state.attribute_list_storage_ptr = std::make_unique<unsigned char[]>(attribute_list_byte_size);
+                            attr_list = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(state.attribute_list_storage_ptr.get());
+                        }
+                        else
+                        {
+                            // Use the embedded storage.
+                            attr_list = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(state.attribute_list_storage_array);
+                        }
+
+                        // I don't think this value is actually going to get modified, but it's easier to make a mutable copy than to do `const_cast` and then having to worry about it.
+                        std::size_t attribute_list_byte_size_copy = attribute_list_byte_size;
+                        if (!InitializeProcThreadAttributeList(attr_list, attrs_capacity, 0, &attribute_list_byte_size_copy))
+                        {
+                            error_string = "`InitializeProcThreadAttributeList()` failed: " + detail::WinApiErrorToString(GetLastError());
+                            return true;
+                        }
+                        state.attribute_list_alive = true;
+
+
+                        // Pass the array to the attribute list. That only stores a pointer to it, so we could fill it even after passing, doesn't matter.
+
+                        if (!UpdateProcThreadAttribute(attr_list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, handle_arr, num_handles * sizeof(HANDLE), nullptr, nullptr))
+                        {
+                            error_string = "`UpdateProcThreadAttribute()` failed when storing the inherited handle list: " + detail::WinApiErrorToString(GetLastError());
+                            return true;
+                        }
+
+                        return false;
+                    },
+                    [&](TagAllHandles)
+                    {
+                        return false;
+                    },
+                }, params.inherit_handles))
+                {
+                    return;
+                }
+
                 #else
+                #error write to state.inherited_handle_set here, and close the handles not in the set
+
                 // Returns true on error, then this constructor should exit too.
                 // `target_handle` is the desired handle in the new process, one of `STD{IN,OUT,ERR}_FILENO`.
                 // `source_handle` is the existing handle in the current process.
@@ -2825,7 +3454,7 @@ namespace em::Proc
             #endif
 
 
-            // Lastly, reset the parameters.
+            // Lastly, reset the consumed input params, just in case.
             params = {};
         }
 
@@ -2840,6 +3469,33 @@ namespace em::Proc
         {
             return state.working_directory;
         }
+
+        // The attribute list for the process, or null if none.
+        [[nodiscard]] LPPROC_THREAD_ATTRIBUTE_LIST ResultingProcessAttributeList_Win()
+        {
+            if (state.attribute_list_alive)
+                return reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(state.attribute_list_storage_ptr ? state.attribute_list_storage_ptr.get() : state.attribute_list_storage_array);
+            else
+                return nullptr;
+        }
+
+        [[nodiscard]] BasicIoStream::handle_t ResultingStdinHandle_Win() const
+        {
+            // By default those would return `INVALID_HANDLE_VALUE` when null, which isn't what we want, because the subprocess would apparently receive the same invalid handle.
+            // While passing `NULL` may sometimes cause the child to allocate its own console. (All that is Claude is to be trusted.)
+            // It shouldn't happen often, though, as when the user requests a null stream, we pass an opened handle to `\\.\NUL` instead. An actual `NULL` would only happen if we try to inherit the parent stream and it's null.
+            return state.stdin_stream ? state.stdin_stream.Handle() : nullptr;
+        }
+
+        [[nodiscard]] BasicIoStream::handle_t ResultingStdoutHandle_Win() const
+        {
+            return state.stdout_stream ? state.stdout_stream.Handle() : nullptr;
+        }
+
+        [[nodiscard]] BasicIoStream::handle_t ResultingStderrHandle_Win() const
+        {
+            return state.stderr_stream ? state.stderr_stream.Handle() : nullptr;
+        }
         #else
         [[nodiscard]] const posix_spawn_file_actions_t *ResultingFileActions_Posix() const
         {
@@ -2849,21 +3505,52 @@ namespace em::Proc
         #endif
 
       private:
+
+        #ifdef _WIN32
+        // How many attributes should the attribute list support. Currently only one, the list of handles.
+        static constexpr DWORD attrs_capacity = 1;
+
+        // The size that I observed `InitializeProcThreadAttributeList()` to report, for the current `attrs_capacity`.
+        // We use this to avoid heap allocations. If this happens to be wrong, we assert and fall back to a heap allocation.
+        static constexpr std::size_t expected_attribute_list_byte_size = 48;
+
+        // How many handles we'll typically inherit, so we can allocate a heap buffer for those. Typically those are `stdin`/`stdout`/`stderr`.
+        // Unlike `expected_attribute_list_byte_size`, which is expected to always be correct, it's fine for this one to be too small depending on the provided params.
+        static constexpr std::size_t num_preallocated_inherited_handles = 3;
+        #endif
+
+
         struct State
         {
             bool detach = false;
 
             #ifdef _WIN32
             std::optional<MaybeOwningNativeString> working_directory;
+
+            // Those two are storage for `AttributeList()`. Use that, don't read them directly.
+            unsigned char attribute_list_storage_array[expected_attribute_list_byte_size]{};
+            std::unique_ptr<unsigned char[]> attribute_list_storage_ptr;
+            bool attribute_list_alive = false;
+
+            // Those two are for the list of inherited handles, stored inside of `AttributeList()`.
+            // The first one right there is why `BakedMiscParams` is not movable. A pointer to this is baked into `AttributeList()` (unless we need a larger array, in which case it gets heap-allocated in `inherited_handles_storage_ptr`).
+            HANDLE inherited_handles_storage_array[num_preallocated_inherited_handles]{};
+            std::unique_ptr<HANDLE[]> inherited_handles_storage_ptr;
+
             #else
             bool spawn_fa_alive = false;
             posix_spawn_file_actions_t spawn_fa{};
+            #endif
 
-            // In those handles, null means inherit, and anything else should be used as is.
+            // Those just keep IO redirect handles alive until the process starts.
+            // On POSIX, the handle values are baked into `spawn_fa`, so we don't need to read them from here.
+            // On Windows, we read them from here (and they are also included in the attribute list).
             InputStream stdin_stream;
             OutputStream stdout_stream;
             OutputStream stderr_stream;
-            #endif
+
+            // This is used to keep extra inherited handles alive.
+            InheritedHandlesSet inherited_handle_set;
         };
         State state;
     };
@@ -2923,7 +3610,6 @@ namespace em::Proc
 
 
             #ifdef _WIN32
-
             wchar_t *command_ptr = command.ResultingCommand_Win();
 
             const wchar_t *executable_ptr = nullptr;
@@ -2941,12 +3627,28 @@ namespace em::Proc
             if (const auto &opt = misc.ResultingWorkingDir_Win())
                 working_dir_ptr = opt->GetPointer();
 
-            STARTUPINFOW startup_info{};
-            startup_info.cb = sizeof(startup_info);
-            // startup_info.dwFlags |= STARTF_USESTDHANDLES;
-            // startup_info.hStdInput = INVALID_HANDLE_VALUE;
-            // startup_info.hStdOutput = INVALID_HANDLE_VALUE;
-            // startup_info.hStdError = INVALID_HANDLE_VALUE;
+            STARTUPINFOEXW startup_info{};
+
+            // The attribute list is a mutable pointer, but I don't think starting the process can actually modify it, so here I `const_cast`.
+            // Since `BakedMiscParams` can use a small buffer optimization for it, this function itself can't be `const`.
+            if (auto attrs = const_cast<BakedMiscParams &>(misc).ResultingProcessAttributeList_Win())
+            {
+                startup_info.StartupInfo.cb = sizeof(startup_info);
+                startup_info.lpAttributeList = attrs;
+            }
+            else
+            {
+                // I'm not sure if I'm allowed to pass a null `lpAttributeList` or not. It's easier to just set `cb` to the size of the non-`EX` part, the `STARTUPINFOW`. That will prevent the attribute list pointer from being passed.
+                startup_info.StartupInfo.cb = sizeof(startup_info.StartupInfo);
+            }
+
+            // IO streams.
+            // Here we could avoid passing `STARTF_USESTDHANDLES`, which would enable some defaults, but I might as well do that myself when determining the handles when baking the parameters.
+            // I don't think there's any benefit to special-casing not passing those here when all the streams match the default values.
+            startup_info.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
+            startup_info.StartupInfo.hStdInput = misc.ResultingStdinHandle_Win();
+            startup_info.StartupInfo.hStdOutput = misc.ResultingStdoutHandle_Win();
+            startup_info.StartupInfo.hStdError = misc.ResultingStderrHandle_Win();
 
             struct ProcInfoGuard
             {
@@ -2955,9 +3657,10 @@ namespace em::Proc
                 ~ProcInfoGuard()
                 {
                     // Not sure if the validity checks are needed. The manual doesn't say anything about allowing invalid handles, so probably needed.
-                    if (value.hProcess != INVALID_HANDLE_VALUE)
+                    // Both null and `INVALID_HANDLE_VALUE` are invalid values.
+                    if (value.hProcess && value.hProcess != INVALID_HANDLE_VALUE)
                         CloseHandle(value.hProcess);
-                    if (value.hThread != INVALID_HANDLE_VALUE)
+                    if (value.hThread && value.hThread != INVALID_HANDLE_VALUE)
                         CloseHandle(value.hThread);
                 }
             };
@@ -2977,7 +3680,7 @@ namespace em::Proc
                 //   doesn't say that the environment is clobbered, so I think the `const_cast` is fine.
                 const_cast<wchar_t *>(env.ResultingEnvironment_Win()),
                 working_dir_ptr,
-                &startup_info,
+                &startup_info.StartupInfo,
                 &proc_info.value
             );
             if (!ok)
@@ -3001,13 +3704,13 @@ namespace em::Proc
             char **command_ptr = const_cast<char **>(command.ResultingCommand_Posix());
             if (!command_ptr)
             {
-                // We check it here, because we sometimes use `cmd_argv[0]` below and it better not be null.
+                // We check it here, because we sometimes use `command_ptr[0]` below and `command_ptr` better not be null.
                 error_string = "Null `argv` specified for process.";
                 return;
             }
             if (!command_ptr[0])
             {
-                // We check it here, because we sometimes use `cmd_argv[0]` below and it better not be null.
+                // We check it here, because we sometimes use `command_ptr[0]` below and the array better not be empty.
                 error_string = "Empty `argv` specified for process.";
                 return;
             }
@@ -3388,4 +4091,12 @@ namespace em::Proc
         };
         State state;
     };
+}
+
+
+// Implement `std::hash` functions declared earlier:
+
+inline std::size_t std::hash<em::Proc::BasicIoStream>::operator()(const em::Proc::BasicIoStream &stream) const
+{
+    return std::hash<em::Proc::BasicIoStream::handle_t>{}(stream.Handle());
 }

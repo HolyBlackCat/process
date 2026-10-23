@@ -57,7 +57,7 @@ Compilation tests:
 Tests:
     environment
     chdir
-    no_append behavior on different systems
+    no_append vs default behavior on different systems
     merging output streams: check both stdout and stderr
 
 

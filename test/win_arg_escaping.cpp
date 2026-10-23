@@ -1,3 +1,6 @@
+// This is a standalone executable that can be used to test command line escaping on Windows. It only compiles on Windows.
+// If it runs with exit code 0, everything is fine.
+
 #include <em/process.hpp>
 
 #include <stdexcept>
@@ -37,7 +40,7 @@ void CheckEscaping(
         using Char = std::remove_cvref_t<decltype(GetUnderlyingStr())>::value_type;
 
         if constexpr (std::is_same_v<Char, wchar_t>)
-            return '`' + em::Proc::ConvertString(em::Proc::windows_only, GetUnderlyingStr()) + '`';
+            return '`' + em::Proc::ConvertString_Win(GetUnderlyingStr()) + '`';
         else
             return '`' + std::string(GetUnderlyingStr()) + '`';
     };
