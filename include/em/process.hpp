@@ -1557,10 +1557,10 @@ namespace em::Proc
         return detail::CloneStreamLow(from, to, inheritable);
     }
 
-    // Creates a pipe, assigning the two ends to `read` and `write`, which should be initially empty. If they aren't empty, their existing values are discarded.
-    // On success, returns true and makes both `read` and `write` non-null.
-    // On failure, returns false, makes both `read` and `write` null, and stores the error message in both `read` and `write`.
-    inline bool MakePipe(InputStream &read, OutputStream &write, Inheritable read_inheritable, Inheritable write_inheritable)
+    // Creates a pipe, assigning the two ends to `write` and `read`, which should be initially empty. If they aren't empty, their existing values are discarded.
+    // On success, returns true and makes both `write` and `read` non-null.
+    // On failure, returns false, makes both `write` and `read` null, and stores the error message in both `write` and `read`.
+    inline bool MakePipe(OutputStream &write, InputStream &read, Inheritable write_inheritable, Inheritable read_inheritable)
     {
         // Firstly, destroy existing handles, if any.
         read = {};
@@ -1747,17 +1747,17 @@ namespace em::Proc
 
     // Convenience variants of `MakePipe()` for when one or both ends are IO redirects.
     // Returns true on success.
-    [[nodiscard]] inline bool MakePipe(InputStreamAttachment &read, OutputStream &write, Inheritable write_inheritable = Inheritable::no)
+    inline bool MakePipe(OutputStream &write, InputStreamAttachment &read, Inheritable write_inheritable = Inheritable::no)
     {
-        return MakePipe(read.emplace<InputStream>(), write, Inheritable::as_stdio_stream, write_inheritable);
+        return MakePipe(write, read.emplace<InputStream>(), write_inheritable, Inheritable::as_stdio_stream);
     }
-    [[nodiscard]] inline bool MakePipe(InputStream &read, OutputStreamAttachment &write, Inheritable read_inheritable = Inheritable::no)
+    inline bool MakePipe(OutputStreamAttachment &write, InputStream &read, Inheritable read_inheritable = Inheritable::no)
     {
-        return MakePipe(read, write.emplace<OutputStream>(), read_inheritable, Inheritable::as_stdio_stream);
+        return MakePipe(write.emplace<OutputStream>(), read, Inheritable::as_stdio_stream, read_inheritable);
     }
-    [[nodiscard]] inline bool MakePipe(InputStreamAttachment &read, OutputStreamAttachment &write)
+    inline bool MakePipe(OutputStreamAttachment &write, InputStreamAttachment &read)
     {
-        return MakePipe(read.emplace<InputStream>(), write.emplace<OutputStream>(), Inheritable::as_stdio_stream, Inheritable::as_stdio_stream);
+        return MakePipe(write.emplace<OutputStream>(), read.emplace<InputStream>(), Inheritable::as_stdio_stream, Inheritable::as_stdio_stream);
     }
 
 
