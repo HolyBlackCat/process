@@ -1,19 +1,4 @@
 
-                  allows new?    when existing:
-CREATE_ALWAYS         yes           truncate
-CREATE_NEW            yes           error
-OPEN_ALWAYS           yes           keep
-OPEN_EXISTING         no            keep
-TRUNCATE_EXISTING     no            truncate
-
-
-O_CREAT | O_TRUNC     yes           truncate
-O_CREAT | O_EXCL      yes           error
-O_CREAT               yes           keep
-0                     no            keep
-O_TRUNC               no            truncate
-
-
 
 
 Pipes:
@@ -38,9 +23,6 @@ Pipes:
   * `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS` to only signal IOCP if the op was delayed.
 
 
-* POSIX: close all FDs in the child, like SDL does. Reproc does this too. Behind a knob.
-
-
 * Windows: a flag to hide the console
 
 
@@ -59,6 +41,8 @@ Tests:
     chdir
     no_append vs default behavior on different systems
     merging output streams: check both stdout and stderr
+
+* Add a function to conditionally throw an exception to `StoresErrorMessage`. Test that everything compiles with exceptions disabled.
 
 
 Maybe later:

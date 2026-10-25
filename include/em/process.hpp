@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <initializer_list>
 #include <map>
 #include <optional>
 #include <span>
@@ -16,10 +17,10 @@
 #include <unordered_set>
 #include <utility>
 #include <variant>
+#include <vector>
 
 #ifdef _WIN32
 
-#include <initializer_list>
 #include <memory>
 
 #pragma push_macro("NOMINMAX")
@@ -30,11 +31,10 @@
 #pragma pop_macro("NOMINMAX")
 #pragma pop_macro("WIN32_LEAN_AND_MEAN")
 
-#else
-
-#include <vector>
+#else // if POSIX
 
 #include <cstring> // For `std::strerror()`.
+#include <dirent.h>
 #include <fcntl.h> // For `fcntl()`.
 #include <spawn.h> // For `posix_spawn()` and friends.
 #include <sys/types.h> // For `pid_t`.
@@ -43,8 +43,64 @@
 
 #if __APPLE__
 #  include <crt_externs.h> // For `_NSGetEnviron()`.
+#  include <Availability.h> // For SDK version macros.
 #endif
 
+#endif // POSIX
+
+
+#ifndef _WIN32
+
+// MacOS version checks BS.
+#ifdef __APPLE__
+
+// Do we have `__builtin_available`? Should be true on Clang and false on GCC.
+#ifndef EM_PROC_HAVE_MACOS_BUILTIN_AVAILABLE
+#  ifdef __has_builtin
+#    if __has_builtin(__builtin_available)
+#      define EM_PROC_HAVE_MACOS_BUILTIN_AVAILABLE 1
+#    else
+#      define EM_PROC_HAVE_MACOS_BUILTIN_AVAILABLE 0
+#    endif
+#  else
+#    define EM_PROC_HAVE_MACOS_BUILTIN_AVAILABLE 0
+#  endif
+#endif
+
+#if EM_PROC_HAVE_MACOS_BUILTIN_AVAILABLE
+// Checks at runtime that MacOS version is at least this number.
+// Note that apparently compilers can optimize this away if the min version is set high enough, so don't bother doing that manually.
+#  define DETAIL_EM_PROC_MACOS_BUILTIN_AVAILABLE(x) __builtin_available(macOS x##.0, iOS x##.0, tvOS x##.0, watchOS x##.0, visionOS x##.0, *)
+#endif
+
+// Is min targeted Apple OS version at least `x`?
+#define DETAIL_EM_PROC_MACOS_VERSION_MIN_REQUIRED_AT_LEAST(x) \
+    __MAC_OS_X_VERSION_MIN_REQUIRED  >= (x##0000) || \
+    __IPHONE_OS_VERSION_MIN_REQUIRED >= (x##0000) || \
+    __TV_OS_VERSION_MIN_REQUIRED     >= (x##0000) || \
+    __WATCH_OS_VERSION_MIN_REQUIRED  >= (x##0000) || \
+    __VISION_OS_VERSION_MIN_REQUIRED >= (x##0000)
+// Is max targeted Apple OS version at least `x`?
+#define DETAIL_EM_PROC_MACOS_VERSION_MAX_ALLOWED_AT_LEAST(x) \
+    __MAC_OS_X_VERSION_MAX_ALLOWED  >= (x##0000) || \
+    __IPHONE_OS_VERSION_MAX_ALLOWED >= (x##0000) || \
+    __TV_OS_VERSION_MAX_ALLOWED     >= (x##0000) || \
+    __WATCH_OS_VERSION_MAX_ALLOWED  >= (x##0000) || \
+    __VISION_OS_VERSION_MAX_ALLOWED >= (x##0000)
+
+// If we have `__builtin_available`, then we check the min version, and then do runtime checks. Otherwise we check the max version and don't do runtime checks.
+#if EM_PROC_HAVE_MACOS_BUILTIN_AVAILABLE
+#  define DETAIL_EM_PROC_MACOS_VERSION_FOR_FEATURES_AT_LEAST(x) DETAIL_EM_PROC_MACOS_VERSION_MIN_REQUIRED_AT_LEAST(x)
+#else
+#  define DETAIL_EM_PROC_MACOS_VERSION_FOR_FEATURES_AT_LEAST(x) DETAIL_EM_PROC_MACOS_VERSION_MIN_REQUIRED_AT_LEAST(x)
+#endif
+
+#else // if not __APPLE__
+#  define DETAIL_EM_PROC_MACOS_VERSION_FOR_FEATURES_AT_LEAST(x) false
+#endif // __APPLE__
+
+
+// Do we have `WCOREDUMP`?
 #ifndef EM_PROC_CAN_DETECT_CORE_DUMPS
 #  ifdef WCOREDUMP // Manual says to ifdef this: https://linux.die.net/man/2/waitpid
 #    define EM_PROC_CAN_DETECT_CORE_DUMPS 1
@@ -53,19 +109,61 @@
 #  endif
 #endif
 
-// Do we have `pipe2()`? If this is false, fall back to `pipe()`.
-// On Macs this is available starting from MacOS 27 (https://github.com/curl/curl/issues/21236), and I think it was exported from the libraries a bit earlier too.
-// I don't feel like figuring out the correct check for Macs, and the fallback works fine either way.
-// At least on Linux, if `_GNU_SOURCE` is not defined, the function disappears. It's defined by default.
+
+// Do we have `pipe2()`?
+
 #ifndef EM_PROC_HAVE_PIPE2
 #  if defined(__linux__) && defined(_GNU_SOURCE)
 #    define EM_PROC_HAVE_PIPE2 1
+#  elif DETAIL_EM_PROC_MACOS_VERSION_FOR_FEATURES_AT_LEAST(27)
+#    define EM_PROC_HAVE_PIPE2 1
+#    if EM_PROC_HAVE_MACOS_BUILTIN_AVAILABLE
+#      define EM_PROC_HAVE_PIPE2_RUNTIME DETAIL_EM_PROC_MACOS_BUILTIN_AVAILABLE(27)
+#    endif
 #  else
 #    define EM_PROC_HAVE_PIPE2 0
 #  endif
 #endif
 
+// `DETAIL_EM_PROC_DISPATCH_PIPE2(have_pipe2, no_pipe2)` expands to `have_pipe2` or `no_pipe2`. The condition can either be runtime or compile-time, depending on the platform.
+#if EM_PROC_HAVE_PIPE2
+#  ifdef EM_PROC_HAVE_PIPE2_RUNTIME
+#    define DETAIL_EM_PROC_DISPATCH_PIPE2(have_pipe2, no_pipe2) (EM_PROC_HAVE_PIPE2_RUNTIME ? (have_pipe2) : (no_pipe2))
+#  else
+#    define DETAIL_EM_PROC_DISPATCH_PIPE2(have_pipe2, no_pipe2) have_pipe2
+#  endif
+#else
+#  define DETAIL_EM_PROC_DISPATCH_PIPE2(have_pipe2, no_pipe2) no_pipe2
 #endif
+
+
+// Do we have `posix_spawn_file_actions_addclosefrom_np()`?
+// At the time of writing, it exists on Linux but not on MacOS.
+
+#ifndef EM_PROC_HAVE_POSIX_SPAWN_FILE_ACTIONS_ADDCLOSEFROM_NP
+// In theory, this function can be disabled with a macro. The condition is shared with `posix_spawn_file_actions_addchdir_np()`.
+// In practice, since we don't handle missing `posix_spawn_file_actions_addchdir_np()` at all, I'm not bothering with this condition here.
+#  ifdef __linux__
+#    define EM_PROC_HAVE_POSIX_SPAWN_FILE_ACTIONS_ADDCLOSEFROM_NP 1
+#  else
+#    define EM_PROC_HAVE_POSIX_SPAWN_FILE_ACTIONS_ADDCLOSEFROM_NP 0
+#  endif
+#endif
+
+
+// Can we access `/proc/self/fd`?
+// Incorrectly setting this to true is not an issue. If this is true and `/proc/self/fd` fails to open, we fall back to another approach.
+#ifndef EM_PROC_HAVE_PROC_SELF_FD
+#  ifndef __APPLE__
+#    define EM_PROC_HAVE_PROC_SELF_FD 1
+#  else
+#    define EM_PROC_HAVE_PROC_SELF_FD 0
+#  endif
+#endif
+
+
+#endif // POSIX
+
 
 #ifdef _WIN32
 // Usage: `EM_PROC_NATIVE("blah")`.
@@ -1033,7 +1131,7 @@ namespace em::Proc
         // On Windows, `async_data_win` must be non-null for async streams, and null for sync streams.
         template <bool Read>
         bool ReadOrWriteUnbuffered(
-            std::conditional_t<Read, std::span<unsigned char>, std::span<const unsigned char>> data,
+            std::conditional_t<Read, std::span<char>, std::span<const char>> data,
             std::size_t &pos,
             IoResult *out_result
             #ifdef _WIN32
@@ -1200,6 +1298,27 @@ namespace em::Proc
         }
     };
 
+    // Is an IO stream handle inheritable by child processes?
+    enum class Inheritable : bool
+    {
+        // Never inherited. Must not be used as an IO stream redirection, nor passed to `MiscParams::inherit_handles`.
+        no = false,
+
+        // Inherited if used as an IO stream redirection, or if allowed by `MiscParams::inherit_handles`.
+        //
+        // Note that our default for inheriting handles differs from the default of the underlying OS APIs.
+        // Our `MiscParams::inherit_handles` is set to inherit nothing by default, while the underlying APIs (if you call them directly or with another library) default to inherit all handles that have this flag enabled.
+        always = true,
+
+        // Inherited if used as an IO stream redirection. Must not be passed to `MiscParams::inherit_handles`. Unspecified if this gets inherited with `all_handles` or not (see OS-specific value below).
+        as_stdio_stream =
+        #ifdef _WIN32
+            true, // Must be inheritable on Windows.
+        #else
+            false, // On POSIX, we end up passing it to `posix_spawn_file_actions_adddup2()`, which doesn't care about inheritability.
+        #endif
+    };
+
     // A base class for non-async IO streams.
     class BasicSyncIoStream : public BasicIoStream
     {
@@ -1234,7 +1353,7 @@ namespace em::Proc
             // The docs even claim that anonymous pipes are internally implemented as named pipes, so they say that stuff like this tends to work.
             if (!SetNamedPipeHandleState(Handle(), &new_mode, nullptr, nullptr))
             {
-                *this = {error_message, std::string("`SetNamedPipeHandleState()` failed: ") + detail::WinApiErrorToString(GetLastError())};
+                *this = {error_message, std::string("`SetNamedPipeHandleState()` failed to change `PIPE_NOWAIT`: ") + detail::WinApiErrorToString(GetLastError())};
                 return false;
             }
 
@@ -1260,7 +1379,57 @@ namespace em::Proc
             // Write flags.
             if (fcntl(Handle(), F_SETFL, flags))
             {
-                *this = {error_message, std::string("`fcntl(F_SETFL)` failed: ") + std::strerror(errno)};
+                *this = {error_message, std::string("`fcntl(F_SETFL)` failed to change `O_NONBLOCK`: ") + std::strerror(errno)};
+                return false;
+            }
+
+            return true;
+            #endif
+        }
+
+        // Can this handle be inherited by a subprocess?
+        // This is mainly for internal use. Prefer to set this directly when creating handles, all our functions should have parameters for that.
+        //
+        // Note that this can be racy if this was set to true and you change it to false, since while it was true, another thread could've created a subprocess that inherited this handle.
+        // Returns true on success, false on failure. On failure, resets this instance to null and stores the error on it, call `ErrorMessage()` to get it.
+        //
+        // In the underlying OS APIs, on Windows this defaults to false, an on POSIX to true. But we override those defaults everywhere.
+        bool SetInheritable(Inheritable inheritable)
+        {
+            if (StoreErrorIfNull())
+                return false;
+
+            #if _WIN32
+
+            if (!SetHandleInformation(Handle(), HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT * bool(inheritable)))
+            {
+                *this = {error_message, std::string("`SetHandleInformation()` failed to change `HANDLE_FLAG_INHERIT`: ") + detail::WinApiErrorToString(GetLastError())};
+                return false;
+            }
+
+            return true;
+
+            #else
+            // Note `F_{GET,SET}FD`, as opposed to `F_{GET,SET}FL`, which is a different thing.
+
+            // Read existing flags.
+            int flags = fcntl(Handle(), F_GETFD);
+            if (flags == -1)
+            {
+                *this = {error_message, std::string("`fcntl(F_GETFD)` failed: ") + std::strerror(errno)};
+                return false;
+            }
+
+
+            if (bool(inheritable))
+                flags &= ~FD_CLOEXEC;
+            else
+                flags |= FD_CLOEXEC;
+
+            // Write flags.
+            if (fcntl(Handle(), F_SETFD, flags))
+            {
+                *this = {error_message, std::string("`fcntl(F_SETFD)` failed to change `FD_CLOEXEC`: ") + std::strerror(errno)};
                 return false;
             }
 
@@ -1274,13 +1443,14 @@ namespace em::Proc
     {
         using BasicSyncIoStream::BasicSyncIoStream;
 
+      public:
         // Tries to read some data, without any buffering.
         // You should probably set `pos` to zero initially.
         // Tries to fill `data` starting from `pos` and until the end. Increases `pos` to indicate how many bytes we were able to get.
         // If `out_result` is specified, writes status to it.
         // Returns true if the status is `ok` (regardless of `out_result` being null).
         // You can call this in a loop while it returns true if you prefer.
-        bool ReadUnbuffered(std::span<unsigned char> data, std::size_t &pos, IoResult *out_result = nullptr)
+        bool ReadUnbuffered(std::span<char> data, std::size_t &pos, IoResult *out_result = nullptr)
         {
             return ReadOrWriteUnbuffered<true>(data, pos, out_result);
         }
@@ -1291,13 +1461,14 @@ namespace em::Proc
     {
         using BasicSyncIoStream::BasicSyncIoStream;
 
+      public:
         // Tries to write some data, without any buffering.
         // You should probably set `pos` to zero initially.
         // Tries to write the part of `data` starting from `pos` and until the end. Increases `pos` to indicate how many bytes we were able to send.
         // If `out_result` is specified, writes status to it.
         // Returns true if the status is `ok` (regardless of `out_result` being null).
         // You can call this in a loop while it returns true if you prefer.
-        bool WriteUnbuffered(std::span<unsigned char> data, std::size_t &pos, IoResult *out_result = nullptr)
+        bool WriteUnbuffered(std::span<char> data, std::size_t &pos, IoResult *out_result = nullptr)
         {
             return ReadOrWriteUnbuffered<true>(data, pos, out_result);
         }
@@ -1327,7 +1498,7 @@ namespace em::Proc
         }
         #endif
 
-        inline bool CloneStreamLow(const BasicIoStream &from, BasicIoStream &to)
+        inline bool CloneStreamLow(const BasicIoStream &from, BasicIoStream &to, Inheritable inheritable)
         {
             // Clear the output first.
             to = {};
@@ -1343,19 +1514,27 @@ namespace em::Proc
                 return true; // Not an error.
 
             #ifdef _WIN32
+
             BasicIoStream::handle_t new_handle = BasicIoStream::invalid_handle;
-            if (!DuplicateHandle(CurrentProcessHandle(), from.Handle(), CurrentProcessHandle(), &new_handle, 0, /*can inherit:*/true, DUPLICATE_SAME_ACCESS))
+            if (!DuplicateHandle(CurrentProcessHandle(), from.Handle(), CurrentProcessHandle(), &new_handle, 0, bool(inheritable), DUPLICATE_SAME_ACCESS))
             {
                 to = {error_message, std::string("`DuplicateHandle()` failed: ") + detail::WinApiErrorToString(GetLastError())};
                 return false;
             }
             to = {take_ownership, new_handle};
             return true;
+
             #else
-            BasicIoStream::handle_t new_handle = dup(from.Handle());
-            if (new_handle < 0)
+
+            // Here `fcntl(x, F_DUPFD_CLOEXEC, y)` is the equivalent of `dup3(x, ??, O_CLOEXEC)` that doesn't require you to manually specify the new handle.
+            // And also `F_DUPFD_CLOEXEC` doesn't require MacOS 27+, unlike `dup3()`.
+
+            // Note that `dup()`/`dup2()`/`dup3()` ignore the existing `O_CLOEXEC` flag on the original handle, if any.
+
+            BasicIoStream::handle_t new_handle = bool(inheritable) ? dup(from.Handle()) : fcntl(from.Handle(), F_DUPFD_CLOEXEC, 0);
+            if (new_handle < 0) // Both `dup()` and `fcntl()` should return -1 on failure.
             {
-                to = {error_message, std::string("`dup()` failed: ") + std::strerror(errno)};
+                to = {error_message, std::string(bool(inheritable) ? "`dup()` failed: " : "`fcntl(F_DUPFD_CLOEXEC)` failed: ") + std::strerror(errno)};
                 return false;
             }
             to = {take_ownership, new_handle};
@@ -1373,15 +1552,15 @@ namespace em::Proc
     // If `from` is null, sets `to` to null as well. That's no an error.
     // One notable use of this is that on Windows, we set the "inheritable" flag for the copy even if the source doesn't have it.
     template <SyncIoStreamType T>
-    bool CloneStream(const T &from, T &to)
+    bool CloneStream(const T &from, T &to, Inheritable inheritable)
     {
-        return detail::CloneStreamLow(from, to);
+        return detail::CloneStreamLow(from, to, inheritable);
     }
 
     // Creates a pipe, assigning the two ends to `read` and `write`, which should be initially empty. If they aren't empty, their existing values are discarded.
-    // On success, returns true and makes `read` and `write` non-null.
-    // On failure, returns false, makes `read` and `write` null, and stores the error message in `read` and `write`.
-    inline bool MakePipe(InputStream &read, OutputStream &write)
+    // On success, returns true and makes both `read` and `write` non-null.
+    // On failure, returns false, makes both `read` and `write` null, and stores the error message in both `read` and `write`.
+    inline bool MakePipe(InputStream &read, OutputStream &write, Inheritable read_inheritable, Inheritable write_inheritable)
     {
         // Firstly, destroy existing handles, if any.
         read = {};
@@ -1390,12 +1569,15 @@ namespace em::Proc
         #ifdef _WIN32
         BasicIoStream::handle_t read_handle = BasicIoStream::invalid_handle;
         BasicIoStream::handle_t write_handle = BasicIoStream::invalid_handle;
+
         SECURITY_ATTRIBUTES attrs{};
         attrs.nLength = sizeof(attrs);
-        attrs.bInheritHandle = true; // Enable inheriting the handles by subprocesses.
+        attrs.bInheritHandle = true; // Note that this only ends up being used if `read_inheritable` or `write_inheritable` are true for the respective handles.
+
         // Note that on failure, `CreatePipe()` isn't guaranteed to leave the output parameters unchanged. So even if we allowed obtaining a pointer to the underlying handle from `BasicIoStream`,
         //   we still wouldn't be able to pass that here directly, unless we also called `ReleaseHandle_Unsafe()` on failure.
-        if (CreatePipe(&read_handle, &write_handle, &attrs, 0)) // `0` is the buffer size. Passing zero leaves it defaulted.
+
+        if (CreatePipe(&read_handle, &write_handle, bool(read_inheritable) && bool(write_inheritable) ? &attrs : nullptr, 0)) // `0` is the buffer size. Passing zero leaves it defaulted.
         {
             // Success.
             read = {take_ownership, read_handle};
@@ -1408,18 +1590,22 @@ namespace em::Proc
             write = {error_message, read.ErrorMessage()};
             return false;
         }
-        return true;
+
         #else
         BasicIoStream::handle_t read_write_handles[2] = {BasicIoStream::invalid_handle, BasicIoStream::invalid_handle};
 
+        bool pipe2_missing = false;
+
         if (
-            #if EM_PROC_HAVE_PIPE2
-            // Note `O_CLOEXEC` rather than `FD_CLOEXEC`. The latter is for `fcntl()` only.
-            // We can't pass `O_NONBLOCK` here, since we don't always need it, and when we do, it's only for one end of the pipe.
-            pipe2(read_write_handles, O_CLOEXEC)
-            #else
-            pipe(read_write_handles)
-            #endif
+            DETAIL_EM_PROC_DISPATCH_PIPE2(
+                // Note `O_CLOEXEC` rather than `FD_CLOEXEC`. The latter is for `fcntl()` only.
+                // We can't pass `O_NONBLOCK` here, since we don't always need it, and when we do, it's only for one end of the pipe.
+                //
+                // We enable `O_CLOEXEC` if at least one half wants it. We then disable it for the other half if needed. This way there's no potential race for a subprocess in another thread to inherit this handle.
+                pipe2(read_write_handles, O_CLOEXEC * (!bool(read_inheritable) || !bool(write_inheritable)))
+            ,
+                (pipe2_missing = true, pipe(read_write_handles))
+            )
         )
         {
             // Failure.
@@ -1432,52 +1618,43 @@ namespace em::Proc
             // Pipe created successfully.
             read = {take_ownership, read_write_handles[0]};
             write = {take_ownership, read_write_handles[1]};
+        }
+        #endif
 
-            #if !EM_PROC_HAVE_PIPE2
-            // Add `FD_CLOEXEC` flag. This prevents child processes from inheriting this handle by default.
-            for (BasicIoStream::handle_t handle : {read.Handle(), write.Handle()})
+        // Adjust individual inheritability if needed.
+        if (
+            bool(read_inheritable) != bool(write_inheritable)
+            #ifndef _WIN32
+            || pipe2_missing
+            #endif
+        )
+        {
+            if (!bool(read_inheritable))
             {
-                // Note `F_{GET,SET}FD`, as opposed to `F_{GET,SET}FL`, which is a different thing.
-
-                // Read existing flags.
-                int flags = fcntl(handle, F_GETFD);
-                if (flags == -1)
+                read.SetInheritable(Inheritable::no);
+                if (read.HasError())
                 {
-                    read = {error_message, std::string("`fcntl(F_GETFD)` failed: ") + std::strerror(errno)};
-                    write = {error_message, read.ErrorMessage()}; // Store the same error in both instances for simplicity.
-                    return false;
-                }
-
-                flags |= FD_CLOEXEC;
-
-                // Write flags.
-                if (fcntl(handle, F_SETFD, flags))
-                {
-                    read = {error_message, std::string("`fcntl(F_SETFD)` failed: ") + std::strerror(errno)};
-                    write = {error_message, read.ErrorMessage()}; // Store the same error in both instances for simplicity.
+                    // Copy the error message to the other handle.
+                    write = {error_message, read.ErrorMessage()};
                     return false;
                 }
             }
-            #endif
+
+            if (!bool(write_inheritable))
+            {
+                write.SetInheritable(Inheritable::no);
+                if (write.HasError())
+                {
+                    // Copy the error message to the other handle.
+                    read = {error_message, write.ErrorMessage()};
+                    return false;
+                }
+            }
         }
+
         return true;
-        #endif
     }
 
-    // A convenience variant of `MakePipe()` that returns the read end of the pipe and outputs the write end through a parameter.
-    [[nodiscard]] inline InputStream MakePipe(OutputStream &write)
-    {
-        InputStream ret;
-        (void)MakePipe(ret, write);
-        return ret;
-    }
-    // A convenience variant of `MakePipe()` that returns the write end of the pipe and outputs the read end through a parameter.
-    [[nodiscard]] inline OutputStream MakePipe(InputStream &read)
-    {
-        OutputStream ret;
-        (void)MakePipe(read, ret);
-        return ret;
-    }
 
     // What to do if we're trying to open a file and it already exists?
     enum class ExistingFile
@@ -1528,6 +1705,7 @@ namespace em::Proc
         // Mainly for internal use. Returns the flags for `open()` corresponding to this struct.
         // This carries information from all the fields, except `filename`.
         // There's no equivalent for input files. Those should just pass `O_RDONLY` as flags, and `0` as file permissions (since the permissions are unused if `O_CREAT` is not specified).
+        // Also don't forget to conditionally add `O_CLOEXEC` to those flags (for input and output files).
         [[nodiscard]] int ToOpenFlags_Posix() const
         {
             return
@@ -1548,6 +1726,42 @@ namespace em::Proc
         #endif
     };
 
+
+    // Inherit an IO stream from the parent process instead of attaching a custom one. This is the default behavior.
+    struct TagInherit {explicit TagInherit() = default;};
+    inline constexpr TagInherit inherit{};
+
+    // Merge one output stream into the other. Usually you put this on `stderr` to merge it into `stdout`, and then attach a custom stream to `stdout`.
+    struct TagMergeOutput {explicit TagMergeOutput() = default;};
+    inline constexpr TagMergeOutput merge_output{};
+
+    // What to do with the input stream of a process.
+    // `InputStream` is intentionally listed first, to make `= {}` submit a null stream.
+    using InputStreamAttachment = std::variant<InputStream, TagInherit, MaybeOwningNativeString>;
+
+    // What to do with one of the output streams of a process.
+    // `OutputStream` is intentionally listed first, to make `= {}` submit a null stream.
+    // Listing `MaybeOwningNativeString` for convenience. It's equivalent to passing the filename to `OutputFileDesc`.
+    using OutputStreamAttachment = std::variant<OutputStream, TagInherit, TagMergeOutput, MaybeOwningNativeString, OutputFileDesc>;
+
+
+    // Convenience variants of `MakePipe()` for when one or both ends are IO redirects.
+    // Returns true on success.
+    [[nodiscard]] inline bool MakePipe(InputStreamAttachment &read, OutputStream &write, Inheritable write_inheritable = Inheritable::no)
+    {
+        return MakePipe(read.emplace<InputStream>(), write, Inheritable::as_stdio_stream, write_inheritable);
+    }
+    [[nodiscard]] inline bool MakePipe(InputStream &read, OutputStreamAttachment &write, Inheritable read_inheritable = Inheritable::no)
+    {
+        return MakePipe(read, write.emplace<OutputStream>(), read_inheritable, Inheritable::as_stdio_stream);
+    }
+    [[nodiscard]] inline bool MakePipe(InputStreamAttachment &read, OutputStreamAttachment &write)
+    {
+        return MakePipe(read.emplace<InputStream>(), write.emplace<OutputStream>(), Inheritable::as_stdio_stream, Inheritable::as_stdio_stream);
+    }
+
+
+
     using IoStreamRefVar = std::variant<std::reference_wrapper<InputStream>, std::reference_wrapper<OutputStream>>;
 
     // This is a low-level function combining the effects of `OpenInputFile()` and `OpenOutputFile()`. Prefer one of those, and see them for more information.
@@ -1557,7 +1771,7 @@ namespace em::Proc
     // For input streams, it's also an error to pass `existing != keep`.
     // NOTE: `allow_creating` doesn't have a default value here, since input streams are required to pass false, while output streams will usually pass true.
     //   This is also why it's placed before other parameters with default arguments.
-    inline bool OpenFile(IoStreamRefVar target, NativeCStringViewParam filename, bool allow_creating, ExistingFile existing = ExistingFile::overwrite, OutputFileFlags flags = {})
+    inline bool OpenFile(IoStreamRefVar target, NativeCStringViewParam filename, Inheritable inheritable, bool allow_creating, ExistingFile existing = ExistingFile::overwrite, OutputFileFlags flags = {})
     {
         BasicIoStream &target_base = std::visit([](auto &elem) -> BasicIoStream & {return elem;}, target);
 
@@ -1636,7 +1850,7 @@ namespace em::Proc
                 [](const InputStream &) -> DWORD {return FILE_SHARE_READ;}, // Others can also read. Should we also allow writes here? Probably not.
                 [&](const OutputStream &) -> DWORD {return bool(flags & OutputFileFlags::no_append) ? 0 : FILE_SHARE_WRITE;}, // If we're appending, I guess allow concurrent writes to also append?
             }, target),
-            &sec_attrs,
+            bool(inheritable) ? &sec_attrs : nullptr,
             allow_creating
                 ? (existing == ExistingFile::keep ? OPEN_ALWAYS : existing == ExistingFile::error ? CREATE_NEW : CREATE_ALWAYS)
                 : (existing == ExistingFile::keep ? OPEN_EXISTING : TRUNCATE_EXISTING),
@@ -1673,7 +1887,7 @@ namespace em::Proc
                 {
                     return output_file_desc.ToOpenFlags_Posix();
                 }
-            }, target),
+            }, target) | (!bool(inheritable) * O_CLOEXEC),
             // This `...` parameter is unused if `O_CREAT` is not passed, but it's easier to pass unconditionally.
             // Calling it when `output_file_desc` is default-constructed (so for input streams) should be fine too.
             output_file_desc.ToOpenPermissions_Posix()
@@ -1694,10 +1908,10 @@ namespace em::Proc
 
     // Opens a file for reading. Returns a null instance with an error stored in it on failure, call `.ErrorMessage()` for details.
     // Note that this function isn't very useful for redirecting process input, since that API also accepts a path direclty, and that's more optimal. This function exists only for completeness.
-    [[nodiscard]] inline InputStream OpenInputFile(NativeCStringViewParam filename)
+    [[nodiscard]] inline InputStream OpenInputFile(NativeCStringViewParam filename, Inheritable inheritable)
     {
         InputStream ret;
-        OpenFile(ret, std::move(filename), false, ExistingFile::keep);
+        OpenFile(ret, std::move(filename), inheritable, false, ExistingFile::keep);
         return ret;
     }
 
@@ -1707,16 +1921,16 @@ namespace em::Proc
     // `allow_creating` controls what happens if no such file exists. `true` means it's created, `false` means this function fails.
     // It's an error to pass `!allow_creating && existing == error`.
     // NOTE: Here the parameter order is different than in `OpenFile()`, because this one makes more sense, and we're not constrained by having to provide decent API for input files too.
-    [[nodiscard]] inline OutputStream OpenOutputFile(NativeCStringViewParam filename, ExistingFile existing = ExistingFile::overwrite, bool allow_creating = true, OutputFileFlags flags = {})
+    [[nodiscard]] inline OutputStream OpenOutputFile(NativeCStringViewParam filename, Inheritable inheritable, ExistingFile existing = ExistingFile::overwrite, bool allow_creating = true, OutputFileFlags flags = {})
     {
         OutputStream ret;
-        OpenFile(ret, std::move(filename), allow_creating, existing, flags);
+        OpenFile(ret, std::move(filename), inheritable, allow_creating, existing, flags);
         return ret;
     }
-    [[nodiscard]] inline OutputStream OpenOutputFile(const OutputFileDesc &desc)
+    [[nodiscard]] inline OutputStream OpenOutputFile(const OutputFileDesc &desc, Inheritable inheritable)
     {
         OutputStream ret;
-        OpenFile(ret, std::move(desc.filename), desc.allow_creating, desc.existing, desc.flags);
+        OpenFile(ret, std::move(desc.filename), inheritable, desc.allow_creating, desc.existing, desc.flags);
         return ret;
     }
 
@@ -2886,25 +3100,10 @@ namespace em::Proc
         #endif
     };
 
-    // Inherit an IO stream from the parent process instead of attaching a custom one. This is the default behavior.
-    struct TagInherit {explicit TagInherit() = default;};
-    inline constexpr TagInherit inherit{};
-
-    // Merge one output stream into the other. Usually you put this on `stderr` to merge it into `stdout`, and then attach a custom stream to `stdout`.
-    struct TagMergeOutput {explicit TagMergeOutput() = default;};
-    inline constexpr TagMergeOutput merge_output{};
-
-    // What to do with the input stream of a process.
-    // `InputStream` is intentionally listed first, to make `= {}` submit a null stream.
-    using InputStreamAttachment = std::variant<InputStream, TagInherit, MaybeOwningNativeString>;
-
-    // What to do with one of the output streams of a process.
-    // `OutputStream` is intentionally listed first, to make `= {}` submit a null stream.
-    // Listing `MaybeOwningNativeString` for convenience. It's equivalent to passing the filename to `OutputFileDesc`.
-    using OutputStreamAttachment = std::variant<OutputStream, TagInherit, TagMergeOutput, MaybeOwningNativeString, OutputFileDesc>;
-
-    // Inherit all file handles as opposed to only some. The main benefit of this is that it's faster to not filter them.
     struct TagAllHandles {explicit TagAllHandles() = default;};
+    // Inherit all file handles as opposed to only some. The main benefit of this is that it's faster to not filter them.
+    // Note that this is dangerous! If you inherit a pipe end that's also used by another subprocess as an IO stream redirection, and then keep it open,
+    //   if that other subprocess closes it, the other end of the pipe will not receive EOF until you close it too, which is not a good thing.
     inline constexpr TagAllHandles all_handles{};
 
     // Used to store handles inherited by the subprocess. See `inherit_handles` below.
@@ -2965,7 +3164,8 @@ namespace em::Proc
 
         // Which handles should the subprocess inherit.
         // On Windows, those are arbitrary `HANDLE`s. On POSIX, those are file descriptors.
-        // The default behavior is to inherit nothing. Insert handles into the set to inherit them, or pass `all_handles` to inherit all of them (which is faster than filtering the handles).
+        // The default behavior is to inherit nothing. Insert handles into the set to inherit them, or pass `all_handles` to inherit all of them (which is faster than filtering the handles,
+        //   but also dangerous, see the comment of `all_handles` for details).
         // The IO redirects (`*_stream`s above) must not be listed here, we inherit them implicitly.
         // This list can only include handles that are inheritable (`bInheritHandle == true` on Windows, no `O_CLOEXEC` on POSIX). Non-inheritable handles are never inherited,
         //   and inheritable handles are inherited only if allowed by this parameter.
@@ -3076,7 +3276,7 @@ namespace em::Proc
                         // We could open it once and store it, but that's mildly suspicious and probably isn't worth it.
                         if (!elem)
                         {
-                            state.stdin_stream = OpenInputFile(R"(\\.\NUL)");
+                            state.stdin_stream = OpenInputFile(R"(\\.\NUL)", Inheritable::as_stdio_stream);
                             if (state.stdin_stream.HasError())
                             {
                                 error_string = "Failed to open a `\\\\.\\NUL` handle for `stdin`: " + state.stdin_stream.ErrorMessage();
@@ -3102,7 +3302,7 @@ namespace em::Proc
                     },
                     [&](MaybeOwningNativeString &&elem)
                     {
-                        state.stdin_stream = OpenInputFile(std::move(elem));
+                        state.stdin_stream = OpenInputFile(std::move(elem), Inheritable::as_stdio_stream);
                         if (state.stdin_stream.HasError())
                         {
                             error_string = "Failed to open `stdin` file: " + state.stdin_stream.ErrorMessage();
@@ -3135,7 +3335,7 @@ namespace em::Proc
                             if (!elem)
                             {
                                 // No particular reason to pass `no_append`, just to hopefully do less work.
-                                target_field = OpenOutputFile(R"(\\.\NUL)", ExistingFile::keep, false, OutputFileFlags::no_append);
+                                target_field = OpenOutputFile(R"(\\.\NUL)", Inheritable::as_stdio_stream, ExistingFile::keep, false, OutputFileFlags::no_append);
                                 if (target_field.HasError())
                                 {
                                     error_string = std::string("Failed to open a `\\\\.\\NUL` handle for `") + stream_name + "`: " + target_field.ErrorMessage();
@@ -3162,7 +3362,7 @@ namespace em::Proc
                         [&](TagMergeOutput)
                         {
                             // We could just pass the same handle to both streams, but Claude has a good point that the started program might close one of the two handles and don't expect the other one to get closed at the same time. Didn't test this though, but SDL does the same.
-                            CloneStream(is_stderr ? state.stdout_stream : state.stderr_stream, target_field);
+                            CloneStream(is_stderr ? state.stdout_stream : state.stderr_stream, target_field, Inheritable::as_stdio_stream);
                             if (target_field.HasError())
                             {
                                 error_string = "Failed to merge the output streams: " + target_field.ErrorMessage();
@@ -3173,7 +3373,7 @@ namespace em::Proc
                         },
                         [&]<typename T>(T &&name_or_desc) requires std::is_same_v<T, MaybeOwningNativeString> || std::is_same_v<T, OutputFileDesc>
                         {
-                            target_field = OpenOutputFile(name_or_desc);
+                            target_field = OpenOutputFile(name_or_desc, Inheritable::as_stdio_stream);
                             if (target_field.HasError())
                             {
                                 error_string = std::string("Failed to open `") + (is_stderr ? "stderr" : "stdout") + "` file: " + target_field.ErrorMessage();
@@ -3307,7 +3507,6 @@ namespace em::Proc
                 }
 
                 #else
-                #error write to state.inherited_handle_set here, and close the handles not in the set
 
                 // Returns true on error, then this constructor should exit too.
                 // `target_handle` is the desired handle in the new process, one of `STD{IN,OUT,ERR}_FILENO`.
@@ -3337,6 +3536,22 @@ namespace em::Proc
                     {
                         // Not adding the stream name to the error message. This shouldn't normally fail, so it's not particularly important.
                         error_string = std::string("`posix_spawn_file_actions_adddup2()` failed: ") + std::strerror(error);
+                        return true;
+                    }
+
+                    return false;
+                };
+                // Returns true on error, then this constructor should exit too.
+                // `target_handle` is the handle we're closing.
+                auto AddClose = [&](int target_handle) -> bool
+                {
+                    if (ConstructFileActionsIfNeeded())
+                        return true;
+
+                    if (int error = posix_spawn_file_actions_addclose(&state.spawn_fa, target_handle))
+                    {
+                        // Not adding the handle to the error message. This shouldn't normally fail, so it's not particularly important.
+                        error_string = std::string("`posix_spawn_file_actions_addclose()` failed: ") + std::strerror(error);
                         return true;
                     }
 
@@ -3416,6 +3631,7 @@ namespace em::Proc
                     }, std::move(is_stderr ? params.stderr_stream : params.stdout_stream));
                 };
 
+                // Stdout and stderr.
                 if (std::holds_alternative<TagMergeOutput>(params.stdout_stream))
                 {
                     // This specific case requires reverse stream initialization order. Otherwise `stdout` gets redirect to the old value of `stderr`, not the new one.
@@ -3431,6 +3647,178 @@ namespace em::Proc
                         return;
                     if (HandleOutputStream(true))
                         return;
+                }
+
+
+                // Handle inherited handles.
+                // Do this after the standard streams, otherwise we could close a handle that we want to `dup2()` into one.
+                if (std::visit(detail::Overload{
+                    [&](InheritedHandlesSet &input_handle_set)
+                    {
+                        state.inherited_handle_set = std::move(input_handle_set);
+
+                        // How should we close the unwanted handles? Hmm.
+
+                        // Option 1: `posix_spawn_file_actions_addclosefrom_np()`.
+                        // We can only use this if we inherit nothing (not counting IO redirects).
+                        // Interestingly, in the current version of glibc it seems to use a plain loop instead of `/proc/self/fd`. Oh well.
+                        #if EM_PROC_HAVE_POSIX_SPAWN_FILE_ACTIONS_ADDCLOSEFROM_NP
+                        if (state.inherited_handle_set.empty())
+                        {
+                            ConstructFileActionsIfNeeded();
+                            if (int error = posix_spawn_file_actions_addclosefrom_np(&state.spawn_fa, 3)) // 0,1,2 are the standard streams, and this closes anything greater or equal to the second argument.
+                            {
+                                error_string = std::string("`posix_spawn_file_actions_addclosefrom_np()` failed: ") + std::strerror(error);
+                                return true;
+                            }
+
+                            return false; // This is enough, don't need to fall back to other approaches.
+                        }
+                        #endif
+
+                        // Like `AddClose()`, but doesn't close handles listed in `state.inherited_handle_set`, or handles of the standard IO streams.
+                        // Also does nothing if the handle has `O_CLOEXEC` already enabled (so will be closed automatically).
+                        // If `maybe_invalid_fd == true`, then silently ignore the error if `target_handle` is a non-existent handle. We need this when looping over all possible handles.
+                        auto AddCloseIfNeeded = [&](int target_handle, bool maybe_invalid_fd) -> bool
+                        {
+                            if (target_handle < 3) // 0,1,2 are standard streams.
+                                return false; // Skip.
+
+                            if (state.inherited_handle_set.contains({non_owning, target_handle}))
+                                return false; // Included in the set, skip.
+
+                            int flags = fcntl(target_handle, F_GETFD);
+                            if (flags == -1)
+                            {
+                                int errno_copy = errno;
+                                if (!(maybe_invalid_fd && errno_copy == EBADF)) // Interestingly, the correct error code is `EBADF`. `EBADFD` is something else.
+                                {
+                                    error_string = std::string("`fcntl(F_GETFD)` failed: ") + std::strerror(errno_copy);
+                                    return true;
+                                }
+                            }
+
+                            if (flags & FD_CLOEXEC)
+                                return false; // Don't need to close this one.
+
+                            return AddClose(target_handle);
+                        };
+
+                        // Option 2: `/proc/self/fd`.
+                        #if EM_PROC_HAVE_PROC_SELF_FD
+                        {
+                            struct DirGuard
+                            {
+                                BakedMiscParams &self;
+                                DIR *dir = nullptr;
+
+                                DirGuard(BakedMiscParams &self)
+                                    : self(self)
+                                {
+                                    dir = opendir("/proc/self/fd");
+
+                                    // Just ignore any errors here. Fall back to another approach.
+
+                                    // But assert if the error is something unusual.
+                                    assert(dir || errno == ENOENT);
+                                }
+
+                                void Close(bool graceful)
+                                {
+                                    if (dir)
+                                    {
+                                        if (closedir(dir) < 0 && graceful)
+                                            self.error_string = std::string("`closedir()` failed: ") + std::strerror(errno);
+
+                                        // Must reset this to null, since we're doing this twice.
+                                        dir = nullptr;
+                                    }
+                                }
+
+                                ~DirGuard()
+                                {
+                                    Close(false);
+                                }
+                            };
+                            DirGuard dir{*this};
+                            // Don't need to check `HasError()` after creating `dir`, it doesn't write any errors.
+
+                            if (dir.dir)
+                            {
+                                while (true)
+                                {
+                                    errno = 0; // Must explicitly zero `errno` to distinguish errors from running out of files.
+
+                                    dirent *entry = readdir(dir.dir);
+                                    if (!entry)
+                                    {
+                                        int errno_copy = errno;
+                                        if (errno_copy == 0)
+                                            break; // No more files in the directory.
+
+                                        // Failed to access the next entry...
+                                        error_string = std::string("`readdir(\"/proc/self/fd\")` failed: ") + std::strerror(errno_copy);
+                                        return true;
+                                    }
+
+                                    if (entry->d_type == DT_DIR)
+                                        continue; // Probably `.` or `..`, ignore.
+
+                                    // Parse the number.
+                                    int fd = 0;
+                                    for (const char *cur = entry->d_name; *cur; cur++)
+                                    {
+                                        char ch = *cur;
+                                        if (ch < '0' || ch > '9')
+                                        {
+                                            // Non-digit in name, hmm.
+                                            error_string = std::string("Strage filename `") + entry->d_name + "` found in `/proc/self/fd`.";
+                                            return true;
+                                        }
+
+                                        fd = fd * 10 + (ch - '0');
+                                    }
+
+                                    // Add an action to close this FD.
+                                    if (AddCloseIfNeeded(fd, false))
+                                        return true; // Failed to add the action.
+                                }
+
+                                // Gracefully close the directory:
+                                dir.Close(true);
+                                if (HasError())
+                                    return true; // Failed to close directory.
+
+                                return false; // This is enough, don't need to fall back to other approaches.
+                            }
+                        }
+                        #endif
+
+                        { // Option 3: Loop over the descriptors.
+                            long max_num_fds = sysconf(_SC_OPEN_MAX); // I wonder why this returns `long`.
+                            if (max_num_fds < 0)
+                            {
+                                error_string = std::string("`sysconf(_SC_OPEN_MAX)` failed: ") + std::strerror(errno);
+                                return true;
+                            }
+
+                            // 0,1,2 are the standard streams. Custom ones start from 3.
+                            for (int fd = 3; fd < int(max_num_fds); fd++)
+                            {
+                                if (AddCloseIfNeeded(fd, true))
+                                    return true;
+                            }
+                        }
+
+                        return false;
+                    },
+                    [&](TagAllHandles)
+                    {
+                        return false;
+                    },
+                }, params.inherit_handles))
+                {
+                    return;
                 }
                 #endif
             }
@@ -3542,9 +3930,9 @@ namespace em::Proc
             posix_spawn_file_actions_t spawn_fa{};
             #endif
 
-            // Those just keep IO redirect handles alive until the process starts.
+            // Those keep IO redirect handles alive until the process starts.
             // On POSIX, the handle values are baked into `spawn_fa`, so we don't need to read them from here.
-            // On Windows, we read them from here (and they are also included in the attribute list).
+            // On Windows, we read them from here (and they are also included in the list of inherited handles in the attribute list).
             InputStream stdin_stream;
             OutputStream stdout_stream;
             OutputStream stderr_stream;
