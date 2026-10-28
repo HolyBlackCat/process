@@ -19,6 +19,18 @@
 #include <variant>
 #include <vector>
 
+#ifndef EM_PROC_EXCEPTIONS
+#  ifdef __cpp_exceptions
+#    define EM_PROC_EXCEPTIONS 1
+#  else
+#    define EM_PROC_EXCEPTIONS 0
+#  endif
+#endif
+#if EM_PROC_EXCEPTIONS
+#include <stdexcept>
+#endif
+
+
 #ifdef _WIN32
 
 #include <memory>
@@ -930,6 +942,12 @@ namespace em::Proc
         [[nodiscard]] NativeCStringViewParam(MaybeOwningNativeString other) : MaybeOwningNativeString(std::move(other)) {}
     };
 
+    // Our exception class.
+    struct Exception : std::runtime_error
+    {
+        using std::runtime_error::runtime_error;
+    };
+
     // A base class that stores an optional error string.
     // Primarily for internal use. A lot of our classes inherit from this.
     // NOTE: When inheriting from this, you probably want to inherit ctors: `using StoresErrorMessage::StoresErrorMessage;`.
@@ -968,6 +986,15 @@ namespace em::Proc
 
         // Returns the error message, or empty if `HasError() == false`.
         [[nodiscard]] const std::string &ErrorMessage() const noexcept {return error_string;}
+
+        #if EM_PROC_EXCEPTIONS
+        // If `HasError() == true`, throws an exception. Otherwise does nothing.
+        void ThrowError() const
+        {
+            if (HasError())
+                throw Exception(ErrorMessage());
+        }
+        #endif
     };
 
     // Explains the result of a read or write operation.

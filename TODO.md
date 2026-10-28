@@ -42,7 +42,7 @@ Tests:
     no_append vs default behavior on different systems
     merging output streams: check both stdout and stderr
 
-* Add a function to conditionally throw an exception to `StoresErrorMessage`. Test that everything compiles with exceptions disabled.
+* Text builds without exceptions.
 
 
 Maybe later:
