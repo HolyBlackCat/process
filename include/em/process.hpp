@@ -1215,10 +1215,12 @@ namespace em::Proc
 
                 // EOF or pipe disconnected?
                 if (
-                    // Mostly certain about those:
-                    error == ERROR_HANDLE_EOF || error == ERROR_BROKEN_PIPE ||
+                    // Mostly certain about this:
+                    error == ERROR_BROKEN_PIPE ||
                     // Less certain about this:
-                    error == ERROR_PIPE_NOT_CONNECTED
+                    error == ERROR_PIPE_NOT_CONNECTED ||
+                    // This normally shouldn't happen, since EOFs seem to be reported by `ReadFile()` returning true (success) and setting `processed_size == 0`.
+                    error == ERROR_HANDLE_EOF
                 )
                 {
                     if (out_result)
@@ -1232,9 +1234,17 @@ namespace em::Proc
                     *out_result = IoResult::error;
                 return false;
             }
+            else if (processed_size == 0)
+            {
+                // EOF.
+                // Yes, this is a bit weird, but this is how `ReadFile()` normally reports it, apparently.
+                // The WinAPI docs claim that `ok == true && processed_size == 0` can also happen on a read end of a pipe when the other end calls `WriteFile()` with length 0,
+                //   but LLM-assisted testing shows that it's only the case for message-mode pipes, not our regular byte-mode pipes (tried writing first and then reading, and tried blocking a read first, and then writing from another thread).
 
-            // Docs say that `processed_size == 0` is possible at this point on read, if the other end called `WriteFile` with zero length.
-            // We don't mind.
+                if (out_result)
+                    *out_result = IoResult::end_reached;
+                return false;
+            }
 
             assert(std::size_t(processed_size) <= remaining_size);
             pos += std::size_t(processed_size);
@@ -1297,7 +1307,7 @@ namespace em::Proc
                 }
 
                 // Surely an error at this point.
-                *this = {error_message, std::string(Read ? "`read()` failed: " : "`write()` failed: ") + std::strerror(errno_copy)};
+                *this = {error_message, std::string(Read ? "`read()` failed: " : "`write()` failed: ") + std::strerror(errno_copy) + '.'}; // Here and everywhere else adding `.` after `strerror` for consistency with WinAPI errors, which always end with `.`.
                 if (out_result)
                     *out_result = IoResult::error;
                 return false;
@@ -1394,7 +1404,7 @@ namespace em::Proc
             int flags = fcntl(Handle(), F_GETFL);
             if (flags == -1)
             {
-                *this = {error_message, std::string("`fcntl(F_GETFL)` failed: ") + std::strerror(errno)};
+                *this = {error_message, std::string("`fcntl(F_GETFL)` failed: ") + std::strerror(errno) + '.'};
                 return false;
             }
 
@@ -1406,7 +1416,7 @@ namespace em::Proc
             // Write flags.
             if (fcntl(Handle(), F_SETFL, flags))
             {
-                *this = {error_message, std::string("`fcntl(F_SETFL)` failed to change `O_NONBLOCK`: ") + std::strerror(errno)};
+                *this = {error_message, std::string("`fcntl(F_SETFL)` failed to change `O_NONBLOCK`: ") + std::strerror(errno) + '.'};
                 return false;
             }
 
@@ -1443,7 +1453,7 @@ namespace em::Proc
             int flags = fcntl(Handle(), F_GETFD);
             if (flags == -1)
             {
-                *this = {error_message, std::string("`fcntl(F_GETFD)` failed: ") + std::strerror(errno)};
+                *this = {error_message, std::string("`fcntl(F_GETFD)` failed: ") + std::strerror(errno) + '.'};
                 return false;
             }
 
@@ -1456,7 +1466,7 @@ namespace em::Proc
             // Write flags.
             if (fcntl(Handle(), F_SETFD, flags))
             {
-                *this = {error_message, std::string("`fcntl(F_SETFD)` failed to change `FD_CLOEXEC`: ") + std::strerror(errno)};
+                *this = {error_message, std::string("`fcntl(F_SETFD)` failed to change `FD_CLOEXEC`: ") + std::strerror(errno) + '.'};
                 return false;
             }
 
@@ -1497,7 +1507,7 @@ namespace em::Proc
         // You can call this in a loop while it returns true if you prefer.
         bool WriteUnbuffered(std::span<char> data, std::size_t &pos, IoResult *out_result = nullptr)
         {
-            return ReadOrWriteUnbuffered<true>(data, pos, out_result);
+            return ReadOrWriteUnbuffered<false>(data, pos, out_result);
         }
     };
 
@@ -1561,7 +1571,7 @@ namespace em::Proc
             BasicIoStream::handle_t new_handle = bool(inheritable) ? dup(from.Handle()) : fcntl(from.Handle(), F_DUPFD_CLOEXEC, 0);
             if (new_handle < 0) // Both `dup()` and `fcntl()` should return -1 on failure.
             {
-                to = {error_message, std::string(bool(inheritable) ? "`dup()` failed: " : "`fcntl(F_DUPFD_CLOEXEC)` failed: ") + std::strerror(errno)};
+                to = {error_message, std::string(bool(inheritable) ? "`dup()` failed: " : "`fcntl(F_DUPFD_CLOEXEC)` failed: ") + std::strerror(errno) + '.'};
                 return false;
             }
             to = {take_ownership, new_handle};
@@ -1636,7 +1646,7 @@ namespace em::Proc
         )
         {
             // Failure.
-            read = {error_message, std::string("`pipe()` failed: ") + std::strerror(errno)};
+            read = {error_message, std::string("`pipe()` failed: ") + std::strerror(errno) + '.'};
             write = {error_message, read.ErrorMessage()};
             return false;
         }
@@ -1923,7 +1933,7 @@ namespace em::Proc
         if (handle < 0)
         {
             // Failed to open.
-            target_base = {error_message, std::string("`open()` failed: ") + std::strerror(errno)};
+            target_base = {error_message, std::string("`open()` failed: ") + std::strerror(errno) + '.'};
             return false;
         }
 
@@ -2532,14 +2542,14 @@ namespace em::Proc
                     sigset_t new_sigmask{};
                     if (sigemptyset(&new_sigmask))
                     {
-                        error_string = std::string("`sigemptyset()` failed: ") + std::strerror(errno);
+                        error_string = std::string("`sigemptyset()` failed: ") + std::strerror(errno) + '.';
                         return;
                     }
 
                     // This seems to perform a deep copy, at least in glibc.
                     if (int error = posix_spawnattr_setsigmask(&state.spawn_attr, &new_sigmask))
                     {
-                        error_string = std::string("`posix_spawnattr_setsigmask()` failed: ") + std::strerror(error);
+                        error_string = std::string("`posix_spawnattr_setsigmask()` failed: ") + std::strerror(error) + '.';
                         return;
                     }
                 }
@@ -2550,7 +2560,7 @@ namespace em::Proc
                 // `POSIX_SPAWN_SETSIGDEF` resets the signal handling modes to the default values. Note that custom handlers seem to be detached automatically even without this.
                 if (int error = posix_spawnattr_setflags(&state.spawn_attr, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF))
                 {
-                    error_string = std::string("`posix_spawnattr_setflags()` failed: ") + std::strerror(error);
+                    error_string = std::string("`posix_spawnattr_setflags()` failed: ") + std::strerror(error) + '.';
                     return;
                 }
             }
@@ -3546,7 +3556,7 @@ namespace em::Proc
                     if (int error = posix_spawn_file_actions_adddup2(&state.spawn_fa, source_handle, target_handle))
                     {
                         // Not adding the stream name to the error message. This shouldn't normally fail, so it's not particularly important.
-                        error_string = std::string("`posix_spawn_file_actions_adddup2()` failed: ") + std::strerror(error);
+                        error_string = std::string("`posix_spawn_file_actions_adddup2()` failed: ") + std::strerror(error) + '.';
                         return true;
                     }
 
@@ -3562,7 +3572,7 @@ namespace em::Proc
                     if (int error = posix_spawn_file_actions_addopen(&state.spawn_fa, target_handle, filename, flags, new_file_permissions))
                     {
                         // Not adding the stream name to the error message. This shouldn't normally fail, so it's not particularly important.
-                        error_string = std::string("`posix_spawn_file_actions_adddup2()` failed: ") + std::strerror(error);
+                        error_string = std::string("`posix_spawn_file_actions_adddup2()` failed: ") + std::strerror(error) + '.';
                         return true;
                     }
 
@@ -3578,7 +3588,7 @@ namespace em::Proc
                     if (int error = posix_spawn_file_actions_addclose(&state.spawn_fa, target_handle))
                     {
                         // Not adding the handle to the error message. This shouldn't normally fail, so it's not particularly important.
-                        error_string = std::string("`posix_spawn_file_actions_addclose()` failed: ") + std::strerror(error);
+                        error_string = std::string("`posix_spawn_file_actions_addclose()` failed: ") + std::strerror(error) + '.';
                         return true;
                     }
 
@@ -3695,7 +3705,7 @@ namespace em::Proc
                             ConstructFileActionsIfNeeded();
                             if (int error = posix_spawn_file_actions_addclosefrom_np(&state.spawn_fa, 3)) // 0,1,2 are the standard streams, and this closes anything greater or equal to the second argument.
                             {
-                                error_string = std::string("`posix_spawn_file_actions_addclosefrom_np()` failed: ") + std::strerror(error);
+                                error_string = std::string("`posix_spawn_file_actions_addclosefrom_np()` failed: ") + std::strerror(error) + '.';
                                 return true;
                             }
 
@@ -3720,7 +3730,7 @@ namespace em::Proc
                                 int errno_copy = errno;
                                 if (!(maybe_invalid_fd && errno_copy == EBADF)) // Interestingly, the correct error code is `EBADF`. `EBADFD` is something else.
                                 {
-                                    error_string = std::string("`fcntl(F_GETFD)` failed: ") + std::strerror(errno_copy);
+                                    error_string = std::string("`fcntl(F_GETFD)` failed: ") + std::strerror(errno_copy) + '.';
                                     return true;
                                 }
                             }
@@ -3755,7 +3765,7 @@ namespace em::Proc
                                     if (dir)
                                     {
                                         if (closedir(dir) < 0 && graceful)
-                                            self.error_string = std::string("`closedir()` failed: ") + std::strerror(errno);
+                                            self.error_string = std::string("`closedir()` failed: ") + std::strerror(errno) + '.';
 
                                         // Must reset this to null, since we're doing this twice.
                                         dir = nullptr;
@@ -3784,7 +3794,7 @@ namespace em::Proc
                                             break; // No more files in the directory.
 
                                         // Failed to access the next entry...
-                                        error_string = std::string("`readdir(\"/proc/self/fd\")` failed: ") + std::strerror(errno_copy);
+                                        error_string = std::string("`readdir(\"/proc/self/fd\")` failed: ") + std::strerror(errno_copy) + '.';
                                         return true;
                                     }
 
@@ -3825,7 +3835,7 @@ namespace em::Proc
                             long max_num_fds = sysconf(_SC_OPEN_MAX); // I wonder why this returns `long`.
                             if (max_num_fds < 0)
                             {
-                                error_string = std::string("`sysconf(_SC_OPEN_MAX)` failed: ") + std::strerror(errno);
+                                error_string = std::string("`sysconf(_SC_OPEN_MAX)` failed: ") + std::strerror(errno) + '.';
                                 return true;
                             }
 
@@ -4173,7 +4183,7 @@ namespace em::Proc
                         // Set the new mask to all ones.
                         if (sigfillset(&new_sigmask))
                         {
-                            self->error_string = std::string("`sigfillset()` failed: ") + std::strerror(errno);
+                            self->error_string = std::string("`sigfillset()` failed: ") + std::strerror(errno) + '.';
                             error = true;
                             return;
                         }
@@ -4186,7 +4196,7 @@ namespace em::Proc
                         // NOTE: Their API is slightly different. `pthread_sigmask()` returns the error code on failure, while `sigprocmask()` returns -1 on failure and writes to `errno`.
                         if (int sigmask_status = pthread_sigmask(SIG_SETMASK, &new_sigmask, &old_sigmask); sigmask_status < 0)
                         {
-                            self->error_string = std::string("`pthread_sigmask()` failed to disable signals before forking: ") + std::strerror(sigmask_status);
+                            self->error_string = std::string("`pthread_sigmask()` failed to disable signals before forking: ") + std::strerror(sigmask_status) + '.';
                             error = true;
                             return;
                         }
@@ -4202,7 +4212,7 @@ namespace em::Proc
 
                         if (int sigmask_status = pthread_sigmask(SIG_SETMASK, &old_sigmask, nullptr); sigmask_status < 0)
                         {
-                            self->error_string = std::string("`pthread_sigmask()` failed to restore signals after forking: ") + std::strerror(sigmask_status);
+                            self->error_string = std::string("`pthread_sigmask()` failed to restore signals after forking: ") + std::strerror(sigmask_status) + '.';
                             error = true;
                             return;
                         }
@@ -4231,7 +4241,7 @@ namespace em::Proc
                 {
                   case -1:
                     // Forking failed.
-                    error_string = std::string(fork_error_prefix) + std::strerror(errno);
+                    error_string = std::string(fork_error_prefix) + std::strerror(errno) + '.';
                     return;
 
                   case 0:
@@ -4262,7 +4272,7 @@ namespace em::Proc
                     int status = -1;
                     if (waitpid(pid, &status, 0) < 0)
                     {
-                        error_string = std::string("`waitpid()` failed: ") + std::strerror(errno);
+                        error_string = std::string("`waitpid()` failed: ") + std::strerror(errno) + '.';
                         return;
                     }
 
@@ -4272,7 +4282,7 @@ namespace em::Proc
                         if (int exit_code = WEXITSTATUS(status))
                         {
                             // We use the exit code to propagate the error code from `posix_spawnp` above.
-                            error_string = std::string("Failed to start process: ") + std::strerror(exit_code); // This specific error message doesn't mention the function name, since it happens often and is considered user-facing.
+                            error_string = std::string("Failed to start process: ") + std::strerror(exit_code) + '.'; // This specific error message doesn't mention the function name, since it happens often and is considered user-facing.
                             return;
                         }
                     }
@@ -4303,7 +4313,7 @@ namespace em::Proc
 
                 if (int error = posix_spawnp(&state.pid, executable_ptr, spawn_fa_opt, spawn_attr, command_ptr, env_ptr))
                 {
-                    error_string = std::string("Failed to start process: ") + std::strerror(error); // This specific error message doesn't mention the function name, since it happens often and is considered user-facing.
+                    error_string = std::string("Failed to start process: ") + std::strerror(error) + '.'; // This specific error message doesn't mention the function name, since it happens often and is considered user-facing.
                     return;
                 }
 
@@ -4449,7 +4459,7 @@ namespace em::Proc
             // It returns `-1` on error.
             if (wait_result < 0)
             {
-                error_string = std::string("`waitpid()` failed: ") + std::strerror(errno);
+                error_string = std::string("`waitpid()` failed: ") + std::strerror(errno) + '.';
                 // Mark the process as exited, I guess.
                 // So that nothing gets blocked on the user side, waiting for it to exit.
                 state.exit_reason = Proc::ExitReason(Proc::ExitReason::Error{});

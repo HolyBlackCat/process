@@ -4,12 +4,8 @@
 Pipes:
 
 * On POSIX:
-  * Stream IDs: `STD{OUT,ERR,IN}_FILENO`
-  * Merging stdout and stderr by redirecting one of them directly to another, no pipe.
-  * Recommend ignoring `SIGPIPE`.
+  * Recommend ignoring `SIGPIPE`. (sigaction?)
   * Document not ignoring `SIGCHLD` because that would destroy every child handle before we can `waitpid` it. A custom handler is in theory possible, if you make sure to not destroy the handle.
-  * Add `FD_CLOEXEC` to the pipe just in case.
-  * An option to set `O_NONBLOCK` to our end of the pipe.
 
 * On Windows:
   * Can make pipes nonblocking with `PIPE_NOWAIT`.
@@ -42,7 +38,9 @@ Tests:
     no_append vs default behavior on different systems
     merging output streams: check both stdout and stderr
 
-* Text builds without exceptions.
+* Test builds without exceptions.
+
+* Async waiting for process termination: jobs (with IOCP) on Windows, fdpid_open on Linux if supported and enabled, dummy pipes on POSIX otherwise
 
 
 Maybe later:
