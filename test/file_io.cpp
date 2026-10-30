@@ -1,8 +1,7 @@
 // A small program that tests the file IO functions.
 
 // Usage:
-// `file_io read "path" {expect_contents "value",expect_error "error"}
-// `file_io read "path"
+// `file_io read "path" {expect_contents "value",expect_error "error",zero_bytes,read_zero_bytes_null}
 // `file_io write "path" {simple,{params,params_struct} existing:{keep,overwrite,error} allow_creating:{0,1} {"",no_append}} {value "value" expect_contents "value",except_error "error"}
 
 #include <em/process.hpp>
@@ -38,7 +37,7 @@ int main(int argc, char **argv)
     if (arg == "read")
     {
         filename = ConsumeArg();
-        in = em::Proc::OpenInputFile(filename, em::Proc::Inheritable::no);
+        in = em::Proc::OpenInputFile(filename, em::Proc::Inherit::no);
     }
     else if ((is_write = arg == "write"))
     {
@@ -47,7 +46,7 @@ int main(int argc, char **argv)
         arg = ConsumeArg();
         if (arg == "simple")
         {
-            out = em::Proc::OpenOutputFile(filename, em::Proc::Inheritable::no);
+            out = em::Proc::OpenOutputFile(filename, em::Proc::Inherit::no);
         }
         else if (bool use_params_struct = false; arg == "params" || (use_params_struct = arg == "params_struct"))
         {
@@ -97,9 +96,9 @@ int main(int argc, char **argv)
             }
 
             if (use_params_struct)
-                out = em::Proc::OpenOutputFile(em::Proc::OutputFileDesc{.filename = filename, .existing = existing, .allow_creating = allow_creating, .flags = flags}, em::Proc::Inheritable::no);
+                out = em::Proc::OpenOutputFile(em::Proc::OutputFileDesc{.filename = filename, .existing = existing, .allow_creating = allow_creating, .flags = flags}, em::Proc::Inherit::no);
             else
-                out = em::Proc::OpenOutputFile(filename, em::Proc::Inheritable::no, existing, allow_creating, flags);
+                out = em::Proc::OpenOutputFile(filename, em::Proc::Inherit::no, existing, allow_creating, flags);
         }
         else
         {
@@ -138,18 +137,56 @@ int main(int argc, char **argv)
 
         em::Proc::IoResult io_result = em::Proc::IoResult(-1);
         std::size_t pos = 0;
-        while (in.ReadUnbuffered(value, pos, &io_result))
+
+        // Here, I'm trying to read in multiple pieces just for fun, and to verify that it works.
+        while (true)
         {
-            if (io_result != em::Proc::IoResult::ok)
+            std::size_t prev_pos = pos;
+
+            bool ret = in.ReadUnbuffered({value.data(), pos + 3}, pos, &io_result);
+
+            if (ret && io_result != em::Proc::IoResult::ok)
                 throw std::runtime_error("`ReadUnbuffered()` returned true but didn't set the result to `ok`.");
+            if (!ret && io_result == em::Proc::IoResult::ok)
+                throw std::runtime_error("`ReadUnbuffered()` returned false but set the result to `ok`.");
+
+            if (ret && pos == prev_pos)
+                throw std::runtime_error("`ReadUnbuffered()` returned true but didn't increment the position.");
+            if (!ret && pos != prev_pos)
+                throw std::runtime_error("`ReadUnbuffered()` returned false but incremented the position.");
+
+            if (!ret)
+                break;
         }
+        if (io_result != em::Proc::IoResult::end_reached)
+            throw std::runtime_error(std::string("`ReadUnbuffered()` stopped with a status other than `end_reached`: `") + em::Proc::to_string(io_result) + "`.");
         if (pos != arg.size())
             throw std::runtime_error("`ReadUnbuffered()` read " + std::to_string(pos) + " characters, but expected " + std::to_string(arg.size()) + ".");
-        if (io_result != em::Proc::IoResult::end_reached)
-            throw std::runtime_error("`ReadUnbuffered()` stopped with a status other than `end_reached`.");
         value.resize(arg.size()); // Trim the dummy last character.
         if (value != arg)
             throw std::runtime_error("Got a wrong result from the file. Expected `" + arg + "` but got `" + value + "`.");
+    }
+    else if (bool null_buf = false; arg == "zero_bytes" || (null_buf = arg == "read_zero_bytes_null"))
+    {
+        em::Proc::BasicIoStream &stream = is_write ? static_cast<em::Proc::BasicIoStream &>(out) : static_cast<em::Proc::BasicIoStream &>(in);
+
+        if (stream.HasError())
+            throw std::runtime_error("Expected to open the file successfully, but got error `" + stream.ErrorMessage() + "`.");
+        if (!stream)
+            throw std::runtime_error("Expected to open the file successfully, but it's null, but holds no error message.");
+
+        char buf[1];
+        std::size_t pos = 0;
+        em::Proc::IoResult io_result = em::Proc::IoResult(-1);
+
+        bool ret = is_write ? out.WriteUnbuffered({null_buf ? nullptr : buf, 0}, pos, &io_result) : in.ReadUnbuffered({null_buf ? nullptr : buf, 0}, pos, &io_result);
+
+        if (ret)
+            throw std::runtime_error("Expected acting on zero bytes to return false.");
+        if (io_result != em::Proc::IoResult::no_data)
+            throw std::runtime_error(std::string("Expected acting on zero bytes to set the result to `no_data`, but got `") + em::Proc::to_string(io_result) + "`.");
+        if (pos != 0)
+            throw std::runtime_error("Expected acting on zero bytes to not advance the position, but it got set to " + std::to_string(pos) + ".");
     }
     else if (is_write && arg == "value")
     {
@@ -192,7 +229,7 @@ int main(int argc, char **argv)
     }
     else
     {
-        throw std::runtime_error("Expected one of: `expect_error`, or `expect_contents` (if `read`), or `value` (if `write`), but got `" + arg + "`.");
+        throw std::runtime_error("Expected one of: `expect_error`, or `expect_contents` (if `read`), or `value` (if `write`), or `zero_bytes`, or `zero_bytes_null`, but got `" + arg + "`.");
     }
 
 

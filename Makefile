@@ -40,6 +40,19 @@ test_file_io: $(OUTPUT_DIR)/file_io$(EXT_EXE)
 	echo -n blah >$(call quote,$(DUMMY_FILE))
 	$< read $(DUMMY_FILE) expect_contents "blah"
 
+	# * Since the test executable reads in blocks of 3 bytes, try giving it an exact multiple of that.
+	echo -n blabla >$(call quote,$(DUMMY_FILE))
+	$< read $(DUMMY_FILE) expect_contents "blabla"
+
+	# * Now an empty file.
+	echo -n '' >$(call quote,$(DUMMY_FILE))
+	$< read $(DUMMY_FILE) expect_contents ""
+
+	# * Also try passing zero size to read.
+	$< read $(DUMMY_FILE) zero_bytes
+	# * This also passes a null pointer as the buffer.
+	$< read $(DUMMY_FILE) read_zero_bytes_null
+
 	# Write simple:
 
 	# * The directory is missing.
@@ -49,6 +62,10 @@ test_file_io: $(OUTPUT_DIR)/file_io$(EXT_EXE)
 	# * The directory exists.
 	mkdir -p $(call quote,$(DUMMY_DIR))
 	$< write $(DUMMY_FILE) simple value "blah" expect_contents "blah"
+
+	# * Zero bytes.
+	$< write $(DUMMY_FILE) simple zero_bytes
+	$< write $(DUMMY_FILE) simple read_zero_bytes_null
 
 	# Write with params:
 

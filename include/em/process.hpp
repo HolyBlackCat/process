@@ -1000,21 +1000,23 @@ namespace em::Proc
     // Explains the result of a read or write operation.
     enum class IoResult
     {
-        // Read or write successful.
-        // This usually means that at least one byte was processed, but zero bytes is possible too (Windows docs say that it can happen when reading when the other end of the pipe calls `WriteFile()` with zero length).
+        // Read or write successful. You can try reading or writing more immediately.
+        // This is the only result that should increment `pos`.
         ok,
 
         // No data to read or write, try again later.
         // This should only happen for non-blocking streams.
         retry_later,
 
-        // Nothing more to read. For a pipe, this means the remote end is closed. For a file, this is EOF. For files this can only happen on read, but for pipes it can happen on both reads and writes.
+        // Nothing more to read.
+        // For a pipe, this means the remote end is closed. For a file, this is EOF.
+        // For files this can only happen on read, but for pipes it can happen on both reads and writes.
         end_reached,
 
         // You passed zero bytes, nothing to do.
         no_data,
 
-        // Something broke,
+        // Something broke, call `ErrorMessage()` on the stream for more details.
         error,
     };
 
@@ -1172,8 +1174,6 @@ namespace em::Proc
                     *out_result = IoResult::error;
                 return false;
             }
-
-          [[maybe_unused]] retry:
 
             // Note that `pos == data.size()` is a valid no-op, but `pos > data.size()` is an assert (and a no-op in release builds).
             assert(pos <= data.size());
@@ -1336,7 +1336,7 @@ namespace em::Proc
     };
 
     // Is an IO stream handle inheritable by child processes?
-    enum class Inheritable : bool
+    enum class Inherit : bool
     {
         // Never inherited. Must not be used as an IO stream redirection, nor passed to `MiscParams::inherit_handles`.
         no = false,
@@ -1431,7 +1431,7 @@ namespace em::Proc
         // Returns true on success, false on failure. On failure, resets this instance to null and stores the error on it, call `ErrorMessage()` to get it.
         //
         // In the underlying OS APIs, on Windows this defaults to false, an on POSIX to true. But we override those defaults everywhere.
-        bool SetInheritable(Inheritable inheritable)
+        bool SetInheritable(Inherit inheritable)
         {
             if (StoreErrorIfNull())
                 return false;
@@ -1535,7 +1535,7 @@ namespace em::Proc
         }
         #endif
 
-        inline bool CloneStreamLow(const BasicIoStream &from, BasicIoStream &to, Inheritable inheritable)
+        inline bool CloneStreamLow(const BasicIoStream &from, BasicIoStream &to, Inherit inheritable)
         {
             // Clear the output first.
             to = {};
@@ -1589,7 +1589,7 @@ namespace em::Proc
     // If `from` is null, sets `to` to null as well. That's no an error.
     // One notable use of this is that on Windows, we set the "inheritable" flag for the copy even if the source doesn't have it.
     template <SyncIoStreamType T>
-    bool CloneStream(const T &from, T &to, Inheritable inheritable)
+    bool CloneStream(const T &from, T &to, Inherit inheritable)
     {
         return detail::CloneStreamLow(from, to, inheritable);
     }
@@ -1597,7 +1597,7 @@ namespace em::Proc
     // Creates a pipe, assigning the two ends to `write` and `read`, which should be initially empty. If they aren't empty, their existing values are discarded.
     // On success, returns true and makes both `write` and `read` non-null.
     // On failure, returns false, makes both `write` and `read` null, and stores the error message in both `write` and `read`.
-    inline bool MakePipe(OutputStream &write, InputStream &read, Inheritable write_inheritable, Inheritable read_inheritable)
+    inline bool MakePipe(OutputStream &write, InputStream &read, Inherit write_inheritable, Inherit read_inheritable)
     {
         // Firstly, destroy existing handles, if any.
         read = {};
@@ -1668,7 +1668,7 @@ namespace em::Proc
         {
             if (!bool(read_inheritable))
             {
-                read.SetInheritable(Inheritable::no);
+                read.SetInheritable(Inherit::no);
                 if (read.HasError())
                 {
                     // Copy the error message to the other handle.
@@ -1679,7 +1679,7 @@ namespace em::Proc
 
             if (!bool(write_inheritable))
             {
-                write.SetInheritable(Inheritable::no);
+                write.SetInheritable(Inherit::no);
                 if (write.HasError())
                 {
                     // Copy the error message to the other handle.
@@ -1784,17 +1784,17 @@ namespace em::Proc
 
     // Convenience variants of `MakePipe()` for when one or both ends are IO redirects.
     // Returns true on success.
-    inline bool MakePipe(OutputStream &write, InputStreamAttachment &read, Inheritable write_inheritable = Inheritable::no)
+    inline bool MakePipe(OutputStream &write, InputStreamAttachment &read, Inherit write_inheritable = Inherit::no)
     {
-        return MakePipe(write, read.emplace<InputStream>(), write_inheritable, Inheritable::as_stdio_stream);
+        return MakePipe(write, read.emplace<InputStream>(), write_inheritable, Inherit::as_stdio_stream);
     }
-    inline bool MakePipe(OutputStreamAttachment &write, InputStream &read, Inheritable read_inheritable = Inheritable::no)
+    inline bool MakePipe(OutputStreamAttachment &write, InputStream &read, Inherit read_inheritable = Inherit::no)
     {
-        return MakePipe(write.emplace<OutputStream>(), read, Inheritable::as_stdio_stream, read_inheritable);
+        return MakePipe(write.emplace<OutputStream>(), read, Inherit::as_stdio_stream, read_inheritable);
     }
     inline bool MakePipe(OutputStreamAttachment &write, InputStreamAttachment &read)
     {
-        return MakePipe(write.emplace<OutputStream>(), read.emplace<InputStream>(), Inheritable::as_stdio_stream, Inheritable::as_stdio_stream);
+        return MakePipe(write.emplace<OutputStream>(), read.emplace<InputStream>(), Inherit::as_stdio_stream, Inherit::as_stdio_stream);
     }
 
 
@@ -1808,7 +1808,7 @@ namespace em::Proc
     // For input streams, it's also an error to pass `existing != keep`.
     // NOTE: `allow_creating` doesn't have a default value here, since input streams are required to pass false, while output streams will usually pass true.
     //   This is also why it's placed before other parameters with default arguments.
-    inline bool OpenFile(IoStreamRefVar target, NativeCStringViewParam filename, Inheritable inheritable, bool allow_creating, ExistingFile existing = ExistingFile::overwrite, OutputFileFlags flags = {})
+    inline bool OpenFile(IoStreamRefVar target, NativeCStringViewParam filename, Inherit inheritable, bool allow_creating, ExistingFile existing = ExistingFile::overwrite, OutputFileFlags flags = {})
     {
         BasicIoStream &target_base = std::visit([](auto &elem) -> BasicIoStream & {return elem;}, target);
 
@@ -1945,7 +1945,7 @@ namespace em::Proc
 
     // Opens a file for reading. Returns a null instance with an error stored in it on failure, call `.ErrorMessage()` for details.
     // Note that this function isn't very useful for redirecting process input, since that API also accepts a path direclty, and that's more optimal. This function exists only for completeness.
-    [[nodiscard]] inline InputStream OpenInputFile(NativeCStringViewParam filename, Inheritable inheritable)
+    [[nodiscard]] inline InputStream OpenInputFile(NativeCStringViewParam filename, Inherit inheritable)
     {
         InputStream ret;
         OpenFile(ret, std::move(filename), inheritable, false, ExistingFile::keep);
@@ -1958,13 +1958,13 @@ namespace em::Proc
     // `allow_creating` controls what happens if no such file exists. `true` means it's created, `false` means this function fails.
     // It's an error to pass `!allow_creating && existing == error`.
     // NOTE: Here the parameter order is different than in `OpenFile()`, because this one makes more sense, and we're not constrained by having to provide decent API for input files too.
-    [[nodiscard]] inline OutputStream OpenOutputFile(NativeCStringViewParam filename, Inheritable inheritable, ExistingFile existing = ExistingFile::overwrite, bool allow_creating = true, OutputFileFlags flags = {})
+    [[nodiscard]] inline OutputStream OpenOutputFile(NativeCStringViewParam filename, Inherit inheritable, ExistingFile existing = ExistingFile::overwrite, bool allow_creating = true, OutputFileFlags flags = {})
     {
         OutputStream ret;
         OpenFile(ret, std::move(filename), inheritable, allow_creating, existing, flags);
         return ret;
     }
-    [[nodiscard]] inline OutputStream OpenOutputFile(const OutputFileDesc &desc, Inheritable inheritable)
+    [[nodiscard]] inline OutputStream OpenOutputFile(const OutputFileDesc &desc, Inherit inheritable)
     {
         OutputStream ret;
         OpenFile(ret, std::move(desc.filename), inheritable, desc.allow_creating, desc.existing, desc.flags);
@@ -2672,11 +2672,25 @@ namespace em::Proc
             return ExitedWithCode(0);
         }
 
+        // Returns true if the program exited with the specified `code`, as opposed to another code, or to crashing, etc.
         [[nodiscard]] bool ExitedWithCode(int code) const
         {
+            assert(!std::holds_alternative<Detached>(var)); // Makes no sense to call this on a detached process, it will always return false.
             auto value = std::get_if<Code>(&var);
             return value && value->code == code;
         }
+
+        #if EM_PROC_EXCEPTIONS
+        void ThrowError()
+        {
+            if (!Success())
+            {
+                if (std::holds_alternative<Detached>(var)) // `Success()` already asserts that this is not the case. So this check here is only for release builds.
+                    return;
+                throw Exception("Subprocess failed: " + ToString());
+            }
+        }
+        #endif
 
         // A debug string to represent this exit reason.
         [[nodiscard]] std::string ToString() const
@@ -3313,7 +3327,7 @@ namespace em::Proc
                         // We could open it once and store it, but that's mildly suspicious and probably isn't worth it.
                         if (!elem)
                         {
-                            state.stdin_stream = OpenInputFile(R"(\\.\NUL)", Inheritable::as_stdio_stream);
+                            state.stdin_stream = OpenInputFile(R"(\\.\NUL)", Inherit::as_stdio_stream);
                             if (state.stdin_stream.HasError())
                             {
                                 error_string = "Failed to open a `\\\\.\\NUL` handle for `stdin`: " + state.stdin_stream.ErrorMessage();
@@ -3339,7 +3353,7 @@ namespace em::Proc
                     },
                     [&](MaybeOwningNativeString &&elem)
                     {
-                        state.stdin_stream = OpenInputFile(std::move(elem), Inheritable::as_stdio_stream);
+                        state.stdin_stream = OpenInputFile(std::move(elem), Inherit::as_stdio_stream);
                         if (state.stdin_stream.HasError())
                         {
                             error_string = "Failed to open `stdin` file: " + state.stdin_stream.ErrorMessage();
@@ -3372,7 +3386,7 @@ namespace em::Proc
                             if (!elem)
                             {
                                 // No particular reason to pass `no_append`, just to hopefully do less work.
-                                target_field = OpenOutputFile(R"(\\.\NUL)", Inheritable::as_stdio_stream, ExistingFile::keep, false, OutputFileFlags::no_append);
+                                target_field = OpenOutputFile(R"(\\.\NUL)", Inherit::as_stdio_stream, ExistingFile::keep, false, OutputFileFlags::no_append);
                                 if (target_field.HasError())
                                 {
                                     error_string = std::string("Failed to open a `\\\\.\\NUL` handle for `") + stream_name + "`: " + target_field.ErrorMessage();
@@ -3399,7 +3413,7 @@ namespace em::Proc
                         [&](TagMergeOutput)
                         {
                             // We could just pass the same handle to both streams, but Claude has a good point that the started program might close one of the two handles and don't expect the other one to get closed at the same time. Didn't test this though, but SDL does the same.
-                            CloneStream(is_stderr ? state.stdout_stream : state.stderr_stream, target_field, Inheritable::as_stdio_stream);
+                            CloneStream(is_stderr ? state.stdout_stream : state.stderr_stream, target_field, Inherit::as_stdio_stream);
                             if (target_field.HasError())
                             {
                                 error_string = "Failed to merge the output streams: " + target_field.ErrorMessage();
@@ -3410,7 +3424,7 @@ namespace em::Proc
                         },
                         [&]<typename T>(T &&name_or_desc) requires std::is_same_v<T, MaybeOwningNativeString> || std::is_same_v<T, OutputFileDesc>
                         {
-                            target_field = OpenOutputFile(name_or_desc, Inheritable::as_stdio_stream);
+                            target_field = OpenOutputFile(name_or_desc, Inherit::as_stdio_stream);
                             if (target_field.HasError())
                             {
                                 error_string = std::string("Failed to open `") + (is_stderr ? "stderr" : "stdout") + "` file: " + target_field.ErrorMessage();
