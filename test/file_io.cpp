@@ -143,19 +143,14 @@ int main(int argc, char **argv)
         {
             std::size_t prev_pos = pos;
 
-            bool ret = in.ReadUnbuffered({value.data(), pos + 3}, pos, &io_result);
+            io_result = in.ReadUnbuffered({value.data(), pos + 3}, pos);
 
-            if (ret && io_result != em::Proc::IoResult::ok)
-                throw std::runtime_error("`ReadUnbuffered()` returned true but didn't set the result to `ok`.");
-            if (!ret && io_result == em::Proc::IoResult::ok)
-                throw std::runtime_error("`ReadUnbuffered()` returned false but set the result to `ok`.");
-
-            if (ret && pos == prev_pos)
+            if (io_result == em::Proc::IoResult::ok && pos == prev_pos)
                 throw std::runtime_error("`ReadUnbuffered()` returned true but didn't increment the position.");
-            if (!ret && pos != prev_pos)
+            if (io_result != em::Proc::IoResult::ok && pos != prev_pos)
                 throw std::runtime_error("`ReadUnbuffered()` returned false but incremented the position.");
 
-            if (!ret)
+            if (io_result != em::Proc::IoResult::ok)
                 break;
         }
         if (io_result != em::Proc::IoResult::end_reached)
@@ -177,12 +172,8 @@ int main(int argc, char **argv)
 
         char buf[1];
         std::size_t pos = 0;
-        em::Proc::IoResult io_result = em::Proc::IoResult(-1);
+        em::Proc::IoResult io_result = is_write ? out.WriteUnbuffered({null_buf ? nullptr : buf, 0}, pos) : in.ReadUnbuffered({null_buf ? nullptr : buf, 0}, pos);
 
-        bool ret = is_write ? out.WriteUnbuffered({null_buf ? nullptr : buf, 0}, pos, &io_result) : in.ReadUnbuffered({null_buf ? nullptr : buf, 0}, pos, &io_result);
-
-        if (ret)
-            throw std::runtime_error("Expected acting on zero bytes to return false.");
         if (io_result != em::Proc::IoResult::no_data)
             throw std::runtime_error(std::string("Expected acting on zero bytes to set the result to `no_data`, but got `") + em::Proc::to_string(io_result) + "`.");
         if (pos != 0)
@@ -199,11 +190,7 @@ int main(int argc, char **argv)
 
         em::Proc::IoResult io_result = em::Proc::IoResult(-1);
         std::size_t pos = 0;
-        while (out.WriteUnbuffered(arg, pos, &io_result))
-        {
-            if (io_result != em::Proc::IoResult::ok)
-                throw std::runtime_error("`WriteUnbuffered()` returned true but didn't set the result to `ok`.");
-        }
+        while ((io_result = out.WriteUnbuffered(arg, pos)) == em::Proc::IoResult::ok) {}
 
         if (pos != arg.size())
             throw std::runtime_error("`WriteUnbuffered()` wrote " + std::to_string(pos) + " characters, but expected " + std::to_string(arg.size()) + ".");

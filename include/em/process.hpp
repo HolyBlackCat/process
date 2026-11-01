@@ -217,19 +217,6 @@
     [[maybe_unused]] prefix_ constexpr name_ &operator<<=(name_ &a, int b) {return a = a << b;} \
     [[maybe_unused]] prefix_ constexpr name_ &operator>>=(name_ &a, int b) {return a = a >> b;} \
 
-// Changes here relative to SDL:
-// * Better error reporting from starting background (detached) processes. See: https://github.com/libsdl-org/SDL/issues/16188
-// * Use return values instead of `errno` in a few places. But it seems in glibc those functions do set errno, even though it's not documented in the manual, so I'm not sure this ever matters.
-// * Don't bother with android-specific code to obtain extra env variables from the application manifest, whatever that is.
-// * Refuse to use `kill(pid, 0)` to wait for background (detached) processes. Since PIDs can be recycled, this seems unreliable.
-// * Added "have core dump" check when a process stops due to a signal.
-// * On Windows, the `CREATE_NO_WINDOW` flag that disables console allocation is not implied by process background-ness (detached-ness). It doesn't seem terribly useful, and we expose it separately.
-// * Use `pipe2()` instead of `pipe()` when possible.
-
-// Differences to reproc:
-// * We don't try to use sockets as pipes as reproc does on Windows. Seems hacky, and they have several suspicious bug reports that look like they could be caused by those, that they didn't respond to.
-//   They did that to support polling (so checking which pipes are ready without actually reading/writing to them), but we can use IO completion ports instead. Those seem to force you to queue an operation,
-//     instead of just reporting the pipe status (like polling does on Linux), so the API has to be designed around it.
 
 namespace em::Proc
 {
@@ -1003,10 +990,10 @@ namespace em::Proc
     enum class IoResult
     {
         // Read or write successful. You can try reading or writing more immediately.
-        // This is the only result that should increment `pos`.
+        // This is the only result that increases `pos`, and it always increases it.
         ok,
 
-        // No data to read or write, try again later.
+        // No data available to read, or no space left to write. Try again later.
         // This should only happen for non-blocking streams.
         retry_later,
 
@@ -1155,36 +1142,25 @@ namespace em::Proc
 
       protected:
         // Perform a read or write.
-        // `out_result` is optional.
-        // Returns true when the result is `IoResult::ok` (regardless of `out_result` being specified or not).
         // On failure, resets the handle to null so you don't miss the error.
         // Don't call this on the async streams on POSIX.
         // On Windows, `async_data_win` must be non-null for async streams, and null for sync streams.
         template <bool Read>
-        bool ReadOrWriteUnbuffered(
+        [[nodiscard]] IoResult ReadOrWriteUnbuffered(
             std::conditional_t<Read, std::span<char>, std::span<const char>> data,
-            std::size_t &pos,
-            IoResult *out_result
+            std::size_t &pos
             #ifdef _WIN32
             , OVERLAPPED *async_data_win = nullptr
             #endif
         )
         {
             if (StoreErrorIfNull())
-            {
-                if (out_result)
-                    *out_result = IoResult::error;
-                return false;
-            }
+                return IoResult::error;
 
             // Note that `pos == data.size()` is a valid no-op, but `pos > data.size()` is an assert (and a no-op in release builds).
             assert(pos <= data.size());
             if (pos >= data.size())
-            {
-                if (out_result)
-                    *out_result = IoResult::no_data;
-                return false;
-            }
+                return IoResult::no_data;
 
             std::size_t remaining_size = data.size() - pos;
 
@@ -1210,9 +1186,7 @@ namespace em::Proc
                 if (error == ERROR_NO_DATA)
                 {
                     // This better not happen randomly on blocking pipes. It shouldn't.
-                    if (out_result)
-                        *out_result = IoResult::retry_later;
-                    return false;
+                    return IoResult::retry_later;
                 }
 
                 // EOF or pipe disconnected?
@@ -1225,16 +1199,12 @@ namespace em::Proc
                     error == ERROR_HANDLE_EOF
                 )
                 {
-                    if (out_result)
-                        *out_result = IoResult::end_reached;
-                    return false;
+                    return IoResult::end_reached;
                 }
 
                 // Surely an error at this point.
                 *this = {error_message, std::string(Read ? "`ReadFile()` failed: " : "`WriteFile()` failed: ") + detail::WinApiErrorToString(error)};
-                if (out_result)
-                    *out_result = IoResult::error;
-                return false;
+                return IoResult::error;
             }
             else if (processed_size == 0)
             {
@@ -1242,18 +1212,13 @@ namespace em::Proc
                 // Yes, this is a bit weird, but this is how `ReadFile()` normally reports it, apparently.
                 // The WinAPI docs claim that `ok == true && processed_size == 0` can also happen on a read end of a pipe when the other end calls `WriteFile()` with length 0,
                 //   but LLM-assisted testing shows that it's only the case for message-mode pipes, not our regular byte-mode pipes (tried writing first and then reading, and tried blocking a read first, and then writing from another thread).
-
-                if (out_result)
-                    *out_result = IoResult::end_reached;
-                return false;
+                return IoResult::end_reached;
             }
 
             assert(std::size_t(processed_size) <= remaining_size);
             pos += std::size_t(processed_size);
 
-            if (out_result)
-                *out_result = IoResult::ok;
-            return true;
+            return IoResult::ok;
 
             #else
 
@@ -1292,46 +1257,32 @@ namespace em::Proc
                     #endif
                 )
                 {
-                    if (out_result)
-                        *out_result = IoResult::retry_later;
-                    return false;
+                    return IoResult::retry_later;
                 }
 
                 // Is this a write to a broken pipe?
                 if constexpr (!Read)
                 {
                     if (errno_copy == EPIPE)
-                    {
-                        if (out_result)
-                            *out_result = IoResult::end_reached;
-                        return false;
-                    }
+                        return IoResult::end_reached;
                 }
 
                 // Surely an error at this point.
                 *this = {error_message, std::string(Read ? "`read()` failed: " : "`write()` failed: ") + std::strerror(errno_copy) + '.'}; // Here and everywhere else adding `.` after `strerror` for consistency with WinAPI errors, which always end with `.`.
-                if (out_result)
-                    *out_result = IoResult::error;
-                return false;
+                return IoResult::error;
             }
 
             // EOF.
             // We already ensured earlier that this is only possible if `Read == true`.
             if (result == 0)
-            {
-                if (out_result)
-                    *out_result = IoResult::end_reached;
-                return false;
-            }
+                return IoResult::end_reached;
 
             // Success.
             // `result` is always positive at this point.
             assert(std::size_t(result) <= remaining_size);
             pos += std::size_t(result);
 
-            if (out_result)
-                *out_result = IoResult::ok;
-            return true;
+            return IoResult::ok;
 
             #endif
         }
@@ -1486,12 +1437,11 @@ namespace em::Proc
         // Tries to read some data, without any buffering.
         // You should probably set `pos` to zero initially.
         // Tries to fill `data` starting from `pos` and until the end. Increases `pos` to indicate how many bytes we were able to get.
-        // If `out_result` is specified, writes status to it.
-        // Returns true if the status is `ok` (regardless of `out_result` being null).
-        // You can call this in a loop while it returns true if you prefer.
-        bool ReadUnbuffered(std::span<char> data, std::size_t &pos, IoResult *out_result = nullptr)
+        // Returns `ok` if successfully read some bytes and incremented `pos`, or returns something else and leaves `pos` unmodified.
+        // You can call this in a loop while it keeps returning `ok`.
+        [[nodiscard]] IoResult ReadUnbuffered(std::span<char> data, std::size_t &pos)
         {
-            return ReadOrWriteUnbuffered<true>(data, pos, out_result);
+            return ReadOrWriteUnbuffered<true>(data, pos);
         }
     };
 
@@ -1504,12 +1454,11 @@ namespace em::Proc
         // Tries to write some data, without any buffering.
         // You should probably set `pos` to zero initially.
         // Tries to write the part of `data` starting from `pos` and until the end. Increases `pos` to indicate how many bytes we were able to send.
-        // If `out_result` is specified, writes status to it.
-        // Returns true if the status is `ok` (regardless of `out_result` being null).
-        // You can call this in a loop while it returns true if you prefer.
-        bool WriteUnbuffered(std::span<char> data, std::size_t &pos, IoResult *out_result = nullptr)
+        // Returns `ok` if successfully wrote some bytes and incremented `pos`, or returns something else and leaves `pos` unmodified.
+        // You can call this in a loop while it keeps returning `ok`.
+        [[nodiscard]] IoResult WriteUnbuffered(std::span<char> data, std::size_t &pos)
         {
-            return ReadOrWriteUnbuffered<false>(data, pos, out_result);
+            return ReadOrWriteUnbuffered<false>(data, pos);
         }
     };
 
@@ -1798,7 +1747,6 @@ namespace em::Proc
     {
         return MakePipe(write.emplace<OutputStream>(), read.emplace<InputStream>(), Inherit::as_stdio_stream, Inherit::as_stdio_stream);
     }
-
 
 
     using IoStreamRefVar = std::variant<std::reference_wrapper<InputStream>, std::reference_wrapper<OutputStream>>;
