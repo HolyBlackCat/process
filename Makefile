@@ -2,17 +2,20 @@
 
 # CXX := implicit
 
-OUTPUT_DIR := test/output
-
-EXECUTABLES := file_io
+OUTPUT_DIR := test/output-$(CXX)
 
 WINDOWS := 0
 override WINDOWS := $(filter-out 0,$(WINDOWS))
 
 EXT_EXE := $(if $(WINDOWS),.exe)
 
+EXECUTABLES := file_io redirects simple_io
+# Converts a name of one of the text executables (one of `EXECUTABLES`) to a path to it.
+override exe_name = $(OUTPUT_DIR)/$1$(EXT_EXE)
+
 FLAGS := -Iinclude -std=c++23 -Wall -Wextra -pedantic-errors -Wconversion -D_GLIBCXX_DEBUG -g
 
+# We use this directory and file for testing IO.
 DUMMY_DIR := test/dummy
 DUMMY_FILE := $(DUMMY_DIR)/1.txt
 
@@ -27,8 +30,21 @@ override quote = '$(subst ','"'"',$1)'
 
 override rm_file = $(call safe_shell_exec,rm -f $(call quote,$(DUMMY_FILE)))
 
+
+
+.PHONY: test_all
+test_all: test_file_io test_redirects
+
+ifneq ($(WINDOWS),)
+EXECUTABLES += win_arg_escaping
+test_all: test_win_arg_escaping
+endif
+
+
 .PHONY: test_file_io
-test_file_io: $(OUTPUT_DIR)/file_io$(EXT_EXE)
+test_file_io: DUMMY_DIR := $(OUTPUT_DIR)/test_file_io/dir
+test_file_io: DUMMY_FILE := $(DUMMY_DIR)/1.txt
+test_file_io: $(call exe_name,file_io)
 	# Read:
 
 	# * The file is missing.
@@ -108,11 +124,103 @@ test_file_io: $(OUTPUT_DIR)/file_io$(EXT_EXE)
 		done \
 	done
 
+.PHONY: test_redirects
+test_redirects: TEST_DIR := $(OUTPUT_DIR)/test_file_io
+test_redirects: stdout := $(TEST_DIR)/stdout.txt
+test_redirects: stderr := $(TEST_DIR)/stderr.txt
+test_redirects: $(call exe_name,redirects) $(call exe_name,simple_io)
+	mkdir -p $(call quote,$(TEST_DIR))
 
+	# Input:
+
+	# * Null input.
+	$< null inherit inherit $(call exe_name,simple_io) >$(stdout) 2>$(stderr)
+	diff $(stdout) <(echo 'stdout[]')
+	diff $(stderr) <(echo 'stderr[]')
+
+	# * Inherited input.
+	echo -n blah | $< inherit inherit inherit $(call exe_name,simple_io) >$(stdout) 2>$(stderr)
+	diff $(stdout) <(echo 'stdout[blah]')
+	diff $(stderr) <(echo 'stderr[blah]')
+
+	echo -n bleh >$(TEST_DIR)/in.txt
+
+	# * File name input.
+	$< file $(TEST_DIR)/in.txt inherit inherit $(call exe_name,simple_io) >$(stdout) 2>$(stderr)
+	diff $(stdout) <(echo 'stdout[bleh]')
+	diff $(stderr) <(echo 'stderr[bleh]')
+
+	# * File stream input.
+	echo -n bleh >$(TEST_DIR)/in.txt
+	$< file_stream $(TEST_DIR)/in.txt inherit inherit $(call exe_name,simple_io) >$(stdout) 2>$(stderr)
+	diff $(stdout) <(echo 'stdout[bleh]')
+	diff $(stderr) <(echo 'stderr[bleh]')
+
+	# Output:
+
+	# * Null:
+
+	#   * Null stdout.
+	$< null null inherit $(call exe_name,simple_io) >$(stdout) 2>$(stderr)
+	diff $(stdout) <(true)
+	diff $(stderr) <(echo 'stderr[]')
+	#   * Null stderr.
+	$< null inherit null $(call exe_name,simple_io) >$(stdout) 2>$(stderr)
+	diff $(stdout) <(echo 'stdout[]')
+	diff $(stderr) <(true)
+
+	#   * Null stdout with stderr merged.
+	$< null null merge $(call exe_name,simple_io) >$(stdout) 2>$(stderr)
+	diff $(stdout) <(true)
+	diff $(stderr) <(true)
+	#   * Null stderr with stdout merged.
+	$< null merge null $(call exe_name,simple_io) >$(stdout) 2>$(stderr)
+	diff $(stdout) <(true)
+	diff $(stderr) <(true)
+
+
+	# * File:
+
+	for file_method in file file_stream file_desc; do \
+		echo '------ Method:' $$file_method; \
+		echo '--- File stdout.'; \
+		rm $(TEST_DIR)/out.txt; \
+		$< null $$file_method $(TEST_DIR)/out.txt inherit $(call exe_name,simple_io) >$(stdout) 2>$(stderr); \
+		diff $(stdout) <(true); \
+		diff $(stderr) <(echo 'stderr[]'); \
+		diff $(TEST_DIR)/out.txt <(echo 'stdout[]'); \
+		\
+		echo '--- File stderr.'; \
+		rm $(TEST_DIR)/out.txt; \
+		$< null inherit $$file_method $(TEST_DIR)/out.txt $(call exe_name,simple_io) >$(stdout) 2>$(stderr); \
+		diff $(stdout) <(echo 'stdout[]'); \
+		diff $(stderr) <(true); \
+		diff $(TEST_DIR)/out.txt <(echo 'stderr[]'); \
+		\
+		echo '--- File stdout with stderr merged.'; \
+		rm $(TEST_DIR)/out.txt; \
+		$< null $$file_method $(TEST_DIR)/out.txt merge $(call exe_name,simple_io) >$(stdout) 2>$(stderr); \
+		diff $(stdout) <(true); \
+		diff $(stderr) <(true); \
+		diff $(TEST_DIR)/out.txt <(echo -e 'stdout[]\nstderr[]'); \
+		\
+		echo '--- File stderr with stdout merged.'; \
+		rm $(TEST_DIR)/out.txt; \
+		$< null merge $$file_method $(TEST_DIR)/out.txt $(call exe_name,simple_io) >$(stdout) 2>$(stderr); \
+		diff $(stdout) <(true); \
+		diff $(stderr) <(true); \
+		diff $(TEST_DIR)/out.txt <(echo -e 'stdout[]\nstderr[]'); \
+	done
+
+ifneq ($(WINDOWS),)
+.PHONY: test_win_arg_escaping
+test_win_arg_escaping: $(call exe_name,win_arg_escaping)
+	$<
+endif
 
 # Build the test executables.
 $(foreach x,$(EXECUTABLES),$(eval\
-$(OUTPUT_DIR)/$x$(EXT_EXE): test/$x.cpp | $(OUTPUT_DIR)/ ; $(CXX) $(FLAGS) $$< -o $$@ \
+$(call exe_name,$x): test/$x.cpp | $(OUTPUT_DIR)/ ; $(CXX) $(FLAGS) $$< -o $$@ \
 ))
 
 # Create any directory.

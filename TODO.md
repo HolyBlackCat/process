@@ -42,6 +42,9 @@ Tests:
 
 * Async waiting for process termination: jobs (with IOCP) on Windows, fdpid_open on Linux if supported and enabled, dummy pipes on POSIX otherwise
 
+* Separately report file not found when launching the process.
+
+* Interrupting processes
 
 Maybe later:
 

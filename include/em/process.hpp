@@ -248,30 +248,32 @@ namespace em::Proc
 {
     // Some tag types:
 
-    // Construct an object in an invalid state, storing the provided error message.
     struct TagErrorMessage {explicit TagErrorMessage() = default;};
+    // Construct an object in an invalid state, storing the provided error message.
     inline constexpr TagErrorMessage error_message{};
-    // Take ownership of some owning handle.
+
     struct TagTakeOwnership {explicit TagTakeOwnership() = default;};
+    // Take ownership of some owning handle.
     inline constexpr TagTakeOwnership take_ownership{};
-    // Store a handle or pointer without taking ownership of it.
+
     struct TagNonOwning {explicit TagNonOwning() = default;};
+    // Store a handle or pointer without taking ownership of it.
     inline constexpr TagNonOwning non_owning{};
 
     #ifdef _WIN32
     struct TagWindowsOnly {explicit TagWindowsOnly() = default;};
-    // This is passed as the first argument to constructors to acknowledge that you understand that they're Windows-specific, and need to be `#if`ed.
-    // Normal functions the the `_Win` suffix (or `_Posix` for POSIX) because it looks nicer.
+    // This is passed as the first argument to constructors to acknowledge that you understand that they're Windows-specific, and need to be wrapped in `#ifdef _WIN32`.
+    // Normal functions use the `_Win` suffix (or `_Posix` for POSIX) because it looks nicer.
     inline constexpr TagWindowsOnly windows_only{};
     #endif
 
 
     #ifdef _WIN32
     using NativeChar = wchar_t;
-    using Pid = DWORD; // Process ID type. This is always some integer type.
+    using Pid = DWORD; // Process ID type. This is always some integer type. For me, `DWORD` is `unsigned long` (which is 32-bit on Windows).
     #else
     using NativeChar = char;
-    using Pid = pid_t; // Process ID type. This is always some integer type.
+    using Pid = pid_t; // Process ID type. This is always some integer type. For me, `pid_t` is `int`.
     #endif
 
 
@@ -1024,11 +1026,11 @@ namespace em::Proc
     {
         switch (result)
         {
-            case IoResult::ok:           return "ok";
-            case IoResult::retry_later:  return "retry_later";
+            case IoResult::ok:          return "ok";
+            case IoResult::retry_later: return "retry_later";
             case IoResult::end_reached: return "end_reached";
-            case IoResult::no_data:      return "no_data";
-            case IoResult::error:        return "error";
+            case IoResult::no_data:     return "no_data";
+            case IoResult::error:       return "error";
         }
         assert(false && "Invalid enum.");
         return "??";
@@ -1764,12 +1766,12 @@ namespace em::Proc
     };
 
 
-    // Inherit an IO stream from the parent process instead of attaching a custom one. This is the default behavior.
     struct TagInherit {explicit TagInherit() = default;};
+    // Inherit an IO stream from the parent process instead of attaching a custom one. This is the default behavior.
     inline constexpr TagInherit inherit{};
 
-    // Merge one output stream into the other. Usually you put this on `stderr` to merge it into `stdout`, and then attach a custom stream to `stdout`.
     struct TagMergeOutput {explicit TagMergeOutput() = default;};
+    // Merge one output stream into the other. Usually you put this on `stderr` to merge it into `stdout`, and then attach a custom stream to `stdout`.
     inline constexpr TagMergeOutput merge_output{};
 
     // What to do with the input stream of a process.
@@ -2673,6 +2675,7 @@ namespace em::Proc
         }
 
         // Returns true if the program exited with the specified `code`, as opposed to another code, or to crashing, etc.
+        // Asserts that this is not a detached process, since we don't know their exit codes.
         [[nodiscard]] bool ExitedWithCode(int code) const
         {
             assert(!std::holds_alternative<Detached>(var)); // Makes no sense to call this on a detached process, it will always return false.
@@ -2681,7 +2684,8 @@ namespace em::Proc
         }
 
         #if EM_PROC_EXCEPTIONS
-        void ThrowError()
+        // Throws if `Success() == false`.
+        void ThrowError() const
         {
             if (!Success())
             {
@@ -4366,8 +4370,28 @@ namespace em::Proc
                 CheckOrWait(true);
         }
 
-        // Returns true if this instance either owns a process (for non-detached processes), or was created by successfully starting a detached process.
+        // Returns true if this instance represents a successfully started process.
         [[nodiscard]] explicit operator bool() const {return state.pid != 0;}
+
+        // If this instance is null, writes a error message nothing this fact in `ErrorMessage()` and returns true.
+        // If not null, returns false.
+        // Mainly for internal use.
+        [[nodiscard]] bool StoreErrorIfNull()
+        {
+            if (!*this)
+            {
+                // Don't clobber the existing error, if any.
+                if (!HasError())
+                    error_string = "This process object is null.";
+
+                // Set the exit reason to "error" too, also without clobbering.
+                if (!state.exit_reason)
+                    state.exit_reason = Proc::ExitReason(Proc::ExitReason::Error{});
+
+                return true;
+            }
+            return false;
+        }
 
         // This is zero for null processes.
         [[nodiscard]] Proc::Pid Pid() const {return state.pid;}
@@ -4396,13 +4420,16 @@ namespace em::Proc
         }
 
         // Wait until the process exits.
+        // Returns `ExitReason().value()` for convenience.
         // Note! This can deadlock if you have pipes open to this process, because you need to be manually poking those pipes.
-        void BlockUntilExit()
+        const Proc::ExitReason &BlockUntilExit()
         {
             CheckOrWait(true);
+            return ExitReason().value();
         }
 
-        // Returns the exit reason of the process, or false if it's not known to be exited.
+        // Returns the exit reason of the process, or false if it's not known to be exited yet.
+        // This is only updated by `UpdateState()` or `BlockUntilExit()`.
         [[nodiscard]] const std::optional<Proc::ExitReason> &ExitReason() const
         {
             return state.exit_reason;
@@ -4414,12 +4441,8 @@ namespace em::Proc
             // Intentionally don't check `HasError()`. If something random has failed, we should still be able to `waitpid()` the process to clean it up.
 
             // Complain about null instances.
-            if (!*this)
-            {
-                // Assert instead of writing to `state.error`, this makes more sense to me.
-                assert(false && "Attempt to wait for a null instance.");
+            if (StoreErrorIfNull())
                 return;
-            }
 
             // Do nothing if we don't own a PID. This rejects background processes, and also repeated waits.
             if (!OwnsProcess())
