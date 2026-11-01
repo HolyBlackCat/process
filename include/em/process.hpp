@@ -337,6 +337,21 @@ namespace em::Proc
         }
     };
 
+    namespace detail
+    {
+        struct SettingsStorage
+        {
+            Settings settings;
+            std::atomic<Settings *> ptr = &settings;
+        };
+
+        [[nodiscard]] inline SettingsStorage &GlobalSettingsStorage()
+        {
+            static SettingsStorage ret;
+            return ret;
+        }
+    }
+
     // Returns the global library settings that you can modify. You should set them before the first use of the library.
     //
     // By default, this library will change some process-wide platform-specific settings to sane values.
@@ -344,13 +359,25 @@ namespace em::Proc
     //
     // The library checks each flag exactly once, when it needs it. After that it can't be changed.
     //
-    // If you use this library from multiple DLLs (possibly in a header included in multiple DLLs), each DLL will have its own copy of the settings, and will try to apply them again for itself too, even if another one already did.
+    // If you use this library from multiple DLLs (possibly in a header included in multiple DLLs), each DLL will have its own copy of the settings (always true on Windows,
+    //   true elsewhere if you passed `-fvisibility-inlines-hidden` in addition to `-fvisibility=hidden`, which is a good idea).
+    // So the other DLL will try to apply the settings again for itself too, even if another DLL already did.
     // But the underlying settings are process-wide, not DLL-wide, so make sure you set the flags to the same values in every DLL to get sane behavior.
-    // (A false flag does nothing instead of undoing the process-wide changes, so if the settings are not consistent across DLLs, those process-wide settings should converge on the OR of the flags across DLLs.)
+    // A false flag does nothing instead of undoing the process-wide changes, so if the settings are not consistent across DLLs, those process-wide settings should converge on the OR of the flags across DLLs.
+    //
+    // You can use `SetGlobalSettingsPtr()` to merge those settings across DLLs, for more sanity. See below.
     [[nodiscard]] inline Settings &GlobalSettings()
     {
-        static Settings ret;
-        return ret;
+        return *detail::GlobalSettingsStorage().ptr.load(std::memory_order_acquire);
+    }
+
+    // Makes `GlobalSettings()` point elsewhere. Great for merging settings structs across DLLs. If given null, restores the default location.
+    // This should really only point to global variables (the default storage used by `GlobalSettings()` counts as one). If not, you're risking a data race,
+    //   since another thread can still use the old struct for a while after you change the pointer.
+    inline void SetGlobalSettingsPtr(Settings *ptr)
+    {
+        detail::SettingsStorage &storage = detail::GlobalSettingsStorage();
+        storage.ptr.store(ptr ? ptr : &storage.settings, std::memory_order_release);
     }
 
 
