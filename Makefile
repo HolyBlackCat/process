@@ -23,8 +23,14 @@ override define lf :=
 $(strip)
 $(strip)
 endef
+
+# Runs a shell command and checks for errors, returns the output.
 override safe_shell = $(shell $1)$(if $(filter-out 0,$(.SHELLSTATUS)),$(error Command failed with code $(.SHELLSTATUS):$(lf)$1$(lf)))
+# Same, but returs nothing.
 override safe_shell_exec = $(call,$(call safe_shell,$1))
+
+# `\r` literally on Windows (the escape sequence, not literal CR), empty string elsewhere.
+override maybe_cr := $(if $(WINDOWS),\r)
 
 override quote = '$(subst ','"'"',$1)'
 
@@ -85,7 +91,8 @@ test_file_io: $(call exe_name,file_io)
 
 	# Write with params:
 
-	for params_mode in params params_struct; do \
+	# Need `set -e` to correctly detect errors in subcommands.
+	set -e && for params_mode in params params_struct; do \
 		for existing in keep overwrite error; do \
 			for allow_creating in 0 1; do \
 				for flags in "" no_append; do \
@@ -135,26 +142,26 @@ test_redirects: $(call exe_name,redirects) $(call exe_name,simple_io)
 
 	# * Null input.
 	$< null inherit inherit $(call exe_name,simple_io) >$(stdout) 2>$(stderr)
-	diff $(stdout) <(echo 'stdout[]')
-	diff $(stderr) <(echo 'stderr[]')
+	diff $(stdout) <(echo -e 'stdout[]$(maybe_cr)')
+	diff $(stderr) <(echo -e 'stderr[]$(maybe_cr)')
 
 	# * Inherited input.
 	echo -n blah | $< inherit inherit inherit $(call exe_name,simple_io) >$(stdout) 2>$(stderr)
-	diff $(stdout) <(echo 'stdout[blah]')
-	diff $(stderr) <(echo 'stderr[blah]')
+	diff $(stdout) <(echo -e 'stdout[blah]$(maybe_cr)')
+	diff $(stderr) <(echo -e 'stderr[blah]$(maybe_cr)')
 
 	echo -n bleh >$(TEST_DIR)/in.txt
 
 	# * File name input.
 	$< file $(TEST_DIR)/in.txt inherit inherit $(call exe_name,simple_io) >$(stdout) 2>$(stderr)
-	diff $(stdout) <(echo 'stdout[bleh]')
-	diff $(stderr) <(echo 'stderr[bleh]')
+	diff $(stdout) <(echo -e 'stdout[bleh]$(maybe_cr)')
+	diff $(stderr) <(echo -e 'stderr[bleh]$(maybe_cr)')
 
 	# * File stream input.
 	echo -n bleh >$(TEST_DIR)/in.txt
 	$< file_stream $(TEST_DIR)/in.txt inherit inherit $(call exe_name,simple_io) >$(stdout) 2>$(stderr)
-	diff $(stdout) <(echo 'stdout[bleh]')
-	diff $(stderr) <(echo 'stderr[bleh]')
+	diff $(stdout) <(echo -e 'stdout[bleh]$(maybe_cr)')
+	diff $(stderr) <(echo -e 'stderr[bleh]$(maybe_cr)')
 
 	# Output:
 
@@ -163,10 +170,10 @@ test_redirects: $(call exe_name,redirects) $(call exe_name,simple_io)
 	#   * Null stdout.
 	$< null null inherit $(call exe_name,simple_io) >$(stdout) 2>$(stderr)
 	diff $(stdout) <(true)
-	diff $(stderr) <(echo 'stderr[]')
+	diff $(stderr) <(echo -e 'stderr[]$(maybe_cr)')
 	#   * Null stderr.
 	$< null inherit null $(call exe_name,simple_io) >$(stdout) 2>$(stderr)
-	diff $(stdout) <(echo 'stdout[]')
+	diff $(stdout) <(echo -e 'stdout[]$(maybe_cr)')
 	diff $(stderr) <(true)
 
 	#   * Null stdout with stderr merged.
@@ -181,35 +188,36 @@ test_redirects: $(call exe_name,redirects) $(call exe_name,simple_io)
 
 	# * File:
 
-	for file_method in file file_stream file_desc; do \
+	# Need `set -e` to correctly detect errors in subcommands.
+	set -e && for file_method in file file_stream file_desc; do \
 		echo '------ Method:' $$file_method; \
 		echo '--- File stdout.'; \
 		rm $(TEST_DIR)/out.txt; \
 		$< null $$file_method $(TEST_DIR)/out.txt inherit $(call exe_name,simple_io) >$(stdout) 2>$(stderr); \
 		diff $(stdout) <(true); \
-		diff $(stderr) <(echo 'stderr[]'); \
-		diff $(TEST_DIR)/out.txt <(echo 'stdout[]'); \
+		diff $(stderr) <(echo -e 'stderr[]$(maybe_cr)'); \
+		diff $(TEST_DIR)/out.txt <(echo -e 'stdout[]$(maybe_cr)'); \
 		\
 		echo '--- File stderr.'; \
 		rm $(TEST_DIR)/out.txt; \
 		$< null inherit $$file_method $(TEST_DIR)/out.txt $(call exe_name,simple_io) >$(stdout) 2>$(stderr); \
-		diff $(stdout) <(echo 'stdout[]'); \
+		diff $(stdout) <(echo -e 'stdout[]$(maybe_cr)'); \
 		diff $(stderr) <(true); \
-		diff $(TEST_DIR)/out.txt <(echo 'stderr[]'); \
+		diff $(TEST_DIR)/out.txt <(echo -e 'stderr[]$(maybe_cr)'); \
 		\
 		echo '--- File stdout with stderr merged.'; \
 		rm $(TEST_DIR)/out.txt; \
 		$< null $$file_method $(TEST_DIR)/out.txt merge $(call exe_name,simple_io) >$(stdout) 2>$(stderr); \
 		diff $(stdout) <(true); \
 		diff $(stderr) <(true); \
-		diff $(TEST_DIR)/out.txt <(echo -e 'stdout[]\nstderr[]'); \
+		diff $(TEST_DIR)/out.txt <(echo -e 'stdout[]$(maybe_cr)\nstderr[]$(maybe_cr)'); \
 		\
 		echo '--- File stderr with stdout merged.'; \
 		rm $(TEST_DIR)/out.txt; \
 		$< null merge $$file_method $(TEST_DIR)/out.txt $(call exe_name,simple_io) >$(stdout) 2>$(stderr); \
 		diff $(stdout) <(true); \
 		diff $(stderr) <(true); \
-		diff $(TEST_DIR)/out.txt <(echo -e 'stdout[]\nstderr[]'); \
+		diff $(TEST_DIR)/out.txt <(echo -e 'stdout[]$(maybe_cr)\nstderr[]$(maybe_cr)'); \
 	done
 
 ifneq ($(WINDOWS),)
