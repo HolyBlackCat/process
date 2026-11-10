@@ -153,8 +153,8 @@ int main(int argc, char **argv)
             if (io_result != em::Proc::IoResult::ok)
                 break;
         }
-        if (io_result != em::Proc::IoResult::end_reached)
-            throw std::runtime_error(std::string("`ReadUnbuffered()` stopped with a status other than `end_reached`: `") + em::Proc::to_string(io_result) + "`.");
+        if (io_result != em::Proc::IoResult::end_of_stream)
+            throw std::runtime_error(std::string("`ReadUnbuffered()` stopped with a status other than `end_of_stream`: `") + em::Proc::to_string(io_result) + "`.");
         if (pos != arg.size())
             throw std::runtime_error("`ReadUnbuffered()` read " + std::to_string(pos) + " characters, but expected " + std::to_string(arg.size()) + ".");
         value.resize(arg.size()); // Trim the dummy last character.
@@ -174,8 +174,8 @@ int main(int argc, char **argv)
         std::size_t pos = 0;
         em::Proc::IoResult io_result = is_write ? out.WriteUnbuffered({null_buf ? nullptr : buf, 0}, pos) : in.ReadUnbuffered({null_buf ? nullptr : buf, 0}, pos);
 
-        if (io_result != em::Proc::IoResult::no_data)
-            throw std::runtime_error(std::string("Expected acting on zero bytes to set the result to `no_data`, but got `") + em::Proc::to_string(io_result) + "`.");
+        if (io_result != em::Proc::IoResult::end_of_buffer)
+            throw std::runtime_error(std::string("Expected acting on zero bytes to set the result to `end_of_buffer`, but got `") + em::Proc::to_string(io_result) + "`.");
         if (pos != 0)
             throw std::runtime_error("Expected acting on zero bytes to not advance the position, but it got set to " + std::to_string(pos) + ".");
     }

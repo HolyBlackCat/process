@@ -1,10 +1,12 @@
+// Starts the specified program with the specified IO redirects. Supports all kinds of redirects other than pipes.
+//
+// Usage:
+//     redirects {null,inherit,{file,file_stream} __} {null,inherit,merge,{file,file_stream} __}x2 argv...
+//               stdin                                stdout, stderr                               the program to run
+
 #include <em/process.hpp>
 
 #include <stdexcept>
-
-// Usage:
-//     redirects {null,inherit,{file,file_stream} __} {null,inherit,merge,{file,file_stream} __}x2
-//               stdin                                stdout, stderr
 
 int main(int argc, char **argv)
 {

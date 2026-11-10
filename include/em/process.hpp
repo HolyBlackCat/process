@@ -10,6 +10,7 @@
 #include <initializer_list>
 #include <map>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <string_view>
 #include <string>
@@ -63,7 +64,7 @@
 
 #ifndef _WIN32
 
-// MacOS version checks BS.
+// MacOS version checking BS.
 #ifdef __APPLE__
 
 // Do we have `__builtin_available`? Should be true on Clang and false on GCC.
@@ -175,6 +176,19 @@
 
 
 #endif // POSIX
+
+
+// We emulate `.resize_and_overwrite()` on vectors by directly poking their size member. For that we need to know its offset inside of the vector, which happens to be the same on the big 3 standard libraries (it's the middle pointer).
+// When the vector has an allocator, different standard libraries diverge on where they put it (before or after the pointers). We don't use this macro with non-empty allocators.
+// Since we only increment/decrement the value, in theory we can even work with vector ABI that stores size instead of a pointer (libc++ was planning to do that behind a macro).
+// `EM_PROC_STD_VECTOR_SIZE_MEMBER_OFFSET` is this offset in multiples of pointer size, or `-1` to opt out of this trick.
+#ifndef EM_PROC_STD_VECTOR_SIZE_MEMBER_OFFSET
+#  if defined(_GLIBCXX_RELEASE) || defined(_LIBCPP_VERSION) || defined(_MSVC_STL_VERSION)
+#    define EM_PROC_STD_VECTOR_SIZE_MEMBER_OFFSET 1
+#  else
+#    define EM_PROC_STD_VECTOR_SIZE_MEMBER_OFFSET -1 // Disable.
+#  endif
+#endif
 
 
 #ifdef _WIN32
@@ -556,6 +570,11 @@ namespace em::Proc
         Overload(P...) -> Overload<P...>; // Keep this for older compilers, just in case.
 
 
+        // Template arguments after `Deduce...` can't be specified by the user and must be deduced.
+        template <typename>
+        concept Deduce = false;
+
+
         // Returns the array size for `argv`-style arrays.
         // If `ptr` is null, returns zero.
         [[nodiscard]] inline std::size_t PtrArraySize(const auto *const *ptr)
@@ -851,6 +870,9 @@ namespace em::Proc
             [[nodiscard]] StringPtrArray(const Char *const *ptr)
                 : StringPtrArray(PtrArraySize(ptr), [&](std::size_t i){return ptr[i];})
             {}
+            [[nodiscard]] StringPtrArray(const Char *const *ptr, std::size_t size)
+                : StringPtrArray(size, [&](std::size_t i){return ptr[i];})
+            {}
 
             [[nodiscard]] StringPtrArray(TagNonOwning, const Char *const *ptr)
                 : ptr_override(ptr)
@@ -1013,6 +1035,149 @@ namespace em::Proc
         #endif
     };
 
+
+    // A contiguous container of bytes, to which more bytes can be inserted.
+    // Not asking for it being contiguous, we don't strictly need that. (We have optimized insertion methods for vectors and strings.)
+    template <typename T>
+    concept ByteContainer =
+        std::ranges::random_access_range<T> &&
+        std::ranges::sized_range<T> &&
+        std::is_same_v<T, std::remove_cvref_t<T>> && // Cvref-unqualified.
+        // The element type:
+        (
+            // Either a single byte integer, cv-unqualified.
+            (
+                std::is_integral_v<std::ranges::range_value_t<T>> &&
+                sizeof(std::ranges::range_value_t<T>) == 1 &&
+                std::is_same_v<std::ranges::range_value_t<T>, std::remove_cv_t<std::ranges::range_value_t<T>>> // Cv-unqualified.
+            ) ||
+            // Or `std::byte` (also cv-unqualified).
+            std::is_same_v<T, std::byte>
+        ) &&
+        // Can insert elements:
+        // For now I'm deliberately not checking the whole interface for modifying the container, don't mind possible hard errors too much.
+        requires(T &t, std::ranges::range_value_t<T> *p){t.insert(t.end(), p, p);};
+
+    namespace detail
+    {
+        // Does this type have `.resize_and_overwrite()`, like `std::string` does?
+        template <typename T>
+        concept CanResizeAndOverwrite = requires(T &t){t.resize_and_overwrite(std::size_t{}, [](std::ranges::range_value_t<T> *, std::size_t) -> std::size_t {return {};});};
+
+        // Is `T` a `std::vector` with a relatively sane allocator? We use this when deciding if we can manipulate the vector, along with `EM_PROC_STD_VECTOR_SIZE_MEMBER_OFFSET`.
+        // We only allow empty allocators (because the layout of non-empty ones depends on stdlib, I can't be bothered) that don't use fancy pointers (in theory I could manipulate the fancy ones too, but it's easier to not bother).
+        template <typename T>
+        constexpr bool is_std_vector_with_sane_allocator = false;
+        template <typename T, typename A>
+        requires
+            std::is_empty_v<A> &&
+            // Check that the pointers are not fancy.
+            std::is_same_v<T *, typename std::allocator_traits<A>::pointer> &&
+            std::is_same_v<const T *, typename std::allocator_traits<A>::const_pointer>
+        constexpr bool is_std_vector_with_sane_allocator<std::vector<T, A>> = true;
+
+        // How much we add to the capacity by default when growing a container.
+        template <ByteContainer T>
+        [[nodiscard]] constexpr std::size_t DefaultAddedCapacity(std::size_t current_capacity)
+        {
+            static constexpr std::size_t min_capacity = []{
+
+                if constexpr (std::is_same_v<T, std::string>)
+                {
+                    constexpr std::size_t ret = T{}.capacity(); // This returns the SSO capacity on all 3 big standard libraries. Works even at compile-time.
+                    static_assert(ret > 0);
+                    return ret;
+                }
+                else
+                {
+                    return 64; // Arbitrary.
+                }
+            }();
+
+            if (current_capacity < (min_capacity + 1) / 2)
+                return min_capacity; // Not bothering to subtract `current_capacity`.
+
+            // Arbitrary grow factor.
+            // Note that this is added to the existing capacity, so no `* 2`.
+            return current_capacity;
+        }
+    }
+
+    static constexpr std::size_t default_stack_buffer_size = 2048;
+
+    // Inserts some bytes to a container, as returned by a `read()`-like function. In-place if possible.
+    // `container` must be a random-access container of bytes (so of integral types of size 1, or of `std::byte`).
+    // `func` is `(char *ptr, std::size_t n) -> std::size_t`. It's called once, given a byte buffer of size `n` (see below for how `n` is computed).
+    // `func` must return how many bytes it actually filled, between `0` and `n` inclusive.
+    // Those bytes are appended to `container`.
+    // `added_capacity_hint` and `StackBufferHint` are hints for the buffer size.
+    // `added_capacity_hint` can be 0, then it's guessed automatically.
+    // If `container` is contiguous and we're able to increase its capacity without initializing the elements, we grow it by `added_capacity_hint` (and the container itself may decide to grow more than requested),
+    //   and then write bytes to it in-place.
+    // For strings this is done via `.resize_and_overwrite()`, and for vectors we patch the internal representation (see `EM_PROC_STD_VECTOR_SIZE_MEMBER_OFFSET`).
+    // And if we're not able to do this, we use a stack buffer of size `StackBufferHint` and copy the contents to the container.
+    // This function is somewhat similar to `std::string::resize_and_overwrite()`, but also works for other containers that don't normally support that (e.g. vectors), and the interface is slightly different.
+    template <std::size_t StackBufferHint = default_stack_buffer_size, detail::Deduce..., ByteContainer T>
+    constexpr void AppendAndOverwrite(T &container, std::size_t added_capacity_hint, auto &&func)
+    {
+        // Computes `added_capacity_hint` if it's missing.
+        auto ComputeAddedCapacityHint = [&]
+        {
+            if (added_capacity_hint == 0)
+                added_capacity_hint = detail::DefaultAddedCapacity<T>(container.capacity());
+        };
+
+        if constexpr (detail::CanResizeAndOverwrite<T>)
+        {
+            ComputeAddedCapacityHint();
+
+            std::size_t size = container.size();
+            container.resize_and_overwrite(size + added_capacity_hint, [&](std::ranges::range_value_t<T> *ptr, std::size_t count)
+            {
+                // It's UB to throw from this callback, but doing the whole `std::exception_ptr` gymnastics would be dumb and slow.
+                // Instead just pretend that the result is unspecified, not UB.
+
+                assert(count == size + added_capacity_hint);
+
+                // `ptr` originally points to the entire container, and the returned value must be the total size, not new one.
+                // A C-style cast for constexpr-friendliness. Not that it matters.
+                std::size_t bytes_written = decltype(func)(func)((char *)ptr + size, count - size);
+                assert(bytes_written <= count);
+
+                return bytes_written + size;
+            });
+        }
+        #if EM_PROC_STD_VECTOR_SIZE_MEMBER_OFFSET >= 0
+        else if constexpr (detail::is_std_vector_with_sane_allocator<T>)
+        {
+            ComputeAddedCapacityHint();
+
+            std::size_t size = container.size();
+            container.reserve(size + added_capacity_hint);
+            std::size_t added_capacity = container.capacity() - size;
+            std::size_t bytes_written = decltype(func)(func)(reinterpret_cast<char *>(container.data()) + size, added_capacity);
+            assert(bytes_written <= added_capacity);
+
+            std::ranges::range_value_t<T> *&size_ptr = *reinterpret_cast<std::ranges::range_value_t<T> **>(reinterpret_cast<char *>(&container) + EM_PROC_STD_VECTOR_SIZE_MEMBER_OFFSET * sizeof(void *));
+            size_ptr += bytes_written;
+        }
+        #endif
+        else
+        {
+            #if __has_cpp_attribute(indeterminate)
+            [[indeterminate]] // Make sure `buffer` is actually uninitialized in C++26 and newer.
+            #endif
+            char buffer[StackBufferHint]; // Intentionally left uninitialized.
+
+            std::size_t bytes_written = decltype(func)(func)(buffer, StackBufferHint);
+            assert(bytes_written <= StackBufferHint);
+
+            // Could use `.append_range()`, but not sure if it's any better.
+            container.insert(container.end(), buffer, buffer + bytes_written);
+        }
+    }
+
+
     // Explains the result of a read or write operation.
     enum class IoResult
     {
@@ -1020,17 +1185,18 @@ namespace em::Proc
         // This is the only result that increases `pos`, and it always increases it.
         ok,
 
-        // No data available to read, or no space left to write. Try again later.
+        // Can't read or write right now, try again later.
         // This should only happen for non-blocking streams.
+        // On pipe read, this means the the other end hasn't produced new data yet. On pipe write, this means the pipe buffer is full and the other end needs to read from it.
         retry_later,
+
+        // You passed zero bytes, nothing to do.
+        end_of_buffer,
 
         // Nothing more to read.
         // For a pipe, this means the remote end is closed. For a file, this is EOF.
         // For files this can only happen on read, but for pipes it can happen on both reads and writes.
-        end_reached,
-
-        // You passed zero bytes, nothing to do.
-        no_data,
+        end_of_stream,
 
         // Something broke, call `ErrorMessage()` on the stream for more details.
         error,
@@ -1040,11 +1206,11 @@ namespace em::Proc
     {
         switch (result)
         {
-            case IoResult::ok:          return "ok";
-            case IoResult::retry_later: return "retry_later";
-            case IoResult::end_reached: return "end_reached";
-            case IoResult::no_data:     return "no_data";
-            case IoResult::error:       return "error";
+            case IoResult::ok:            return "ok";
+            case IoResult::retry_later:   return "retry_later";
+            case IoResult::end_of_buffer: return "end_of_buffer";
+            case IoResult::end_of_stream: return "end_of_stream";
+            case IoResult::error:         return "error";
         }
         assert(false && "Invalid enum.");
         return "??";
@@ -1187,7 +1353,7 @@ namespace em::Proc
             // Note that `pos == data.size()` is a valid no-op, but `pos > data.size()` is an assert (and a no-op in release builds).
             assert(pos <= data.size());
             if (pos >= data.size())
-                return IoResult::no_data;
+                return IoResult::end_of_buffer;
 
             std::size_t remaining_size = data.size() - pos;
 
@@ -1226,7 +1392,7 @@ namespace em::Proc
                     error == ERROR_HANDLE_EOF
                 )
                 {
-                    return IoResult::end_reached;
+                    return IoResult::end_of_stream;
                 }
 
                 // Surely an error at this point.
@@ -1239,7 +1405,7 @@ namespace em::Proc
                 // Yes, this is a bit weird, but this is how `ReadFile()` normally reports it, apparently.
                 // The WinAPI docs claim that `ok == true && processed_size == 0` can also happen on a read end of a pipe when the other end calls `WriteFile()` with length 0,
                 //   but LLM-assisted testing shows that it's only the case for message-mode pipes, not our regular byte-mode pipes (tried writing first and then reading, and tried blocking a read first, and then writing from another thread).
-                return IoResult::end_reached;
+                return IoResult::end_of_stream;
             }
 
             assert(std::size_t(processed_size) <= remaining_size);
@@ -1291,7 +1457,7 @@ namespace em::Proc
                 if constexpr (!Read)
                 {
                     if (errno_copy == EPIPE)
-                        return IoResult::end_reached;
+                        return IoResult::end_of_stream;
                 }
 
                 // Surely an error at this point.
@@ -1302,7 +1468,7 @@ namespace em::Proc
             // EOF.
             // We already ensured earlier that this is only possible if `Read == true`.
             if (result == 0)
-                return IoResult::end_reached;
+                return IoResult::end_of_stream;
 
             // Success.
             // `result` is always positive at this point.
@@ -1469,6 +1635,23 @@ namespace em::Proc
         [[nodiscard]] IoResult ReadUnbuffered(std::span<char> data, std::size_t &pos)
         {
             return ReadOrWriteUnbuffered<true>(data, pos);
+        }
+
+        // This version appends the data to the byte container `data`, which is usually a `std::string` or a `std::vector<char/unsigned char/std::byte/etc>`.
+        // It can't have the same name as `ReadUnbuffered()`, because they have similar parameter types.
+        // `added_capacity_hint` is how much to grow the container capacity by, if we're able to read bytes into it in-place. If we can't read in-place,
+        //   then we use a stack buffer of size `StackBufferHint` (both are same as in `AppendAndOverwrite()`).
+        template <std::size_t StackBufferHint = default_stack_buffer_size, detail::Deduce...>
+        [[nodiscard]] IoResult ReadUnbufferedAppend(ByteContainer auto &data, std::size_t added_capacity_hint = 0)
+        {
+            IoResult ret = IoResult::error;
+            (AppendAndOverwrite<StackBufferHint>)(data, added_capacity_hint, [&](char *ptr, std::size_t n)
+            {
+                std::size_t bytes_read = 0;
+                ret = ReadUnbuffered({ptr, n}, bytes_read);
+                return bytes_read;
+            });
+            return ret;
         }
     };
 
@@ -2434,27 +2617,41 @@ namespace em::Proc
 
         // Produces a windows-style environemtn string by concating `env[i]` into a `\0`-separated list, with `\0\0` at the end.
         // NOTE: Some places in this library bypass this function to generate the env string. This is unlike `AssembleCommandLine()`, which is used for all Windows command lines (that don't come as a single string).
-        template <typename Char>
-        [[nodiscard]] std::basic_string<Char> AssembleEnvironmentFromPtr(const Char *const *env)
+        template <bool ExplicitSize, typename Char>
+        [[nodiscard]] std::basic_string<Char> AssembleEnvironmentFromPtr(const Char *const *env, std::conditional_t<ExplicitSize, std::size_t, std::nullptr_t> size)
         {
-            if (!env)
-                return {};
+            // Not calculating the resulting string size in advance because I don't want to `strlen()` every element.
 
-            // Not calculating the size in advance because I don't want to `strlen()` every element.
             std::basic_string<Char> ret;
-            while (*env)
+
+            if (!env)
+                return ret;
+
+            auto AddVariable = [&]
             {
                 if (!**env)
                 {
                     // If the string is empty, it would normally cause the rest of the strings to be ignored, since `\0\0` is the terminator.
-                    // Instead we manually discard it here.
+                    // Instead we assert and skip it here.
                     assert(false && "Empty string in an environment array.");
                     env++;
-                    continue;
+                    return; // Skip.
                 }
 
                 ret += *env++;
                 ret += '\0'; // Intentional even after the last element. We want `\0\0` at the end.
+            };
+
+
+            if constexpr (ExplicitSize)
+            {
+                for (std::size_t i = 0; i < size; i++)
+                    AddVariable();
+            }
+            else
+            {
+                while (*env)
+                    AddVariable();
             }
 
             return ret;
@@ -2842,6 +3039,17 @@ namespace em::Proc
             resulting_executable = std::move(executable);
             #endif
         }
+        // From `argv`, with an explicit size instead of requiring the null terminator.
+        [[nodiscard]] Command(const char *const *argv, std::size_t argc, std::optional<MaybeOwningString> executable = {}, Extras extras = DefaultExtras())
+        {
+            #ifdef _WIN32
+            detail_InitCommand_Win(executable, extras, argc, [&](std::size_t i) {return argv[i];});
+            #else
+            (void)extras;
+            resulting_command = {argv, argc};
+            resulting_executable = std::move(executable);
+            #endif
+        }
 
         // This version doesn't copy `argv` on POSIX, make sure it doesn't dangle until the process starts.
         // Note, the `executable` is narrow here to match `argv`. This is to simplify our implementation, since the command line is assembled narrow here,
@@ -3048,36 +3256,19 @@ namespace em::Proc
         // Passing null here means no variables.
         [[nodiscard]] Environment(const char *const *env_vars, EncodingMode encoding = EncodingMode::relaxed)
         {
-            #ifdef _WIN32
-            if (env_vars)
-            {
-                bool success = false;
-                resulting_env = ConvertString_Win(detail::AssembleEnvironmentFromPtr(env_vars), encoding == EncodingMode::error ? &success : nullptr);
-                if (encoding == EncodingMode::error && !success)
-                    error_string = "Encoding error.";
-            }
-            #else
-            (void)encoding;
+            SetFromMaybeSizedPtrArray<false>(env_vars, nullptr, encoding);
+        }
 
-            // Validate that all variables have `=` in them.
-            if (env_vars)
-            {
-                for (auto copy = env_vars; *copy; copy++)
-                {
-                    if (std::string_view(*copy).find('=') == std::string_view::npos)
-                    {
-                        error_string = "Missing `=` in environment variable.";
-                        return;
-                    }
-                }
-            }
-
-            resulting_env = env_vars;
-            #endif
+        // This version copies the strings, and uses an explicit size (so the array doesn't need to be null-terminated).
+        // Passing null here means no variables.
+        [[nodiscard]] Environment(const char *const *env_vars, std::size_t num_env_vars, EncodingMode encoding = EncodingMode::relaxed)
+        {
+            SetFromMaybeSizedPtrArray<true>(env_vars, num_env_vars, encoding);
         }
 
         // This version doesn't copy the strings on POSIX, so make sure they don't dangle.
         // Passing null here means no variables.
+        // There's no non-owning version that takes a size, the array is required to be null-terminated for this one.
         [[nodiscard]] Environment(TagNonOwning, const char *const *env_vars, EncodingMode encoding = EncodingMode::relaxed)
         #ifdef _WIN32
             : Environment(env_vars, encoding)
@@ -3101,7 +3292,12 @@ namespace em::Proc
         // Windows special: From pointer array. Copies the contents, never dangles.
         [[nodiscard]] Environment(TagWindowsOnly, const wchar_t *const *env_vars)
         {
-            resulting_env = detail::AssembleEnvironmentFromPtr(env_vars);
+            resulting_env = detail::AssembleEnvironmentFromPtr<false>(env_vars, nullptr);
+        }
+        // Windows special: From pointer array with an explicit size. Copies the contents, never dangles.
+        [[nodiscard]] Environment(TagWindowsOnly, const wchar_t *const *env_vars, std::size_t num_env_vars)
+        {
+            resulting_env = detail::AssembleEnvironmentFromPtr<true>(env_vars, num_env_vars);
         }
         #endif
 
@@ -3122,6 +3318,54 @@ namespace em::Proc
         #endif
 
       private:
+        template <bool ExplicitSize>
+        void SetFromMaybeSizedPtrArray(const char *const *env_vars, std::conditional_t<ExplicitSize, std::size_t, std::nullptr_t> num_env_vars, EncodingMode encoding)
+        {
+            #ifdef _WIN32
+            if (env_vars)
+            {
+                bool success = false;
+                resulting_env = ConvertString_Win(detail::AssembleEnvironmentFromPtr<ExplicitSize>(env_vars, num_env_vars), encoding == EncodingMode::error ? &success : nullptr);
+                if (encoding == EncodingMode::error && !success)
+                    error_string = "Encoding error.";
+            }
+            #else
+            (void)encoding;
+
+            // Validate that all variables have `=` in them.
+            auto CheckVariable = [&](const char *var)
+            {
+                if (std::string_view(var).find('=') == std::string_view::npos)
+                {
+                    error_string = "Missing `=` in environment variable.";
+                    return;
+                }
+            };
+
+            if constexpr (ExplicitSize)
+            {
+                if (env_vars)
+                {
+                    for (std::size_t i = 0; i < num_env_vars; i++)
+                        CheckVariable(env_vars[i]);
+                }
+
+                resulting_env = {env_vars, num_env_vars};
+            }
+            else
+            {
+                if (env_vars)
+                {
+                    for (auto copy = env_vars; *copy; copy++)
+                        CheckVariable(*copy);
+                }
+
+                resulting_env = env_vars;
+            }
+
+            #endif
+        }
+
         #ifdef _WIN32
         std::optional<MaybeOwningNativeString> resulting_env;
         #else

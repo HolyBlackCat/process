@@ -9,7 +9,7 @@ override WINDOWS := $(filter-out 0,$(WINDOWS))
 
 EXT_EXE := $(if $(WINDOWS),.exe)
 
-EXECUTABLES := file_io redirects simple_io
+EXECUTABLES := file_io redirects simple_io scripted_io scripted_pipes
 # Converts a name of one of the text executables (one of `EXECUTABLES`) to a path to it.
 override exe_name = $(OUTPUT_DIR)/$1$(EXT_EXE)
 
@@ -29,7 +29,7 @@ override safe_shell = $(shell $1)$(if $(filter-out 0,$(.SHELLSTATUS)),$(error Co
 # Same, but returs nothing.
 override safe_shell_exec = $(call,$(call safe_shell,$1))
 
-# `\r` literally on Windows (the escape sequence, not literal CR), empty string elsewhere.
+# `\r` literally on Windows (the escape sequence, not the CR character), empty string elsewhere.
 override maybe_cr := $(if $(WINDOWS),\r)
 
 override quote = '$(subst ','"'"',$1)'
@@ -220,6 +220,27 @@ test_redirects: $(call exe_name,redirects) $(call exe_name,simple_io)
 		diff $(TEST_DIR)/out.txt <(echo -e 'stdout[]$(maybe_cr)\nstderr[]$(maybe_cr)'); \
 	done
 
+.PHONY: test_pipes
+test_pipes: $(call exe_name,scripted_pipes) $(call exe_name,scripted_io)
+	# stdin:
+	# * Write then read.
+	$< pipe_stdin -- $(call exe_name,scripted_io) wait 100 read Hello -- write Hello end_of_buffer
+	# * Blocking read, then write.
+	$< pipe_stdin -- $(call exe_name,scripted_io) read Hello -- wait 100 write Hello end_of_buffer
+	# * Closing stdin.
+	$< pipe_stdin -- $(call exe_name,scripted_io) read Hello read_fails -- write Hello end_of_buffer close_write_pipe
+	# * Writing into a closed stdin.
+# 	$< pipe_stdin -- $(call exe_name,scripted_io) -- wait 100 write Hello end_of_buffer
+
+	# stdout:
+	# * Write then read.
+	$< pipe_stdout -- $(call exe_name,scripted_io) write Hello -- wait 100 read Hello end_of_buffer read . end_of_stream
+	# * Blocking read, then write.
+	$< pipe_stdout -- $(call exe_name,scripted_io) wait 100 write Hello -- read Hello end_of_buffer read . end_of_stream
+	# * Closing stdout.
+	$< pipe_stdout -- $(call exe_name,scripted_io) write Hello wait 100 write_fails -- read Hello end_of_buffer close_read_pipe expect_crash
+
+
 ifneq ($(WINDOWS),)
 .PHONY: test_win_arg_escaping
 test_win_arg_escaping: $(call exe_name,win_arg_escaping)
@@ -228,7 +249,7 @@ endif
 
 # Build the test executables.
 $(foreach x,$(EXECUTABLES),$(eval\
-$(call exe_name,$x): test/$x.cpp | $(OUTPUT_DIR)/ ; $(CXX) $(FLAGS) $$< -o $$@ \
+$(call exe_name,$x): test/$x.cpp include/em/process.hpp | $(OUTPUT_DIR)/ ; $(CXX) $(FLAGS) $$< -o $$@ \
 ))
 
 # Create any directory.
