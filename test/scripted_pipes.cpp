@@ -9,9 +9,12 @@
 // * `write data status` - writes `data`, then checks that the status equals `status`,
 //     which is a `IoResult` enum, one of: `retry_later`, `end_of_buffer`, `end_of_stream`, `error`.
 //     Passing status `ok` makes no sense, since we loop while it's `ok`.
+//     If `data` is a string `long`, then instead passes a long string designed to fill a pipe buffer.
 // * `read data status` - same, but for reads. This is affected by `use_stdout`/`use_stderr`.
-// * `close_write_pipe` - closes the pipe that attaches to `stdin`.
-// * `close_read_pipe` - closes the pipe that attaches to `stdout` or `stderr`, depending on `use_stdout`/`use_stderr`.
+// * `close_write_pipe` - closes the pipe that's attached to `stdin`.
+// * `close_read_pipe` - closes the pipe that's attached to `stdout` or `stderr` (depending on `use_stdout`/`use_stderr`)
+// * `nonblocking_writes` - makes the pipe that's attached to `stdin` non-blocking.
+// * `nonblocking_reads` - makes the pipe that's attached to `stdout` or `stderr` non-blocking (depending on `use_stdout`/`use_stderr`).
 // * `expect_crash` - expect the subprocess to not exit successfully. This check is done at the end of the program, rather than immediately.
 
 #include <em/process.hpp>
@@ -95,6 +98,21 @@ int main(int argc, char **argv)
     {
         std::string_view action = ConsumeArg();
 
+        // If `s == "long"`, replaces it with a long string, same string every time.
+        // Sync this with `scripted_io.cpp`.
+        auto ReplaceLongString = [](std::string &s)
+        {
+            if (s == "long")
+            {
+                for (std::size_t i = 0; i < 15000; i++)
+                {
+                    if (i > 0)
+                        s += ' ';
+                    s += std::to_string(i);
+                }
+            }
+        };
+
         if (action == "wait")
         {
             std::string_view delay = ConsumeArg();
@@ -114,6 +132,7 @@ int main(int argc, char **argv)
         else if (action == "write")
         {
             std::string data(ConsumeArg());
+            ReplaceLongString(data);
             std::size_t pos = 0;
             em::Proc::IoResult status;
             while ((status = pipe_stdin.WriteUnbuffered(data, pos)) == em::Proc::IoResult::ok) {}
@@ -125,6 +144,7 @@ int main(int argc, char **argv)
         else if (action == "read")
         {
             std::string expected_data(ConsumeArg());
+            ReplaceLongString(expected_data);
             std::string data(expected_data.size(), '\0');
             std::size_t pos = 0;
             em::Proc::IoResult status;
@@ -146,13 +166,21 @@ int main(int argc, char **argv)
         {
             (use_stderr ? pipe_stderr : pipe_stdout) = {};
         }
+        else if (action == "nonblocking_writes")
+        {
+            pipe_stdin.SetBlocking(false);
+        }
+        else if (action == "nonblocking_reads")
+        {
+            (use_stderr ? pipe_stderr : pipe_stdout).SetBlocking(false);
+        }
         else if (action == "expect_crash")
         {
             proc_will_crash = true;
         }
         else
         {
-            throw std::runtime_error("Bad command, got `" + std::string(action) + "` but expected one of: `wait N`, `use_stdout`, `use_stderr`, `write data status`, `read data status`, `close_write_pipe`, `close_read_pipe`, `expect_crash`.");
+            throw std::runtime_error("Bad command, got `" + std::string(action) + "` but expected one of: `wait N`, `use_stdout`, `use_stderr`, `write data status`, `read data status`, `close_write_pipe`, `close_read_pipe`, `nonblocking_writes`, `nonblocking_reads`, `expect_crash`.");
         }
     }
 

@@ -49,6 +49,7 @@
 #include <cstring> // For `std::strerror()`.
 #include <dirent.h>
 #include <fcntl.h> // For `fcntl()`.
+#include <signal.h> // For `sigaction()`.
 #include <spawn.h> // For `posix_spawn()` and friends.
 #include <sys/types.h> // For `pid_t`.
 #include <sys/wait.h> // For `waitpid()`.
@@ -167,13 +168,19 @@
 // Can we access `/proc/self/fd`?
 // Incorrectly setting this to true is not an issue. If this is true and `/proc/self/fd` fails to open, we fall back to another approach.
 #ifndef EM_PROC_HAVE_PROC_SELF_FD
-#  ifndef __APPLE__
-#    define EM_PROC_HAVE_PROC_SELF_FD 1
-#  else
+#  ifdef __APPLE__
 #    define EM_PROC_HAVE_PROC_SELF_FD 0
+#  else
+#    define EM_PROC_HAVE_PROC_SELF_FD 1
 #  endif
 #endif
 
+
+// Do we have `sa_sigaction` field in `struct sigaction`.
+// Seems to normally be true. But I see the field being `#ifdef`ed in the header, so in theory it could be missing. I don't feel like replicating the glibc condition that uses their internal macros.
+#ifndef EM_PROC_HAVE_SA_SIGACTION
+#  define EM_PROC_HAVE_SA_SIGACTION 1
+#endif
 
 #endif // POSIX
 
@@ -334,6 +341,10 @@ namespace em::Proc
         // Calling that prevents some implicit error messageboxes from being displayed (mainly when opening files?), and instead just reports the errors to the application.
         // SDL sets this temporarily for opening files, but since this is process-wide, I think I'd rather do it once.
         Flag disable_error_messageboxes_win = true;
+        #else
+        // If true, we set SIGPIPE handling to ignore, unless it's already set to something else.
+        // This prevents a crash (receiving SIGPIPE) when writing to a pipe that's closed from the other end. On Windows, it doesn't crash by default.
+        Flag ignore_sigpipe = true;
         #endif
 
         // Sets all the flags to false, to opt out of this library touching any process-wide settings.
@@ -1222,12 +1233,17 @@ namespace em::Proc
       public:
         #ifdef _WIN32
         using handle_t = HANDLE;
-        // There's some weirdness with what counts as a valid handle. `INVALID_HANDLE_VALUE` is basically `(HANDLE)-1`, but `nullptr` also seems to be invalid. Using `INVALID_HANDLE_VALUE` seems better to me.
-        // Also this can't be constexpr! D:<
-        inline static const handle_t invalid_handle = INVALID_HANDLE_VALUE;
+        // There's some weirdness with what counts as a valid handle. `INVALID_HANDLE_VALUE` is basically `(HANDLE)-1`, but `nullptr` also seems to be invalid.
+        // We normalize the value in the constructors, to force it to be `invalid_handle` for both values.
+        // The reason I prefer `nullptr` is because when setting standard stream for a new process, passing null acts as a null stream, but passing `INVALID_HANDLE_VALUE` is an error.
+        // If we reverse this, this needs to be documented on `GetStd{in,out,err}Stream()`, and also do the adjustment to null when creating the process.
+        // Also `INVALID_HANDLE_VALUE` isn't constexpr (since it casts `-1` to a pointer) and `nullptr` is, which doesn't actually do much, but feels nice.
+        static constexpr handle_t invalid_handle = nullptr;
+        inline const static handle_t secondary_invalid_handle = INVALID_HANDLE_VALUE; // Not constexpr, ugh.
         #else
         using handle_t = int;
         static constexpr handle_t invalid_handle = -1; // `0` is stdin.
+        static constexpr handle_t secondary_invalid_handle = -1; // Same as `invalid_handle` on POSIX.
         #endif
 
       private:
@@ -1258,8 +1274,8 @@ namespace em::Proc
 
             #if _WIN32
             // On Windows, null is also an invalid handle, in addition to `INVALID_HANDLE_VALUE` which is `(HANDLE)-1`.
-            // Instead of expanding `operator bool` to check that, I'd rather adjust it here.
-            if (state.handle == nullptr)
+            // I'd rather normalize the handles here, than expand `operator bool` to check both values.
+            if (state.handle == secondary_invalid_handle)
                 state.handle = invalid_handle;
             #endif
         }
@@ -1282,16 +1298,7 @@ namespace em::Proc
         ~BasicIoStream()
         {
             if (state.owns_handle)
-            {
-                // Don't care about the error message at this point.
-                #ifdef _WIN32
-                [[maybe_unused]] bool ok = CloseHandle(state.handle); // Unlike POSIX `close()`, this returns non-zero on success.
-                assert(ok);
-                #else
-                [[maybe_unused]] bool ok = close(state.handle) == 0;
-                assert(ok);
-                #endif
-            }
+                CloseLow(false);
         }
 
         [[nodiscard]] explicit operator bool() const
@@ -1316,6 +1323,13 @@ namespace em::Proc
         [[nodiscard]] handle_t Handle() const {return state.handle;}
         [[nodiscard]] bool IsOwning() const {return state.owns_handle;}
 
+        // Closes the handle. The destructor does this too (but only for owning handles).
+        // Returns true on success, but either way this instance is made null. Stores an error message on failure.
+        bool Close()
+        {
+            return CloseLow(true);
+        }
+
         // Returns the current handle, and then releases ownership of it, if any, and resets this instance to null.
         // It's then your job to free it.
         [[nodiscard]] handle_t ReleaseHandle_Unsafe() &&
@@ -1334,6 +1348,31 @@ namespace em::Proc
         }
 
       protected:
+        bool CloseLow(bool store_error)
+        {
+            if (store_error ? StoreErrorIfNull() : !*this)
+                return false;
+
+            #ifdef _WIN32
+            bool ok = CloseHandle(state.handle); // Unlike POSIX `close()`, this returns non-zero on success.
+            if (!ok && store_error)
+            {
+                *this = {error_message, "`CloseHandle()` failed: " + detail::WinApiErrorToString(GetLastError())};
+                return false;
+            }
+            #else
+            bool ok = close(state.handle) == 0;
+            if (!ok && store_error)
+            {
+                *this = {error_message, std::string("`close()` failed: ") + std::strerror(errno) + '.'};
+                return false;
+            }
+            #endif
+            state.handle = invalid_handle;
+            state.owns_handle = false;
+            return true;
+        }
+
         // Perform a read or write.
         // On failure, resets the handle to null so you don't miss the error.
         // Don't call this on the async streams on POSIX.
@@ -1375,20 +1414,24 @@ namespace em::Proc
             {
                 auto error = GetLastError();
 
-                // Should retry later?
                 if (error == ERROR_NO_DATA)
                 {
-                    // This better not happen randomly on blocking pipes. It shouldn't.
-                    return IoResult::retry_later;
+                    // Specifically on write ends of pipes this means EOF. Why?!
+                    // This better not happen randomly on blocking read pipes. It shouldn't.
+                    return Read ? IoResult::retry_later : IoResult::end_of_stream;
                 }
 
                 // EOF or pipe disconnected?
                 if (
-                    // Mostly certain about this:
+                    // Mostly certain about this. But this should only happen on reads, since writes get `ERROR_NO_DATA`, which is handled above.
                     error == ERROR_BROKEN_PIPE ||
-                    // Less certain about this:
+                    // Apparently this happens when the server side of the pipe (a concept from named pipes, idk which end is the server on anonymous pipes, Claude thinks it should be the read end)
+                    //   kicks the client from the pipe using `DisconnectNamedPipe()`, which keeps the server end alive and ready to accept more connections.
+                    // So for us this normally doesn't happen, but still nice to have it.
+                    // Also notably this discards the contents of the pipe buffer. Though a well-behaved server can use `FlushFileBuffers()` to wait until the buffer is empty and only then kick the client.
+                    // I'm not 100% sure if this should be `end_of_stream` or an error. I think `end_of_stream` is better.
                     error == ERROR_PIPE_NOT_CONNECTED ||
-                    // This normally shouldn't happen, since EOFs seem to be reported by `ReadFile()` returning true (success) and setting `processed_size == 0`.
+                    // This normally shouldn't happen, since EOFs seem to be reported by `ReadFile()` returning true (success) and setting `processed_size == 0`. Maybe can happen for async operations?
                     error == ERROR_HANDLE_EOF
                 )
                 {
@@ -1401,11 +1444,12 @@ namespace em::Proc
             }
             else if (processed_size == 0)
             {
-                // EOF.
+                // For reads, this is EOF.
                 // Yes, this is a bit weird, but this is how `ReadFile()` normally reports it, apparently.
                 // The WinAPI docs claim that `ok == true && processed_size == 0` can also happen on a read end of a pipe when the other end calls `WriteFile()` with length 0,
                 //   but LLM-assisted testing shows that it's only the case for message-mode pipes, not our regular byte-mode pipes (tried writing first and then reading, and tried blocking a read first, and then writing from another thread).
-                return IoResult::end_of_stream;
+                // For writes, this supposedly indicates the pipe buffer being full.
+                return Read ? IoResult::end_of_stream : IoResult::retry_later;
             }
 
             assert(std::size_t(processed_size) <= remaining_size);
@@ -1567,6 +1611,43 @@ namespace em::Proc
             }
 
             return true;
+            #endif
+        }
+
+        // Checks whether the stream is blocking. Should default to true.
+        // This asks the underlying API, we don't cache the blocking-ness.
+        // Returns null on error, then check `ErrorMessage()` for the error message.
+        [[nodiscard]] std::optional<bool> GetBlocking()
+        {
+            if (StoreErrorIfNull())
+                return false;
+
+            #ifdef _WIN32
+
+            DWORD mode = 0;
+            if (!GetNamedPipeHandleStateW(Handle(), &mode, nullptr, nullptr, nullptr, nullptr, 0))
+            {
+                // Don't reset the instance to null, unlike what `SetBlocking()` does. Unlike that one, this shouldn't cause any misuse.
+                error_string = "`GetNamedPipeHandleStateW()` failed: " + detail::WinApiErrorToString(GetLastError());
+                return {};
+            }
+
+            return !(mode & PIPE_NOWAIT);
+
+            #else
+
+            // Note `F_{GET,SET}FL`, as opposed to `F_{GET,SET}FD`, which is a different thing.
+
+            // Read existing flags.
+            int flags = fcntl(Handle(), F_GETFL);
+            if (flags == -1)
+            {
+                error_string = std::string("`fcntl(F_GETFL)` failed: ") + std::strerror(errno) + '.';
+                return {};
+            }
+
+            return !(flags & O_NONBLOCK);
+
             #endif
         }
 
@@ -1739,6 +1820,53 @@ namespace em::Proc
             return true;
             #endif
         }
+
+        #ifndef _WIN32
+        // Check if the signal handler is set to `handler`. Get `sa` from `sigaction()`.
+        inline bool SignalHandlerIsEqualTo(const struct sigaction &sa, sighandler_t handler)
+        {
+            // In theory, `sa.sa_flags & SA_SIGINFO` dispatches between `sa_sigaction` and `sa_handler`.
+            // Setting `sa_sigaction` to `SIG_DFL` is sketchy, but SDL checks for this, so we do too (they check both and ignore `sa.sa_flags & SA_SIGINFO`, but having the condition looks better to me).
+            // But also notably on both Linux and Mac those two function pointers are in a union, so are the exact same pointer (so the flag check should get optimized out).
+            // Also interestingly `sa_handler` and `sa_sigaction` are macros for me (on both Linux and Mac), apparently to avoid relying on anonymous unions (which are C11/C++-only).
+            return
+                #if EM_PROC_HAVE_SA_SIGACTION
+                sa.sa_flags & SA_SIGINFO ? sa.sa_sigaction == (decltype(sa.sa_sigaction))(void *)(handler) :
+                #endif
+                sa.sa_handler == handler;
+        }
+
+        // If the SIGPIPE handler is set to default, instead set it to ignore.
+        // Returns null on success, or an error message on failure.
+        // This function will do this every time it's called. You probably want to call it only once, though repeated calls are not harmful.
+        inline std::optional<std::string> IgnoreSigpipeIfDefaulted()
+        {
+            struct sigaction old_sa{}; // Ha, need `struct`.
+            [[maybe_unused]] int status = sigaction(SIGPIPE, nullptr, &old_sa);
+            if (status != 0)
+                return std::string("`sigaction(SIGPIPE)` failed to get the current signal handler: ") + std::strerror(errno) + "`.";
+
+            if (SignalHandlerIsEqualTo(old_sa, SIG_DFL))
+            {
+                if (signal(SIGPIPE, SIG_IGN) == SIG_ERR)
+                    return std::string("`signal(SIGPIPE, SIG_IGN)` failed: ") + std::strerror(errno) + "`.";
+            }
+
+            return {};
+        }
+
+        // Calls `IgnoreSigpipeIfDefaulted()` once and caches the result. If `GlobalSettings().ignore_sigpipe == false` on the first call, then does nothing and returns null on this and future calls.
+        inline const std::optional<std::string> &MaybeIgnoreSigpipeOnceIfDefaulted()
+        {
+            static const std::optional<std::string> ret = []{
+                std::optional<std::string> result;
+                if (GlobalSettings().ignore_sigpipe.Consume())
+                    result = IgnoreSigpipeIfDefaulted();
+                return result;
+            }();
+            return ret;
+        }
+        #endif
     }
 
     template <typename T>
@@ -1790,6 +1918,15 @@ namespace em::Proc
         }
 
         #else
+        // Ignore sigpipe if the settings allow it. We need to do it somewhere, and doing it on write sounds wasteful, so do it here.
+        // Hopeflly the user doesn't bring their own pipe, bypassing this function.
+        if (auto error = detail::MaybeIgnoreSigpipeOnceIfDefaulted())
+        {
+            read = {error_message, *error};
+            write = {error_message, *error};
+            return false;
+        }
+
         BasicIoStream::handle_t read_write_handles[2] = {BasicIoStream::invalid_handle, BasicIoStream::invalid_handle};
 
         bool pipe2_missing = false;
@@ -1820,13 +1957,11 @@ namespace em::Proc
         #endif
 
         // Adjust individual inheritability if needed.
-        if (
-            bool(read_inheritable) != bool(write_inheritable)
-            #ifndef _WIN32
-            || pipe2_missing
-            #endif
-        )
+        #ifndef _WIN32
+        if (pipe2_missing)
         {
+            // If there is no `pipe2()`, then both handles start inheritable, and we might need to disable that.
+
             if (!bool(read_inheritable))
             {
                 read.SetInheritable(Inherit::no);
@@ -1846,6 +1981,38 @@ namespace em::Proc
                     // Copy the error message to the other handle.
                     read = {error_message, write.ErrorMessage()};
                     return false;
+                }
+            }
+        }
+        else
+        #endif
+        {
+            // Braces to make clang-tidy happy about the indentation.
+
+            if (bool(read_inheritable) != bool(write_inheritable))
+            {
+                // One handle is inheritable and the other isn't, so we created both of them not inheritable by default, and now need to make one inheritable.
+
+                if (bool(read_inheritable))
+                {
+                    read.SetInheritable(Inherit::always);
+                    if (read.HasError())
+                    {
+                        // Copy the error message to the other handle.
+                        write = {error_message, read.ErrorMessage()};
+                        return false;
+                    }
+                }
+
+                if (bool(write_inheritable))
+                {
+                    write.SetInheritable(Inherit::always);
+                    if (write.HasError())
+                    {
+                        // Copy the error message to the other handle.
+                        read = {error_message, write.ErrorMessage()};
+                        return false;
+                    }
                 }
             }
         }
@@ -2128,6 +2295,72 @@ namespace em::Proc
     {
         OutputStream ret;
         OpenFile(ret, std::move(desc.filename), inheritable, desc.allow_creating, desc.existing, desc.flags);
+        return ret;
+    }
+
+
+    namespace detail
+    {
+        #ifdef _WIN32
+        enum class StdStreamKind : DWORD
+        {
+            in = STD_INPUT_HANDLE,
+            out = STD_OUTPUT_HANDLE,
+            err = STD_ERROR_HANDLE,
+        };
+        #else
+        enum class StdStreamKind
+        {
+            in = STDIN_FILENO,
+            out = STDOUT_FILENO,
+            err = STDERR_FILENO,
+        };
+        #endif
+
+        [[nodiscard]] inline BasicIoStream GetStdStream(StdStreamKind kind)
+        {
+            #ifdef _WIN32
+            HANDLE handle = GetStdHandle(DWORD(kind));
+            if (handle == INVALID_HANDLE_VALUE)
+            {
+                const char *kind_name = nullptr;
+                switch (kind)
+                {
+                    case StdStreamKind(STD_INPUT_HANDLE):  kind_name = "STD_INPUT_HANDLE"; break;
+                    case StdStreamKind(STD_OUTPUT_HANDLE): kind_name = "STD_OUTPUT_HANDLE"; break;
+                    case StdStreamKind(STD_ERROR_HANDLE):  kind_name = "STD_ERROR_HANDLE"; break;
+                }
+
+                return {error_message, std::string("`GetStdHandle(") + kind_name + ")` failed: " + detail::WinApiErrorToString(GetLastError())};
+            }
+
+            return {non_owning, handle};
+            #else
+            return {non_owning, BasicIoStream::handle_t(kind)};
+            #endif
+        }
+    }
+
+    // Get handles to standard IO streams. Those are non-owning handles.
+    // You can get an error if something goes wrong. You can get null if the stream is not open.
+    // You shouldn't use those as IO redirections for subprocesses (use `em::Proc::inherit` instead).
+
+    [[nodiscard]] inline InputStream GetStdinStream()
+    {
+        InputStream ret;
+        ret.BasicIoStream::operator=(detail::GetStdStream(detail::StdStreamKind::in));
+        return ret;
+    }
+    [[nodiscard]] inline OutputStream GetStdoutStream()
+    {
+        OutputStream ret;
+        ret.BasicIoStream::operator=(detail::GetStdStream(detail::StdStreamKind::out));
+        return ret;
+    }
+    [[nodiscard]] inline OutputStream GetStderrStream()
+    {
+        OutputStream ret;
+        ret.BasicIoStream::operator=(detail::GetStdStream(detail::StdStreamKind::err));
         return ret;
     }
 
@@ -2939,6 +3172,9 @@ namespace em::Proc
         ExitReason(Var var) : var(std::move(var)) {}
     };
 
+    // If you're going to assemble command in a vector, use this type and then move it into `Command`.
+    using CommandVec = std::vector<MaybeOwningNativeString>;
+
     // A part of parameters of a process. Stores the command line of a process being created.
     class Command : public StoresErrorMessage
     {
@@ -2998,11 +3234,11 @@ namespace em::Proc
             : Command(std::span(argv), std::move(executable), std::move(extras))
         {}
         // A vector version for consistency with POSIX.
-        [[nodiscard]] Command(const std::vector<MaybeOwningNativeString> &argv, std::optional<MaybeOwningNativeString> executable = {}, Extras extras = DefaultExtras())
+        [[nodiscard]] Command(const CommandVec &argv, std::optional<MaybeOwningNativeString> executable = {}, Extras extras = DefaultExtras())
             : Command(std::span(argv), std::move(executable), std::move(extras))
         {}
         #else
-        [[nodiscard]] Command(std::vector<MaybeOwningNativeString> argv, std::optional<MaybeOwningNativeString> executable = {}, Extras extras = DefaultExtras())
+        [[nodiscard]] Command(CommandVec argv, std::optional<MaybeOwningNativeString> executable = {}, Extras extras = DefaultExtras())
         {
             (void)extras;
             resulting_command = std::move(argv);
@@ -3563,15 +3799,15 @@ namespace em::Proc
                     },
                     [&](TagInherit)
                     {
-                        HANDLE handle = GetStdHandle(STD_INPUT_HANDLE);
-                        if (handle == INVALID_HANDLE_VALUE)
+                        InputStream stream = GetStdinStream();
+                        if (stream.HasError())
                         {
-                            error_string = "`GetStdHandle(STD_INPUT_HANDLE)` failed: " + detail::WinApiErrorToString(GetLastError());
+                            error_string = "Failed to inherit `stdin`: " + stream.ErrorMessage();
                             return true;
                         }
 
-                        // This handle can still be null. In that case we just pass that as is. (Even though this constructor converts null to `INVALID_HANDLE_VALUE`, we convert that back when passing it.)
-                        state.stdin_stream = {non_owning, handle};
+                        // This handle can still be null, in that case we just pass that as is.
+                        state.stdin_stream = std::move(stream);
                         return false;
                     },
                     [&](MaybeOwningNativeString &&elem)
@@ -3622,15 +3858,15 @@ namespace em::Proc
                         },
                         [&](TagInherit)
                         {
-                            HANDLE handle = GetStdHandle(is_stderr ? STD_ERROR_HANDLE : STD_OUTPUT_HANDLE);
-                            if (handle == INVALID_HANDLE_VALUE)
+                            OutputStream stream = is_stderr ? GetStderrStream() : GetStdoutStream();
+                            if (stream.HasError())
                             {
-                                error_string = std::string("`GetStdHandle(") + (is_stderr ? "STD_ERROR_HANDLE" : "STD_OUTPUT_HANDLE") + ")` failed: " + detail::WinApiErrorToString(GetLastError());
+                                error_string = std::string("Failed to inherit `") + stream_name + "`: " + stream.ErrorMessage();
                                 return true;
                             }
 
-                            // This handle can still be null. In that case we just pass that as is. (Even though this constructor converts null to `INVALID_HANDLE_VALUE`, we convert that back when passing it.)
-                            target_field = {non_owning, handle};
+                            // This handle can still be null, in that case we just pass that as is.
+                            target_field = std::move(stream);
                             return false;
                         },
                         [&](TagMergeOutput)
@@ -4143,20 +4379,17 @@ namespace em::Proc
 
         [[nodiscard]] BasicIoStream::handle_t ResultingStdinHandle_Win() const
         {
-            // By default those would return `INVALID_HANDLE_VALUE` when null, which isn't what we want, because the subprocess would apparently receive the same invalid handle.
-            // While passing `NULL` may sometimes cause the child to allocate its own console. (All that is Claude is to be trusted.)
+            // Those streams being `NULL` may sometimes cause the child to allocate its own console (if Claude is to be trusted).
             // It shouldn't happen often, though, as when the user requests a null stream, we pass an opened handle to `\\.\NUL` instead. An actual `NULL` would only happen if we try to inherit the parent stream and it's null.
-            return state.stdin_stream ? state.stdin_stream.Handle() : nullptr;
+            return state.stdin_stream.Handle();
         }
-
         [[nodiscard]] BasicIoStream::handle_t ResultingStdoutHandle_Win() const
         {
-            return state.stdout_stream ? state.stdout_stream.Handle() : nullptr;
+            return state.stdout_stream.Handle();
         }
-
         [[nodiscard]] BasicIoStream::handle_t ResultingStderrHandle_Win() const
         {
-            return state.stderr_stream ? state.stderr_stream.Handle() : nullptr;
+            return state.stderr_stream.Handle();
         }
         #else
         [[nodiscard]] const posix_spawn_file_actions_t *ResultingFileActions_Posix() const
@@ -4337,7 +4570,9 @@ namespace em::Proc
                 true, // Inherit handles.
                 CREATE_UNICODE_ENVIRONMENT |
                     // Randomly stumbled upon this flag, seems helpful.
-                    (CREATE_NEW_PROCESS_GROUP * misc.ShouldDetach()),
+                    (CREATE_NEW_PROCESS_GROUP * misc.ShouldDetach()) |
+                    // Why is this not inferred from the value of `cb` I have no idea.
+                    (EXTENDED_STARTUPINFO_PRESENT * (startup_info.StartupInfo.cb == sizeof(startup_info))),
                 // It's mildly sus that `env_ptr` needs a `const_cast`. The function parameter is of type `void *`. Unlike for the command line, the documentation (at https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw)
                 //   doesn't say that the environment is clobbered, so I think the `const_cast` is fine.
                 const_cast<wchar_t *>(env.ResultingEnvironment_Win()),

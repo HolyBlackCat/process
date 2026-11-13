@@ -46,6 +46,8 @@ Tests:
 
 * Interrupting processes
 
+* Do something if the user passes `GetStdinStream()` (or stdout or stderr) as a redirection. Probably rewrite to `inherit` if possible? Then adjust the comment that says not to use them as redirects too.
+
 Maybe later:
 
 * Test what happens if parent dies before child on Windows and on POSIX. Do we need to configure that?

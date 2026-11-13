@@ -3,23 +3,22 @@
 
 int main(int, char **argv)
 {
-    struct Guard
-    {
-        ~Guard() {std::cout << "End!\n";}
-    };
-    Guard guard;
+    em::Proc::OutputStream out;
 
     em::Proc::Params params;
     params.command = argv + 1;
+    em::Proc::MakePipe(out, params.stdin_stream, em::Proc::Inherit::always);
 
-    std::cout << "Begin!\n";
     em::Proc::Process proc = std::move(params);
-    if (proc.HasError())
-    {
-        std::cout << "Failed: " << proc.ErrorMessage() << '\n';
-        return 1;
-    }
-    std::cout << "...\n";
+    proc.ThrowError();
+
+    std::string data = "Hello!";
+    std::size_t pos = 0;
+    em::Proc::IoResult r;
+    while ((r = out.WriteUnbuffered(data, pos)) == em::Proc::IoResult::ok) {}
+    std::cout << "Wrote " << pos << " bytes: " << to_string(r) << '\n';
+    out = {};
     proc.BlockUntilExit();
-    std::cout << proc.ExitReason().value().ToString() << '\n';
+    proc.ThrowError();
+    proc.ExitReason()->ThrowError();
 }

@@ -3,8 +3,10 @@
 // * `wait N` - waits this many milliseconds.
 // * `use_stdout`, `use_stderr` - select what stream is used for subsequent write operations. Defaults to stdout.
 // * `write ...` - writes the specified string, checks that the write was successful.
+//     If the string is literally `long`, then instead uses a specific long string that's larger than a pipe buffer.
 // * `write_fails` - writes one byte and checks that it fails.
 // * `read ...` - reads the amount of characters equal to the size of the specified string, and checks that the read was successful and the result equals to that string.
+//     If the expected string is literally `long`, then instead uses a specific long string that's larger than a pipe buffer.
 // * `read_fails` - reads one byte and checks that it fails.
 
 #include <algorithm>
@@ -22,6 +24,21 @@ int main(int argc, char **argv)
         if (!*argv)
             throw std::runtime_error("Not enough arguments.");
         return std::string_view(*argv++);
+    };
+
+    // If `s == "long"`, replaces it with a long string, same string every time.
+    // Sync this with `scripted_pipes.cpp`.
+    auto ReplaceLongString = [](std::string &s)
+    {
+        if (s == "long")
+        {
+            for (std::size_t i = 0; i < 15000; i++)
+            {
+                if (i > 0)
+                    s += ' ';
+                s += std::to_string(i);
+            }
+        }
     };
 
     bool use_stderr = false;
@@ -48,7 +65,9 @@ int main(int argc, char **argv)
         }
         else if (action == "write")
         {
-            if (!((use_stderr ? std::clog : std::cout) << ConsumeArg() << std::flush))
+            std::string str(ConsumeArg());
+            ReplaceLongString(str);
+            if (!((use_stderr ? std::clog : std::cout) << str << std::flush))
                 throw std::runtime_error("`write` operation failed.");
         }
         else if (action == "write_fails")
@@ -58,7 +77,8 @@ int main(int argc, char **argv)
         }
         else if (action == "read")
         {
-            std::string_view expected_str = ConsumeArg();
+            std::string expected_str(ConsumeArg());
+            ReplaceLongString(expected_str);
             std::string actual_str(expected_str.size(), ' ');
             if (!std::cin.read(actual_str.data(), std::streamsize(actual_str.size())))
                 throw std::runtime_error("`read` operation failed.");

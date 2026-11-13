@@ -37,9 +37,9 @@ override quote = '$(subst ','"'"',$1)'
 override rm_file = $(call safe_shell_exec,rm -f $(call quote,$(DUMMY_FILE)))
 
 
-
+# Don't forget to add all test targets here.
 .PHONY: test_all
-test_all: test_file_io test_redirects
+test_all: test_file_io test_redirects test_pipes
 
 ifneq ($(WINDOWS),)
 EXECUTABLES += win_arg_escaping
@@ -224,13 +224,17 @@ test_redirects: $(call exe_name,redirects) $(call exe_name,simple_io)
 test_pipes: $(call exe_name,scripted_pipes) $(call exe_name,scripted_io)
 	# stdin:
 	# * Write then read.
-	$< pipe_stdin -- $(call exe_name,scripted_io) wait 100 read Hello -- write Hello end_of_buffer
+	$< pipe_stdin -- $(call exe_name,scripted_io) wait 100 read Hello -- wait 50 write Hello end_of_buffer
 	# * Blocking read, then write.
 	$< pipe_stdin -- $(call exe_name,scripted_io) read Hello -- wait 100 write Hello end_of_buffer
 	# * Closing stdin.
 	$< pipe_stdin -- $(call exe_name,scripted_io) read Hello read_fails -- write Hello end_of_buffer close_write_pipe
 	# * Writing into a closed stdin.
-# 	$< pipe_stdin -- $(call exe_name,scripted_io) -- wait 100 write Hello end_of_buffer
+	$< pipe_stdin -- $(call exe_name,scripted_io) -- wait 100 write . end_of_stream
+	# * Filling the pipe buffer.
+	$< pipe_stdin -- $(call exe_name,scripted_io) wait 100 read long -- write long end_of_buffer
+	# * Filling the pipe buffer on a non-blocking pipe.
+	$< pipe_stdin -- $(call exe_name,scripted_io) wait 100 -- nonblocking_writes write long retry_later
 
 	# stdout:
 	# * Write then read.
