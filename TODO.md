@@ -1,26 +1,13 @@
 
-
-
-Pipes:
-
-* On POSIX:
-  * Recommend ignoring `SIGPIPE`. (sigaction?)
-  * Document not ignoring `SIGCHLD` because that would destroy every child handle before we can `waitpid` it. A custom handler is in theory possible, if you make sure to not destroy the handle.
-
-* On Windows:
-  * Can make pipes nonblocking with `PIPE_NOWAIT`.
-  * Must enable pipe inheritance with `HANDLE_FLAG_INHERIT`
+Pipes on Windows:
   * Must use a named pipe if at least one end is async
   * `PIPE_REJECT_REMOTE_CLIENTS` for named pipes?
   * For named pipes, create the read end with `CreateNamedPipe` and the write end with `CreateFile`.
     It seems to work both ways, but if someone wants to break our app, they could try to connect to the pipe themselves after `CreateNamedPipe` but before I do `CreateFile`, and it's apparently harder to do if `CreateNamedPipe` creates the read end, since the permissions to connect to the write end are harder to come by, at least if Claude is to be trusted.
     Use inline relaxed atomci as a counter, and also add the address of the atomic to the name in case there are multiple dlls.
-  * `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` to only inherit certain handles.
   * `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS` to only signal IOCP if the op was delayed.
 
-
-* Windows: a flag to hide the console
-
+* Windows: a flag to hide the console?
 
 * Async/polling:
 
@@ -35,18 +22,12 @@ Compilation tests:
 Tests:
     environment
     chdir
-    no_append vs default behavior on different systems
-    merging output streams: check both stdout and stderr
 
 * Test builds without exceptions.
 
 * Async waiting for process termination: jobs (with IOCP) on Windows, fdpid_open on Linux if supported and enabled, dummy pipes on POSIX otherwise
 
-* Separately report file not found when launching the process.
-
 * Interrupting processes
-
-* Do something if the user passes `GetStdinStream()` (or stdout or stderr) as a redirection. Probably rewrite to `inherit` if possible? Then adjust the comment that says not to use them as redirects too.
 
 Maybe later:
 

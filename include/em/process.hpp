@@ -342,9 +342,16 @@ namespace em::Proc
         // SDL sets this temporarily for opening files, but since this is process-wide, I think I'd rather do it once.
         Flag disable_error_messageboxes_win = true;
         #else
-        // If true, we set SIGPIPE handling to ignore, unless it's already set to something else.
-        // This prevents a crash (receiving SIGPIPE) when writing to a pipe that's closed from the other end. On Windows, it doesn't crash by default.
-        Flag ignore_sigpipe = true;
+        // If true, we set `SIGPIPE` handling to ignore, unless it's already set to something else.
+        // This prevents a crash (receiving SIGPIPE) when writing to a pipe that's closed from the other end. On Windows it never crashes.
+        Flag ignore_sigpipe_posix = true;
+        // If true, check that `SIGCHLD` is not set to automatically destroy handles of finished subprocesses (the handles being their PIDs that you need to close with `waitpid()`).
+        // It would do that if set to `SIG_IGN` or if flag `SA_NOCLDWAIT` is set for it.
+        // This is a best effort check, since you could set `SIGCHLD` to close the handles manually using `waitpid()` or whatever.
+        // We currently don't support operating with this `SIGCHLD` behavior (it closing the handles one way or another).
+        //   Adding the ability to release the handle from `Process` wouldn't be enough I think, since if e.g. the constructor of `Process` throws after starting the process
+        //   and before we had the chance to release the handle, it'll explode. We'd need a params flag to disable ownership, or infer it from the signal handler.
+        Flag check_sigchld_posix = true;
         #endif
 
         // Sets all the flags to false, to opt out of this library touching any process-wide settings.
@@ -355,6 +362,11 @@ namespace em::Proc
 
             #ifdef _WIN32
             if (!disable_error_messageboxes_win.Set(false))
+                ok = false;
+            #else
+            if (!ignore_sigpipe_posix.Set(false))
+                ok = false;
+            if (!check_sigchld_posix.Set(false))
                 ok = false;
             #endif
 
@@ -1855,13 +1867,43 @@ namespace em::Proc
             return {};
         }
 
-        // Calls `IgnoreSigpipeIfDefaulted()` once and caches the result. If `GlobalSettings().ignore_sigpipe == false` on the first call, then does nothing and returns null on this and future calls.
+        // Calls `IgnoreSigpipeIfDefaulted()` once and caches the result. If `GlobalSettings().ignore_sigpipe_posix == false` on the first call, then does nothing and returns null on this and future calls.
         inline const std::optional<std::string> &MaybeIgnoreSigpipeOnceIfDefaulted()
         {
             static const std::optional<std::string> ret = []{
                 std::optional<std::string> result;
-                if (GlobalSettings().ignore_sigpipe.Consume())
+                if (GlobalSettings().ignore_sigpipe_posix.Consume())
                     result = IgnoreSigpipeIfDefaulted();
+                return result;
+            }();
+            return ret;
+        }
+
+        // Check if the current behavior of `SIGCHLD`. If we don't like it, we return an error message. If we unable to perform the check, we also return an error message.
+        // If the check says `SIGCHLD` is fine, we return null.
+        inline std::optional<std::string> CheckSigchld()
+        {
+            struct sigaction sa{}; // Ha, need `struct`.
+            [[maybe_unused]] int status = sigaction(SIGCHLD, nullptr, &sa);
+            if (status != 0)
+                return std::string("`sigaction(SIGCHLD)` failed to get the current signal handler: ") + std::strerror(errno) + "`.";
+
+            if (sa.sa_flags & SA_NOCLDWAIT)
+                return "`SIGCHLD` has `SA_NOCLDWAIT` enabled, this is not supported.";
+
+            if (SignalHandlerIsEqualTo(sa, SIG_IGN))
+                return "`SIGCHLD` is set to `SIG_IGN`, this is not supported.";
+
+            return {};
+        }
+
+        // Calls `CheckSigchld()` once and caches the result. If `GlobalSettings().check_sigchld_posix == false` on the first call, then does nothing and returns null on this and future calls.
+        inline const std::optional<std::string> &MaybeCheckSigchldOnce()
+        {
+            static const std::optional<std::string> ret = []{
+                std::optional<std::string> result;
+                if (GlobalSettings().check_sigchld_posix.Consume())
+                    result = CheckSigchld();
                 return result;
             }();
             return ret;
@@ -1920,7 +1962,7 @@ namespace em::Proc
         #else
         // Ignore sigpipe if the settings allow it. We need to do it somewhere, and doing it on write sounds wasteful, so do it here.
         // Hopeflly the user doesn't bring their own pipe, bypassing this function.
-        if (auto error = detail::MaybeIgnoreSigpipeOnceIfDefaulted())
+        if (const auto &error = detail::MaybeIgnoreSigpipeOnceIfDefaulted())
         {
             read = {error_message, *error};
             write = {error_message, *error};
@@ -2343,7 +2385,8 @@ namespace em::Proc
 
     // Get handles to standard IO streams. Those are non-owning handles.
     // You can get an error if something goes wrong. You can get null if the stream is not open.
-    // You shouldn't use those as IO redirections for subprocesses (use `em::Proc::inherit` instead).
+    // Must not use those as IO redirections for subprocesses (use `em::Proc::inherit` or `em::Proc::merge_output` instead), we assert on that.
+    // Those are only there as a courtesy, in case you want to do IO on standard streams using our functions.
 
     [[nodiscard]] inline InputStream GetStdinStream()
     {
@@ -3770,6 +3813,21 @@ namespace em::Proc
                     }
                 }
 
+                // Complain if the user tries to pass `GetStdinStream()`/`GetStdoutStream()`/`GetStderrStream()` as a redirect.
+                // Since this requires WinAPI calls to check on Windows, it's only done in debug builds.
+                // Note `&& *opt` in the condition. If the user passes null and `Get__Stream()` also returns null, that's not an error.
+                assert([&]{auto opt = std::get_if<InputStream>(&params.stdin_stream); return !(opt && *opt && *opt == GetStdinStream());}());
+                // For output streams we check both ways. The redirects can't refer to the same streams, and to the other output streams.
+                assert([&]{
+                    auto opt_out = std::get_if<OutputStream>(&params.stdout_stream);
+                    auto opt_err = std::get_if<OutputStream>(&params.stderr_stream);
+                    auto std_out = GetStdoutStream();
+                    auto std_err = GetStderrStream();
+                    return
+                        !(opt_out && *opt_out && (*opt_out == std_out || *opt_out == std_err)) &&
+                        !(opt_err && *opt_err && (*opt_err == std_out || *opt_err == std_err));
+                }());
+
                 #ifdef _WIN32
 
                 // Stdin.
@@ -3963,6 +4021,26 @@ namespace em::Proc
                             // The docs say this always returns an error when querying the size, by design. So I'm not checking the return value.
                             InitializeProcThreadAttributeList(nullptr, attrs_capacity, 0, &ret);
                             assert(ret > 0);
+
+                            // If the value is more than we expected, log it.
+                            // Using `assert()` here to conditionally disable the logging. Not using `#ifndef NDEBUG` to make it easier to switch to a different assertion macro later if needed.
+                            assert([&]{
+                                if (ret > expected_attribute_list_byte_size)
+                                {
+                                    // Log this using our own IO, because why not. Ignore errors.
+                                    if (OutputStream err = GetStderrStream())
+                                    {
+                                        std::string message =
+                                            "`InitializeProcThreadAttributeList()` returned a larger value than expected on your machine (" + std::to_string(ret) + " vs " + std::to_string(expected_attribute_list_byte_size) + "). "
+                                            "Please report this to `https://github.com/HolyBlackCat/process`, including the numbers. "
+                                            "This is not a problem. Disable assertions to hide this message, or increase `expected_attribute_list_byte_size` in the library.\n";
+                                        std::size_t pos = 0;
+                                        while (err.WriteUnbuffered(message, pos) == IoResult::ok) {}
+                                    }
+                                }
+                                return true;
+                            }());
+
                             return ret;
                         }();
                         if (attribute_list_byte_size == 0)
@@ -3977,7 +4055,6 @@ namespace em::Proc
                         // If on this system `attribute_list_byte_size` is higher than expected, heap-allocate the thing, and also assert.
                         if (attribute_list_byte_size > expected_attribute_list_byte_size)
                         {
-                            assert(false && "`InitializeProcThreadAttributeList()` returns a larger value than expected on your Windows version, go bump `expected_attribute_list_byte_size` in the library and report this to me. This is not a bug.");
                             state.attribute_list_storage_ptr = std::make_unique<unsigned char[]>(attribute_list_byte_size);
                             attr_list = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(state.attribute_list_storage_ptr.get());
                         }
@@ -4400,7 +4477,6 @@ namespace em::Proc
         #endif
 
       private:
-
         #ifdef _WIN32
         // How many attributes should the attribute list support. Currently only one, the list of handles.
         static constexpr DWORD attrs_capacity = 1;
@@ -4595,6 +4671,13 @@ namespace em::Proc
                 state.process_handle = std::exchange(proc_info.value.hProcess, INVALID_HANDLE_VALUE);
 
             #else
+            // Check `SIGCHLD` if not disabled in the settings. Need to do it somewhere, why not here.
+            if (const auto &error = detail::MaybeCheckSigchldOnce())
+            {
+                error_string = *error;
+                return;
+            }
+
             // Note the `const_cast` here. It's needed because the POSIX API takes `char *const *` instead of `const char *const *`, because the C pointer conversion rules are more strict than the C++ ones,
             //   and they figured it would be more convenient. They don't actually modify those strings.
             // Similarly for `env_ptr` below.
