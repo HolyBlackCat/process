@@ -2383,10 +2383,13 @@ namespace em::Proc
         }
     }
 
+
     // Get handles to standard IO streams. Those are non-owning handles.
     // You can get an error if something goes wrong. You can get null if the stream is not open.
-    // Must not use those as IO redirections for subprocesses (use `em::Proc::inherit` or `em::Proc::merge_output` instead), we assert on that.
+    // Must not use those as IO redirects for subprocesses (use `em::Proc::inherit` or `em::Proc::merge_output` instead), we assert on that.
     // Those are only there as a courtesy, in case you want to do IO on standard streams using our functions.
+    // (Supporting using those are redirects on POSIX would be simple and cheap, they just return 0,1,2 there. But on Windows, we need the handles to be inheritable,
+    //   and they may not be, so we'd need to check for that and then conditionally clone them, which sounds annoying and adds extra WinAPI calls.)
 
     [[nodiscard]] inline InputStream GetStdinStream()
     {
@@ -2406,6 +2409,7 @@ namespace em::Proc
         ret.BasicIoStream::operator=(detail::GetStdStream(detail::StdStreamKind::err));
         return ret;
     }
+
 
     namespace detail
     {
@@ -2988,7 +2992,7 @@ namespace em::Proc
                 }
                 state.spawn_attr_alive = true;
 
-                { // Configure the signal mask for `POSIX_SPAWN_SETSIGMASK` below. See that for details.
+                { // Configure the signal mask for `POSIX_SPAWN_SETSIGMASK` below, filled with all zeroes. See that for details.
                     sigset_t new_sigmask{};
                     if (sigemptyset(&new_sigmask))
                     {
@@ -3004,10 +3008,27 @@ namespace em::Proc
                     }
                 }
 
+                { // Configure the signal mask for `POSIX_SPAWN_SETSIGDEF` below, filled with all ones. See that for details.
+                    sigset_t new_sigmask{};
+                    if (sigfillset(&new_sigmask))
+                    {
+                        error_string = std::string("`sigfillset()` failed: ") + std::strerror(errno) + '.';
+                        return;
+                    }
+
+                    // This seems to perform a deep copy, at least in glibc.
+                    if (int error = posix_spawnattr_setsigdefault(&state.spawn_attr, &new_sigmask))
+                    {
+                        error_string = std::string("`posix_spawnattr_setsigdefault()` failed: ") + std::strerror(error) + '.';
+                        return;
+                    }
+                }
+
                 // Set flags.
-                // `POSIX_SPAWN_SETSIGMASK` uses the mask we set with `posix_spawnattr_setsigmask` above.
+                // `POSIX_SPAWN_SETSIGMASK` uses the mask we set with `posix_spawnattr_setsigmask()` above.
                 //   We need this for two reasons. Firstly, general sanity. Secondly, for detached background processes we temporarily disable signals before forking, and this restores them.
-                // `POSIX_SPAWN_SETSIGDEF` resets the signal handling modes to the default values. Note that custom handlers seem to be detached automatically even without this.
+                // `POSIX_SPAWN_SETSIGDEF` resets the signal handling modes to the default values, for signals specified in `posix_spawnattr_setsigdefault()` above.
+                //   Note that custom handlers (as in function pointers specifically) seem to be replaced with default handlers automatically even without this.
                 if (int error = posix_spawnattr_setflags(&state.spawn_attr, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF))
                 {
                     error_string = std::string("`posix_spawnattr_setflags()` failed: ") + std::strerror(error) + '.';

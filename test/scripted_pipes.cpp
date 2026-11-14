@@ -93,7 +93,6 @@ int main(int argc, char **argv)
 
     // Evaluate the commands.
     bool use_stderr = false;
-    bool proc_will_crash = false;
     while (*argv)
     {
         std::string_view action = ConsumeArg();
@@ -174,26 +173,13 @@ int main(int argc, char **argv)
         {
             (use_stderr ? pipe_stderr : pipe_stdout).SetBlocking(false);
         }
-        else if (action == "expect_crash")
-        {
-            proc_will_crash = true;
-        }
         else
         {
-            throw std::runtime_error("Bad command, got `" + std::string(action) + "` but expected one of: `wait N`, `use_stdout`, `use_stderr`, `write data status`, `read data status`, `close_write_pipe`, `close_read_pipe`, `nonblocking_writes`, `nonblocking_reads`, `expect_crash`.");
+            throw std::runtime_error("Bad command, got `" + std::string(action) + "` but expected one of: `wait N`, `use_stdout`, `use_stderr`, `write data status`, `read data status`, `close_write_pipe`, `close_read_pipe`, `nonblocking_writes`, `nonblocking_reads`.");
         }
     }
 
     proc.BlockUntilExit();
     proc.ThrowError();
-
-    if (proc_will_crash)
-    {
-        if (proc.ExitReason()->Success())
-            throw std::runtime_error("Expected the subprocess to crash, but it didn't.");
-    }
-    else
-    {
-        proc.ExitReason()->ThrowError();
-    }
+    proc.ExitReason()->ThrowError();
 }

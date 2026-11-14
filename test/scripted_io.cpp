@@ -9,13 +9,21 @@
 //     If the expected string is literally `long`, then instead uses a specific long string that's larger than a pipe buffer.
 // * `read_fails` - reads one byte and checks that it fails.
 
+#include <em/process.hpp>
+
 #include <algorithm>
+#include <csignal>
 #include <iostream>
 #include <stdexcept>
 #include <thread>
 
 int main(int argc, char **argv)
 {
+    #ifndef _WIN32
+    // Don't crash when writing to a broken pipe on POSIX, to make the behavior consistent with Windows.
+    std::signal(SIGPIPE, SIG_IGN);
+    #endif
+
     (void)argc;
     argv++;
 

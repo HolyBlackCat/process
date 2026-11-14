@@ -241,8 +241,20 @@ test_pipes: $(call exe_name,scripted_pipes) $(call exe_name,scripted_io)
 	$< pipe_stdout -- $(call exe_name,scripted_io) write Hello -- wait 100 read Hello end_of_buffer read . end_of_stream
 	# * Blocking read, then write.
 	$< pipe_stdout -- $(call exe_name,scripted_io) wait 100 write Hello -- read Hello end_of_buffer read . end_of_stream
-	# * Closing stdout.
-	$< pipe_stdout -- $(call exe_name,scripted_io) write Hello wait 100 write_fails -- read Hello end_of_buffer close_read_pipe expect_crash
+	# * Non-blocking read with no input.
+	$< pipe_stdout -- $(call exe_name,scripted_io) wait 100 -- nonblocking_reads read . retry_later
+	# * Closing stdout. On POSIX this would crash if `scripted_io` didn't ignore `SIGPIPE`. We ignore it to make the results consistent with Windows.
+	$< pipe_stdout -- $(call exe_name,scripted_io) write Hello wait 100 write_fails -- read Hello end_of_buffer close_read_pipe
+
+	# stderr:
+	# * Write then read.
+	$< pipe_stderr -- $(call exe_name,scripted_io) use_stderr write Hello -- use_stderr wait 100 read Hello end_of_buffer read . end_of_stream
+	# * Blocking read, then write.
+	$< pipe_stderr -- $(call exe_name,scripted_io) use_stderr wait 100 write Hello -- use_stderr read Hello end_of_buffer read . end_of_stream
+	# * Non-blocking read with no input.
+	$< pipe_stderr -- $(call exe_name,scripted_io) use_stderr wait 100 -- use_stderr nonblocking_reads read . retry_later
+	# * Closing stderr. On POSIX this would crash if `scripted_io` didn't ignore `SIGPIPE`. We ignore it to make the results consistent with Windows.
+	$< pipe_stderr -- $(call exe_name,scripted_io) use_stderr write Hello wait 100 write_fails -- use_stderr read Hello end_of_buffer close_read_pipe
 
 
 ifneq ($(WINDOWS),)
