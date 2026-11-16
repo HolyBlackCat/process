@@ -343,7 +343,8 @@ namespace em::Proc
         Flag disable_error_messageboxes_win = true;
         #else
         // If true, we set `SIGPIPE` handling to ignore, unless it's already set to something else.
-        // This prevents a crash (receiving SIGPIPE) when writing to a pipe that's closed from the other end. On Windows it never crashes.
+        // This prevents a crash (receiving `SIGPIPE`) when writing to a pipe that's closed from the other end. Instead the write will report an error. This matches Windows behavior, where there is no `SIGPIPE`.
+        // Note that if your own standard output streams happen to be attached to pipes (because whatever ran your process did that), writing to them will also not crash, and will instead report a stream error to you.
         Flag ignore_sigpipe_posix = true;
         // If true, check that `SIGCHLD` is not set to automatically destroy handles of finished subprocesses (the handles being their PIDs that you need to close with `waitpid()`).
         // It would do that if set to `SIG_IGN` or if flag `SA_NOCLDWAIT` is set for it.
@@ -2142,14 +2143,18 @@ namespace em::Proc
     // Merge one output stream into the other. Usually you put this on `stderr` to merge it into `stdout`, and then attach a custom stream to `stdout`.
     inline constexpr TagMergeOutput merge_output{};
 
+    struct TagDefault {explicit TagDefault() = default;};
+    // Use the default stream redirection. Typically means `inherit`, but becomes null for detached proesses, see the comments on `stdin_stream`/`stdout_stream`/`stderr_stream` for more details.
+    inline constexpr TagDefault use_default{};
+
     // What to do with the input stream of a process.
     // `InputStream` is intentionally listed first, to make `= {}` submit a null stream.
-    using InputStreamAttachment = std::variant<InputStream, TagInherit, MaybeOwningNativeString>;
+    using InputStreamAttachment = std::variant<InputStream, TagDefault, TagInherit, MaybeOwningNativeString>;
 
     // What to do with one of the output streams of a process.
     // `OutputStream` is intentionally listed first, to make `= {}` submit a null stream.
     // Listing `MaybeOwningNativeString` for convenience. It's equivalent to passing the filename to `OutputFileDesc`.
-    using OutputStreamAttachment = std::variant<OutputStream, TagInherit, TagMergeOutput, MaybeOwningNativeString, OutputFileDesc>;
+    using OutputStreamAttachment = std::variant<OutputStream, TagDefault, TagInherit, TagMergeOutput, MaybeOwningNativeString, OutputFileDesc>;
 
 
     // Convenience variants of `MakePipe()` for when one or both ends are IO redirects.
@@ -3685,6 +3690,42 @@ namespace em::Proc
     using InheritedHandlesSet = std::unordered_set<BasicIoStream>;
     using InheritedHandles = std::variant<InheritedHandlesSet, TagAllHandles>;
 
+    #ifdef _WIN32
+    // This only matters when starting a console program. Controls which console is used by it, if any.
+    // In theory WinAPI says some of those modes aren't exclusive (`new_group` could be combined with `hidden` and `none`), but that seems to be useless. You can pass both bits manually if you want.
+    // Also see `MiscParams::flags_win`, you can pass custom WinAPI flags using that.
+    enum class Console_Win : DWORD
+    {
+        // Reuses the console from the current process. If it has none, then spawns a new one.
+        // This is the default behavior.
+        inherit_or_new = 0,
+
+        // Always spawns a new console window.
+        always_new = CREATE_NEW_CONSOLE,
+
+        // Like `inherit_or_new`, but if the console gets inherited, puts the new process in a separate group.
+        // This uniquely lets you send graceful shutdown signals to it, see explanation below.
+        //
+        // This prevents Ctrl+Break sent to the parent from propagating to the child. Ctrl+C still propagates, though (Ctrl+C is console-wide regardless of groups).
+        // If you enable this, it's your responsibility to propagate Ctrl+Break from your process to the children, if you don't want them to linger behind.
+        //
+        // A fake `Ctrl+Break` event is used on Windows as a graceful shutdown signal for console programs.
+        // Without this flag, we refuse to send Ctrl+Break, because it would also terminate the current process.
+        // We don't provide a way to send Ctrl+C because, that is console-wide and would always terminate the current process.
+        //
+        // You're only able to send Ctrl+Break if you share the console with the process, so if you use another mode (like `always_new`), that prevents sending it.
+        new_group = CREATE_NEW_PROCESS_GROUP,
+
+        // Creates a stub invisible console.
+        hidden = CREATE_NO_WINDOW,
+
+        // Gives the child no console.
+        // Unlike `hidden`, the child will receive errors if it tries to call console-related APIs.
+        // So `hidden` seems to be a safer but slightly more expensive option.
+        none = DETACHED_PROCESS,
+    };
+    #endif
+
     // A part of parameters of a process. Stores misc stuff that doesn't fit anywhere else, including IO redirects.
     // This is move-only because of the stored IO streams.
     class MiscParams : public StoresErrorMessage
@@ -3694,7 +3735,7 @@ namespace em::Proc
 
         using StoresErrorMessage::StoresErrorMessage;
 
-        // This causes us to immediately release the process handle after starting it, so you can't wait for it to terminate and can't get its exit code.
+        // This causes us to immediately release the process handle after starting it, so you can't get its exit code, and can't wait for it to terminate, and don't have to wait for it to terminate.
         // Also does a few things to separate the child process from the parent.
         // This also doesn't work with `inherit` IO redirects. Those get implicitly replaced with null streams.
         //
@@ -3708,32 +3749,36 @@ namespace em::Proc
         // What this does on POSIX is called "double forking" of "daemonizing" the new process, see this for more details: https://stackoverflow.com/q/881388/2752075
         bool detach = false;
 
+        #ifdef _WIN32
+        // What to do with the console window? Defeaults to `inherit_or_new` if `detach == false` or to `none` if `detach == true`.
+        std::optional<Console_Win> console_win;
+        // Extra WinAPI flags from https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags#flags
+        // Those just get OR-ed with `console_win` and with some more flags.
+        // `CREATE_DEFAULT_ERROR_MODE` here prevents `GlobalSettings().disable_error_messageboxes_win` from affecting the subprocess. It sounds like a good idea to not override it for them.
+        DWORD flags_win = CREATE_DEFAULT_ERROR_MODE;
+        #endif
+
         // If specified, replaced the working directory. Otherwise it's inherited from the parent process.
         std::optional<MaybeOwningNativeString> working_directory;
 
 
-        // What to do with `stdin`. The default behavior is to inherit it from the parent process.
-        // Pass `{}` or `nullptr` to make it null.
+        // What to do with with the streams?
+        // The default behavior is to inherit them from the parent process (`inherit`), but this can change, see below.
+        // Pass `{}` to make it null (`/dev/null` or a Windows equivalent).
         // Pass a string to open a file with that path and attach it.
-        // Pass an `InputStream` to attach a custom stream. This usually should be used with `MakePipe()`. While you could pass the result of `OpenInputFile()` as a stream too,
-        //   that's less optimal than passing the path here as a string.
-        InputStreamAttachment stdin_stream = inherit;
+        //   For output (stdout/stderr) you can also pass `OutputFileDesc` which stores a file path with some extra settings
+        // Pass `InputStream` (stdout/stderr) or `OutputStream` (stdin) to attach a custom stream.
+        //   Usually you don't do this directly, and instead pass it as a parameter to `MakePipe()` to fill it for you.
+        //   While you could pass the result of `OpenInputFile()`/`OpenOutputFile()` as a stream too, that's less optimal than passing the path here as a string.
+        // Pass `merge_output` (stdout/stderr only) to merge it into the other output stream (e.g. `stderr_stream = merge_output` merges stderr into stdout).
+        // If `detach == true`, then this defaults to `{}` instead of `inherit`.
+        //   On Windows, we're actually checking `console_win` rather than `detach`, and do this if it's `hidden` or `none`.
+        //   But since the default value of `console_win` is controlled by `detach`, if you don't override `console_win`, then `detach` ends up controlling this on Windows too.
+        // On POSIX, if you pass `detach == true`, you're not allowed to use `inherit`. We allow it on Windows because it happens to work there, but on POSIX it will error.
 
-        // What to do with `stdout`. The default behavior is to inherit it from the parent process.
-        // Pass `{}` or `nullptr` to make it null.
-        // Pass a string to open a file with that path and attach it. You can also pass `OutputFileDesc` which stores a file path with some extra settings.
-        // Pass an `OutputStream` to attach a custom stream. This usually should be used with `MakePipe()`. While you could pass the result of `OpenOutputFile()` as a stream too,
-        //   that's less optimal than passing the path here as a string.
-        // Pass `merge_output` to redirect it to `stderr` (rarely useful), then `stderr_stream` controls both streams.
-        OutputStreamAttachment stdout_stream = inherit;
-
-        // What to do with `stderr`. The default behavior is to inherit it from the parent process.
-        // Pass `{}` or `nullptr` to make it null.
-        // Pass a string to open a file with that path and attach it. You can also pass `OutputFileDesc` which stores a file path with some extra settings.
-        // Pass an `OutputStream` to attach a custom stream. This usually should be used with `MakePipe()`. While you could pass the result of `OpenOutputFile()` as a stream too,
-        //   that's less optimal than passing the path here as a string.
-        // Pass `merge_output` to redirect it to `stdout`, then `stderr_stream` controls both streams. This is useful if you want to read both streams combined.
-        OutputStreamAttachment stderr_stream = inherit;
+        InputStreamAttachment stdin_stream = use_default;
+        OutputStreamAttachment stdout_stream = use_default;
+        OutputStreamAttachment stderr_stream = use_default;
 
 
         // Which handles should the subprocess inherit.
@@ -3783,6 +3828,43 @@ namespace em::Proc
         [[nodiscard]] BakedMiscParams(MiscParams &&params)
             : BakedMiscParams() // Call destructor on throw.
         {
+            state.detach = params.detach;
+
+            // Process flags.
+            #ifdef _WIN32
+            if (!params.console_win)
+                params.console_win = state.detach ? Console_Win::none : Console_Win::inherit_or_new;
+
+            state.process_flags = DWORD(*params.console_win) | params.flags_win;
+
+            // Check for bad flags.
+            // Just this for now, nothing else seems blatantly broken.
+            if (state.process_flags & EXTENDED_STARTUPINFO_PRESENT)
+            {
+                error_string = "Not allowed to pass `EXTENDED_STARTUPINFO_PRESENT` manually. It is set automatically if needed.";
+                return;
+            }
+            #endif
+
+            // Resolve the defaulted stream redirects.
+            #ifdef _WIN32
+            if (state.process_flags & (CREATE_NO_WINDOW | DETACHED_PROCESS))
+            #else
+            if (state.detach)
+            #endif
+            {
+                if (std::holds_alternative<TagDefault>(params.stdin_stream )) params.stdin_stream  = {};
+                if (std::holds_alternative<TagDefault>(params.stdout_stream)) params.stdout_stream = {};
+                if (std::holds_alternative<TagDefault>(params.stderr_stream)) params.stderr_stream = {};
+            }
+            else
+            {
+                if (std::holds_alternative<TagDefault>(params.stdin_stream )) params.stdin_stream  = inherit;
+                if (std::holds_alternative<TagDefault>(params.stdout_stream)) params.stdout_stream = inherit;
+                if (std::holds_alternative<TagDefault>(params.stderr_stream)) params.stderr_stream = inherit;
+            }
+
+
             #ifndef _WIN32
             // Construct spawn file actions.
             // Returns true on error, then this constructor should exit too.
@@ -3876,6 +3958,12 @@ namespace em::Proc
                         state.stdin_stream = std::move(elem);
                         return false;
                     },
+                    [&](TagDefault)
+                    {
+                        assert(false); // This should be unreachable, we replaced those above.
+                        error_string = "Internal error: Default stream redirect didn't get resolved.";
+                        return true;
+                    },
                     [&](TagInherit)
                     {
                         InputStream stream = GetStdinStream();
@@ -3934,6 +4022,12 @@ namespace em::Proc
 
                             target_field = std::move(elem);
                             return false;
+                        },
+                        [&](TagDefault)
+                        {
+                            assert(false); // This should be unreachable, we replaced those above.
+                            error_string = "Internal error: Default stream redirect didn't get resolved.";
+                            return true;
                         },
                         [&](TagInherit)
                         {
@@ -4183,8 +4277,19 @@ namespace em::Proc
                         state.stdin_stream = std::move(elem);
                         return AddDup2(STDIN_FILENO, state.stdin_stream.Handle());
                     },
+                    [&](TagDefault)
+                    {
+                        assert(false); // This should be unreachable, we replaced those above.
+                        error_string = "Internal error: Default stream redirect didn't get resolved.";
+                        return true;
+                    },
                     [&](TagInherit)
                     {
+                        if (state.detach)
+                        {
+                            error_string = "Detached proesses can't inherit IO handles on POSIX.";
+                            return true;
+                        }
                         return false;
                     },
                     [&](MaybeOwningNativeString &&elem)
@@ -4219,8 +4324,19 @@ namespace em::Proc
 
                             return AddDup2(target_handle, target_field.Handle());
                         },
+                        [&](TagDefault)
+                        {
+                            assert(false); // This should be unreachable, we replaced those above.
+                            error_string = "Internal error: Default stream redirect didn't get resolved.";
+                            return true;
+                        },
                         [&](TagInherit)
                         {
+                            if (state.detach)
+                            {
+                                error_string = "Detached proesses can't inherit IO handles on POSIX.";
+                                return true;
+                            }
                             return false;
                         },
                         [&](TagMergeOutput)
@@ -4461,6 +4577,11 @@ namespace em::Proc
         }
 
         #ifdef _WIN32
+        [[nodiscard]] DWORD ResultingProcessFlags_Win() const
+        {
+            return state.process_flags;
+        }
+
         [[nodiscard]] const std::optional<MaybeOwningNativeString> &ResultingWorkingDir_Win() const
         {
             return state.working_directory;
@@ -4511,7 +4632,6 @@ namespace em::Proc
         static constexpr std::size_t num_preallocated_inherited_handles = 3;
         #endif
 
-
         struct State
         {
             bool detach = false;
@@ -4528,6 +4648,9 @@ namespace em::Proc
             // The first one right there is why `BakedMiscParams` is not movable. A pointer to this is baked into `AttributeList()` (unless we need a larger array, in which case it gets heap-allocated in `inherited_handles_storage_ptr`).
             HANDLE inherited_handles_storage_array[num_preallocated_inherited_handles]{};
             std::unique_ptr<HANDLE[]> inherited_handles_storage_ptr;
+
+            // Flags to be passed to `CreateProcessW()`.
+            DWORD process_flags = 0;
 
             #else
             bool spawn_fa_alive = false;
@@ -4666,8 +4789,6 @@ namespace em::Proc
                 nullptr, // Thread attributes.
                 true, // Inherit handles.
                 CREATE_UNICODE_ENVIRONMENT |
-                    // Randomly stumbled upon this flag, seems helpful.
-                    (CREATE_NEW_PROCESS_GROUP * misc.ShouldDetach()) |
                     // Why is this not inferred from the value of `cb` I have no idea.
                     (EXTENDED_STARTUPINFO_PRESENT * (startup_info.StartupInfo.cb == sizeof(startup_info))),
                 // It's mildly sus that `env_ptr` needs a `const_cast`. The function parameter is of type `void *`. Unlike for the command line, the documentation (at https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw)

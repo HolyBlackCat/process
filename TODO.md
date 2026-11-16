@@ -1,3 +1,20 @@
+Tri-state: not detach, detach group, full detach
+
+Windows: Investigate DETACHED_PROCESS for full detach (and new group for group and full detach)
+Windows: Only for group-detached processes we can send ctrl+break
+
+Linux: Just need to implement group detach
+
+
+
+* Interrupting processes
+
+Tests:
+    environment
+    chdir
+
+
+
 
 Pipes on Windows:
   * Must use a named pipe if at least one end is async
@@ -19,15 +36,10 @@ Compilation tests:
     with and without EM_PROC_HAVE_PIPE2
     with and without EM_PROC_CAN_DETECT_CORE_DUMPS
 
-Tests:
-    environment
-    chdir
 
 * Test builds without exceptions.
 
 * Async waiting for process termination: jobs (with IOCP) on Windows, fdpid_open on Linux if supported and enabled, dummy pipes on POSIX otherwise
-
-* Interrupting processes
 
 Maybe later:
 
@@ -40,6 +52,8 @@ Maybe later:
   Reproc is weird: they use sockets instead of pipes on Windows, to replicate posix-style poll.
 
   Reproc also creates an extra socket per process so that it can track when it exits by polling on that socket. We should be able to do this with a pipe./
+
+* Ability to pass true null IO handles.
 
 * Escaping strings:
 
