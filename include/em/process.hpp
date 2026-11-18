@@ -3735,9 +3735,10 @@ namespace em::Proc
 
         using StoresErrorMessage::StoresErrorMessage;
 
-        // This causes us to immediately release the process handle after starting it, so you can't get its exit code, and can't wait for it to terminate, and don't have to wait for it to terminate.
+        // This causes us to immediately release the process handle after starting it, so you can't get its exit code, and can't wait for it to terminate, and don't have to wait for it to terminate in the destructor.
         // Also does a few things to separate the child process from the parent.
-        // This also doesn't work with `inherit` IO redirects. Those get implicitly replaced with null streams.
+        // On POSIX, those extra things are forced. On Windows, they can be
+        // Also by default prevents the IO from the subprocess from reaching the terminal of the current process. See `stdin_stream`/`stdout_stream`/`stderr_stream` below for details.
         //
         // In theory, on POSIX we could still wait using the PID, using `kill(pid, 0)`. But that seems unreliable, because the PID could be reused by another process. And this is not very useful in the first place.
         //
@@ -3771,10 +3772,9 @@ namespace em::Proc
         //   Usually you don't do this directly, and instead pass it as a parameter to `MakePipe()` to fill it for you.
         //   While you could pass the result of `OpenInputFile()`/`OpenOutputFile()` as a stream too, that's less optimal than passing the path here as a string.
         // Pass `merge_output` (stdout/stderr only) to merge it into the other output stream (e.g. `stderr_stream = merge_output` merges stderr into stdout).
-        // If `detach == true`, then this defaults to `{}` instead of `inherit`.
+        // If `detach == true`, then this defaults to `{}` instead of `inherit`, just for sanity.
         //   On Windows, we're actually checking `console_win` rather than `detach`, and do this if it's `hidden` or `none`.
         //   But since the default value of `console_win` is controlled by `detach`, if you don't override `console_win`, then `detach` ends up controlling this on Windows too.
-        // On POSIX, if you pass `detach == true`, you're not allowed to use `inherit`. We allow it on Windows because it happens to work there, but on POSIX it will error.
 
         InputStreamAttachment stdin_stream = use_default;
         OutputStreamAttachment stdout_stream = use_default;
@@ -4285,11 +4285,6 @@ namespace em::Proc
                     },
                     [&](TagInherit)
                     {
-                        if (state.detach)
-                        {
-                            error_string = "Detached proesses can't inherit IO handles on POSIX.";
-                            return true;
-                        }
                         return false;
                     },
                     [&](MaybeOwningNativeString &&elem)
@@ -4301,7 +4296,7 @@ namespace em::Proc
                     return;
                 }
 
-                // Stdout.
+                // Stdout and stderr.
                 auto HandleOutputStream = [&](bool is_stderr) -> bool
                 {
                     const int target_handle = is_stderr ? STDERR_FILENO : STDOUT_FILENO;
@@ -4332,11 +4327,6 @@ namespace em::Proc
                         },
                         [&](TagInherit)
                         {
-                            if (state.detach)
-                            {
-                                error_string = "Detached proesses can't inherit IO handles on POSIX.";
-                                return true;
-                            }
                             return false;
                         },
                         [&](TagMergeOutput)
@@ -4355,7 +4345,6 @@ namespace em::Proc
                     }, std::move(is_stderr ? params.stderr_stream : params.stdout_stream));
                 };
 
-                // Stdout and stderr.
                 if (std::holds_alternative<TagMergeOutput>(params.stdout_stream))
                 {
                     // This specific case requires reverse stream initialization order. Otherwise `stdout` gets redirect to the old value of `stderr`, not the new one.
@@ -4670,6 +4659,54 @@ namespace em::Proc
         State state;
     };
 
+    // How to terminate a process?
+    // Typical values are `soft` and `hard`, but see below for more details.
+    // On POSIX, this is a signal number (you can pass your own).
+    // On Windows, this is a bitmask of different termination approaches to try, and the first one that works is used.
+    enum class Terminate
+        #ifdef _WIN32
+        : std::uint64_t
+        #endif
+    {
+        #ifdef _WIN32
+        // Close all windows of the process by sending the `WM_CLOSE` event to them.
+        bit_close_windows_win = std::uint64_t(1) << 32,
+        // Stop the event loop of the process by sending `WM_QUIT` to it (on the main thread, it better not use a different thread).
+        // You can suggest the exit code for the app, use the lowest 32 bits for it.
+        // This is still a graceful shutdown, the app can do whatever cleanup it needs.
+        // This is stronger than `bit_close_windows_win`, e.g. it probably shouldn't display the "do you want to save the file" modal windows, but I guess this depends on the app?
+        bit_quit_event_loop_win = std::uint64_t(1) << 33,
+        // Send the Ctrl+Break event.
+        // This crashes the app by default, but it can provide a custom handler, so this is still relatively graceful.
+        // This only works under specific circumstances. Both the current process and the subprocess must be attached to the same console,
+        //   and the subprocess must be created with `MiscParams::console_win = new_group`.
+        bit_ctrl_break_win = std::uint64_t(1) << 34,
+        // Force terminates the app, like `SIGKILL`.
+        // You can specify the exit code for the app, use the lowest 32 bits for it.
+        bit_terminate_win = std::uint64_t(1) << 35,
+
+        // The exit code for `bit_terminate_win` and `bit_quit_event_loop_win`.
+        // Those are the lowest 32 bits.
+        mask_exit_code_win = (std::uint64_t(1) << 32) - 1,
+
+        // The default exit code that we use.
+        default_exit_code_win = 0xffffffff,
+
+        hard = bit_terminate_win | default_exit_code_win,
+
+        soft =
+            bit_close_windows_win |
+            bit_quit_event_loop_win | default_exit_code_win |
+            bit_ctrl_break_win |
+            hard, // Not 100% sure about falling back to a hard termination, but it's probably better than not sending anything.
+
+        #else
+        soft = SIGINT,
+        hard = SIGKILL,
+        #endif
+    };
+    DETAIL_EM_PROC_FLAG_ENUM(Terminate)
+
     // A single subprocess.
     class Process : public StoresErrorMessage
     {
@@ -4790,7 +4827,9 @@ namespace em::Proc
                 true, // Inherit handles.
                 CREATE_UNICODE_ENVIRONMENT |
                     // Why is this not inferred from the value of `cb` I have no idea.
-                    (EXTENDED_STARTUPINFO_PRESENT * (startup_info.StartupInfo.cb == sizeof(startup_info))),
+                    (EXTENDED_STARTUPINFO_PRESENT * (startup_info.StartupInfo.cb == sizeof(startup_info))) |
+                    // Custom user flags, including the console mode.
+                    misc.ResultingProcessFlags_Win(),
                 // It's mildly sus that `env_ptr` needs a `const_cast`. The function parameter is of type `void *`. Unlike for the command line, the documentation (at https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw)
                 //   doesn't say that the environment is clobbered, so I think the `const_cast` is fine.
                 const_cast<wchar_t *>(env.ResultingEnvironment_Win()),
@@ -5036,7 +5075,7 @@ namespace em::Proc
             return *this;
         }
 
-        // The default behavior is to wait for the process (if `IsBackground() == false`).
+        // The default behavior is to wait for the process (if `IsDetached() == false`).
         // We have to wait to clean up the process, otherwise it remains as a "zombie", because we never consumed its exit status.
         ~Process()
         {
@@ -5075,6 +5114,11 @@ namespace em::Proc
         // This is zero for null processes.
         [[nodiscard]] Proc::Pid Pid() const {return state.pid;}
 
+        #ifdef _WIN32
+        // This is zero for null processes.
+        [[nodiscard]] DWORD MainThreadId_Win() const {return state.main_thread_id;}
+        #endif
+
         // Returns true if this instance owns a process handle. This is a subset of `operator bool`.
         // This is only true for non-background processes, which we didn't observe to exit yet. This means the destructor will have to do something to clean up the process handle/pid that we own.
         [[nodiscard]] bool OwnsProcess() const
@@ -5086,8 +5130,8 @@ namespace em::Proc
             #endif
         }
 
-        // Returns true if this is a background process. See `Params::Detached()` for more details.
-        [[nodiscard]] bool IsBackground() const
+        // Returns true if this is a detached process. See `MiscParams::detach` for more details.
+        [[nodiscard]] bool IsDetached() const
         {
             return state.exit_reason && std::holds_alternative<Proc::ExitReason::Detached>(state.exit_reason->var);
         }
@@ -5101,17 +5145,126 @@ namespace em::Proc
         // Wait until the process exits.
         // Returns `ExitReason().value()` for convenience.
         // Note! This can deadlock if you have pipes open to this process, because you need to be manually poking those pipes.
-        const Proc::ExitReason &BlockUntilExit()
+        const Proc::ExitReason &WaitUntilExit()
         {
             CheckOrWait(true);
             return ExitReason().value();
         }
 
         // Returns the exit reason of the process, or false if it's not known to be exited yet.
-        // This is only updated by `UpdateState()` or `BlockUntilExit()`.
+        // This is only updated by `UpdateState()` or `WaitUntilExit()`.
         [[nodiscard]] const std::optional<Proc::ExitReason> &ExitReason() const
         {
             return state.exit_reason;
+        }
+
+        // Tries to terminate the process. May or may not succeed. Doesn't block.
+        // Common arguments are `em::Proc::Terminate::soft` and `em::Proc::Terminate::hard`, but see the comments on `em::Proc::Terminate` for more options.
+        // Returns null if we think the request was sent successfully. It doesn't guarantee that the process will actually terminate (but if the mode is `hard`, then it should hopefully terminate).
+        // Returns empty string if the request failed gracefully (e.g. on Windows when trying to close windows of a program that has none).
+        // Returns a non-empty string on error. Some errors are lost, since I'd rather try more different termination methods than stop to report it.
+        // Doesn't update `ExitReason()`/etc, you must call `UpdateState()` or `WaitUntilExit()` yourself (use the latter only after `hard` termination requests or risk deadlocking).
+        // This function doesn't update the error state of the current `Process` object itself, for general sanity.
+        std::optional<std::string> Terminate(Proc::Terminate mode)
+        {
+            // The default return value if no termination mode is specified is an empty string.
+            std::optional<std::string> ret = "";
+
+            if (!*this)
+                return ret; // Soft error.
+
+            if (IsDetached())
+            {
+                ret = "Can't terminate a detached process.";
+                return ret;
+            }
+
+            if (!OwnsProcess())
+                return ret; // Probably already known to be exited. Soft error.
+
+            #ifdef _WIN32
+
+            // Post `WM_CLOSE` to all windows owned by this process.
+            auto CloseWindows = [&]() -> std::optional<std::string>
+            {
+                struct VisitState
+                {
+                    DWORD expected_pid = 0;
+                    bool found_matching_windows = false;
+                };
+                auto VisitWindow = [](HWND window, LPARAM userdata) -> BOOL
+                {
+                    // Claude also suggests checking `IsWindowVisible(window) && GetWindow(window, GW_OWNER)`, but I'm not sure how necessary that is.
+                    VisitState &state = *reinterpret_cast<VisitState *>(userdata);
+                    DWORD window_pid = 0;
+                    if (GetWindowThreadProcessId(window, &window_pid) && window_pid == state.expected_pid)
+                    {
+                        if (PostMessageW(window, WM_CLOSE, 0, 0))
+                        {
+                            // Don't break from the loop (by returning `FALSE`), we want to visit all windows.
+                            state.found_matching_windows = true;
+                        }
+                    }
+
+                    return TRUE; // WinAPI stops the loop on false.
+                };
+                VisitState visit_state{.expected_pid = Pid()};
+                if (!EnumWindows(VisitWindow, reinterpret_cast<LPARAM>(&visit_state)))
+                    return "`EnumWindows()` failed: " + detail::WinApiErrorToString(GetLastError());
+                if (!visit_state.found_matching_windows)
+                    return ""; // Soft error.
+
+                return {};
+            };
+
+            auto QuitEventLoop = [&]() -> std::optional<std::string>
+            {
+                if (!PostThreadMessageW(MainThreadId_Win(), WM_QUIT, /*exit code:*/WPARAM(mode), 0))
+                {
+                    auto error = GetLastError();
+                    if (error == ERROR_INVALID_THREAD_ID)
+                        return ""; // This thread doesn't have a message loop. This is a soft error.
+                    // Otherwise a hard error.
+                    return "`PostThreadMessageW()` failed: " + detail::WinApiErrorToString(error);
+                }
+
+                return {};
+            };
+
+            auto SendCtrlBreak = [&]() -> std::optional<std::string>
+            {
+                // This seems to basically never fail, even if the event couldn't reach the process.
+                if (!GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, Pid()))
+                    return "`GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT)` failed: " + detail::WinApiErrorToString(GetLastError());
+                return {};
+            };
+
+            auto TerminateProc = [&]() -> std::optional<std::string>
+            {
+                if (!TerminateProcess(state.process_handle, /*exit code:*/DWORD(mode)))
+                    return "`TerminateProcess()` failed: " + detail::WinApiErrorToString(GetLastError());
+                return {};
+            };
+
+            // This logic indeed replaces hard errors with return values from the latter methods. A bit annoying, but intended. Can't think of a better option.
+            if (ret && bool(mode & Proc::Terminate::bit_close_windows_win))
+                ret = CloseWindows();
+            if (ret && bool(mode & Proc::Terminate::bit_quit_event_loop_win))
+                ret = QuitEventLoop();
+            if (ret && bool(mode & Proc::Terminate::bit_ctrl_break_win))
+                ret = SendCtrlBreak();
+            if (ret && bool(mode & Proc::Terminate::bit_terminate_win))
+                ret = TerminateProc();
+
+            #else
+
+            // Only run `kill()` if `mode != 0`, to match the Windows behavior.
+            if (mode != Proc::Terminate{} && kill(Pid(), int(mode)) < 0)
+                ret = std::string("`kill()` failed: ") + std::strerror(errno) + '.';
+
+            #endif
+
+            return ret;
         }
 
       private:
@@ -5123,7 +5276,14 @@ namespace em::Proc
             if (StoreErrorIfNull())
                 return;
 
-            // Do nothing if we don't own a PID. This rejects background processes, and also repeated waits.
+            // Complain about detached processes. `OwnsProcess()` would catch those too, but I want a nicer error.
+            if (IsDetached())
+            {
+                error_string = "Can't check state of a detached process.";
+                return;
+            }
+
+            // Do nothing if we don't own a PID. This rejects repeated waits (and would also reject detached processes, if we didn't check for them above).
             if (!OwnsProcess())
                 return;
 
@@ -5140,7 +5300,7 @@ namespace em::Proc
             // If wait says the process is still running...
             if (wait_result != WAIT_OBJECT_0)
             {
-                assert(wait); // Should only be possible if `wait == true`.
+                assert(!wait); // Should only be possible in a non-blocking call.
                 return;
             }
 
@@ -5184,7 +5344,7 @@ namespace em::Proc
             // If wait says the process is still running...
             if (wait_result == 0)
             {
-                assert(wait); // Should only be possible if `wait == true`.
+                assert(!wait); // Should only be possible in a non-blocking call.
                 return;
             }
 
@@ -5223,6 +5383,8 @@ namespace em::Proc
             #ifdef _WIN32
             // There's some weirdness with what counts as a valid handle. `INVALID_HANDLE_VALUE` is basically `(HANDLE)-1`, but `nullptr` also seems to be invalid. Using `INVALID_HANDLE_VALUE` seems better to me.
             HANDLE process_handle = INVALID_HANDLE_VALUE;
+            // Needed for `PostThreadMessageW()`.
+            DWORD main_thread_id = 0;
             #else
             // Do we need to `waitpid()` on the PID to clean it up?
             bool owns_pid = false;

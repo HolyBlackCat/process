@@ -179,7 +179,7 @@ int main(int argc, char **argv)
         }
     }
 
-    proc.BlockUntilExit();
+    proc.WaitUntilExit();
     proc.ThrowError();
     proc.ExitReason()->ThrowError();
 }

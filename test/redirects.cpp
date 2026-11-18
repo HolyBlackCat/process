@@ -88,7 +88,7 @@ int main(int argc, char **argv)
 
     em::Proc::Process process = std::move(params);
     process.ThrowError();
-    process.BlockUntilExit();
+    process.WaitUntilExit();
     process.ThrowError();
     process.ExitReason()->ThrowError();
 }

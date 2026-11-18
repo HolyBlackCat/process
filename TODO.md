@@ -1,7 +1,11 @@
-Tri-state: not detach, detach group, full detach
+Investigate info from claude:
 
-Windows: Investigate DETACHED_PROCESS for full detach (and new group for group and full detach)
-Windows: Only for group-detached processes we can send ctrl+break
+* Sending WM_CLOSE as opposed to WM_QUIT via PostThreadMessage is indeed useless for most apps
+
+
+Function to apply all process settings at once, to be called at startup.
+Do we still want to remove the error messageboxes?
+
 
 Linux: Just need to implement group detach
 
