@@ -198,6 +198,15 @@
 #endif
 
 
+#ifndef EM_PROC_INDETERMINATE
+#  if __has_cpp_attribute(indeterminate)
+#    define EM_PROC_INDETERMINATE [[indeterminate]]
+#  else
+#    define EM_PROC_INDETERMINATE
+#  endif
+#endif
+
+
 #ifdef _WIN32
 // Usage: `EM_PROC_NATIVE("blah")`.
 // Makes a string literal wide on Windows, and returns it as is on other platforms.
@@ -1188,10 +1197,7 @@ namespace em::Proc
         #endif
         else
         {
-            #if __has_cpp_attribute(indeterminate)
-            [[indeterminate]] // Make sure `buffer` is actually uninitialized in C++26 and newer.
-            #endif
-            char buffer[StackBufferHint]; // Intentionally left uninitialized.
+            EM_PROC_INDETERMINATE char buffer[StackBufferHint];
 
             std::size_t bytes_written = decltype(func)(func)(buffer, StackBufferHint);
             assert(bytes_written <= StackBufferHint);
@@ -4825,11 +4831,13 @@ namespace em::Proc
                 nullptr, // Process attributes.
                 nullptr, // Thread attributes.
                 true, // Inherit handles.
-                CREATE_UNICODE_ENVIRONMENT |
+                state.create_process_flags = (
+                    CREATE_UNICODE_ENVIRONMENT |
                     // Why is this not inferred from the value of `cb` I have no idea.
                     (EXTENDED_STARTUPINFO_PRESENT * (startup_info.StartupInfo.cb == sizeof(startup_info))) |
                     // Custom user flags, including the console mode.
-                    misc.ResultingProcessFlags_Win(),
+                    misc.ResultingProcessFlags_Win()
+                ),
                 // It's mildly sus that `env_ptr` needs a `const_cast`. The function parameter is of type `void *`. Unlike for the command line, the documentation (at https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw)
                 //   doesn't say that the environment is clobbered, so I think the `const_cast` is fine.
                 const_cast<wchar_t *>(env.ResultingEnvironment_Win()),
@@ -4845,7 +4853,8 @@ namespace em::Proc
 
             // Get the pid.
             state.pid = proc_info.value.dwProcessId;
-
+            // Main thread id too.
+            state.main_thread_id = proc_info.value.dwThreadId;
 
             // Lastly, for non-background processes, preserve the handle.
             if (!misc.ShouldDetach())
@@ -5117,6 +5126,8 @@ namespace em::Proc
         #ifdef _WIN32
         // This is zero for null processes.
         [[nodiscard]] DWORD MainThreadId_Win() const {return state.main_thread_id;}
+        // All flags passed to `CreateProcessW()` when creating this subprocess.
+        [[nodiscard]] DWORD ProcessFlags_Win() const {return state.create_process_flags;}
         #endif
 
         // Returns true if this instance owns a process handle. This is a subset of `operator bool`.
@@ -5233,9 +5244,82 @@ namespace em::Proc
 
             auto SendCtrlBreak = [&]() -> std::optional<std::string>
             {
-                // This seems to basically never fail, even if the event couldn't reach the process.
+                // In many cases `GenerateConsoleCtrlEvent()` returns true despite failing to terminate the process (e.g. when the child and the parent are not attached to the same console).
+                // And when `console_win == inherit_or_new`, it'll even terminate your own (parent) process instead of the child, lmao.
+                // So before calling it, we have to do some safety checks.
+
+                // I'm not bothering to check `GetConsoleWindow()`, since that's the one thing that `GenerateConsoleCtrlEvent()` itself seems to check.
+                // Even if it didn't, it should be covered by checking that the child PID is attached to the same console,
+                //   that we do below (which is racy, but if it's not, we just waste the termination attempt, nothing bad happens).
+
+                // Check that the process was created with the right flags.
+                if (auto f = ProcessFlags_Win();
+                    // Must have `new_group`.
+                    !(f & DWORD(Console_Win::new_group)) ||
+                    // Must not have any other flags.
+                    // Out of those, `always_new` is specifically documented to cause `new_group` to be ignored, and others probably have similar effect.
+                    // We must be attached to the same console for it to work, and all those flags prevent that.
+                    f & (DWORD(Console_Win::always_new) | DWORD(Console_Win::hidden) | DWORD(Console_Win::none))
+                )
+                {
+                    return ""; // Soft error.
+                }
+
+                { // Also check that we're on the same console.
+                    // Need to list the PIDs on the same console.
+                    // First, try a stack array and hope it's large enough. Otherwise fall back to allocating the array on the heap.
+
+                    // How large should the stack array be.
+                    static constexpr std::size_t num_preallocated_pids = 64;
+
+                    EM_PROC_INDETERMINATE DWORD stack_storage[num_preallocated_pids];
+                    DWORD *storage_ptr = stack_storage;
+                    std::size_t cur_capacity = num_preallocated_pids;
+                    std::size_t cur_size = 0;
+
+                    std::vector<DWORD> heap_storage;
+
+                    // Get the PIDs.
+                    while (true)
+                    {
+                        cur_size = GetConsoleProcessList(storage_ptr, DWORD(cur_capacity));
+                        if (cur_size == 0)
+                            return "`GetConsoleProcessList()` failed: " + detail::WinApiErrorToString(GetLastError());
+                        if (cur_size <= cur_capacity)
+                            break; // Finally our storage is large enough.
+
+                        // Need more capacity.
+
+                        heap_storage.resize(0); // Don't want to be copying the contents.
+                        heap_storage.resize(cur_size + 64); // Allocate a bit more, just in case.
+                        cur_capacity = heap_storage.capacity();
+                        heap_storage.resize(cur_capacity); // Shrug.
+                        storage_ptr = heap_storage.data();
+                    }
+
+                    // Check the PIDs.
+                    bool found = false;
+                    for (std::size_t i = 0; i < cur_size; i++)
+                    {
+                        if (storage_ptr[i] == state.pid)
+                        {
+                            found = true;
+                            break;
+                        }
+                    }
+
+                    if (!found)
+                        return ""; // The child isn't on this console.
+                }
+
+                // Finally, send the event.
                 if (!GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, Pid()))
-                    return "`GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT)` failed: " + detail::WinApiErrorToString(GetLastError());
+                {
+                    auto error = GetLastError();
+                    if (error == ERROR_INVALID_HANDLE)
+                        return ""; // I think this happens if the the current (parent) process doesn't have a console.
+                    return "`GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT)` failed: " + detail::WinApiErrorToString(error);
+                }
                 return {};
             };
 
@@ -5385,6 +5469,8 @@ namespace em::Proc
             HANDLE process_handle = INVALID_HANDLE_VALUE;
             // Needed for `PostThreadMessageW()`.
             DWORD main_thread_id = 0;
+            // All flags passed to `CreateProcessW()`.
+            DWORD create_process_flags = 0;
             #else
             // Do we need to `waitpid()` on the PID to clean it up?
             bool owns_pid = false;
