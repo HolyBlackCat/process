@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cassert>
+#include <chrono> // For `std::this_thread::sleep_for()`, to pass the duration.
 #include <compare>
 #include <concepts>
 #include <cstddef>
@@ -14,6 +15,7 @@
 #include <span>
 #include <string_view>
 #include <string>
+#include <thread> // For `std::this_thread::sleep_for()`.
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
@@ -4666,27 +4668,32 @@ namespace em::Proc
     };
 
     // How to terminate a process?
-    // Typical values are `soft` and `hard`, but see below for more details.
-    // On POSIX, this is a signal number (you can pass your own).
+    // Typical values are `soft`, `hard`, and `escalate`, but see below for more details.
+    // `soft` and `hard` are instantaneous, while `escalate` may sleep for some time between trying different methods (escalates from `soft` to `hard`).
+    // On POSIX, you can pass your own signal number by casting it to this type.
     // On Windows, this is a bitmask of different termination approaches to try, and the first one that works is used.
-    enum class Terminate
-        #ifdef _WIN32
-        : std::uint64_t
-        #endif
+    // On Windows, soft termination is complicated and requires trying different approaches, even without `escalate`. But without `escalate`,
+    //   we stop at the first approach that didn't outright fail, without checking if the process actually respected it or not.
+    enum class Terminate : std::uint64_t
     {
         #ifdef _WIN32
         // Close all windows of the process by sending the `WM_CLOSE` event to them.
         bit_close_windows_win = std::uint64_t(1) << 32,
+
         // Stop the event loop of the process by sending `WM_QUIT` to it (on the main thread, it better not use a different thread).
-        // You can suggest the exit code for the app, use the lowest 32 bits for it.
+        // Many apps silently ignore this event.
+        // You can suggest the exit code for the app, use the lowest 32 bits for it. Not all apps respect the provided code.
         // This is still a graceful shutdown, the app can do whatever cleanup it needs.
         // This is stronger than `bit_close_windows_win`, e.g. it probably shouldn't display the "do you want to save the file" modal windows, but I guess this depends on the app?
+        // Since many apps silently ignore this event, it isn't a part of `soft`. It's a part of `escalate` though, since it can check if it worked or not.
         bit_quit_event_loop_win = std::uint64_t(1) << 33,
+
         // Send the Ctrl+Break event.
         // This crashes the app by default, but it can provide a custom handler, so this is still relatively graceful.
         // This only works under specific circumstances. Both the current process and the subprocess must be attached to the same console,
         //   and the subprocess must be created with `MiscParams::console_win = new_group`.
         bit_ctrl_break_win = std::uint64_t(1) << 34,
+
         // Force terminates the app, like `SIGKILL`.
         // You can specify the exit code for the app, use the lowest 32 bits for it.
         bit_terminate_win = std::uint64_t(1) << 35,
@@ -4695,25 +4702,47 @@ namespace em::Proc
         // Those are the lowest 32 bits.
         mask_exit_code_win = (std::uint64_t(1) << 32) - 1,
 
-        // The default exit code that we use.
+        // The default exit code that we use for some of the termination modes.
         default_exit_code_win = 0xffffffff,
+
+        // If specified, then we don't stop on the first termination mode that looked like it succeeded.
+        // Instead we check for some time if the process has actually terminated, and if not, fall back to the next mode.
+        bit_escalate = std::uint64_t(1) << 36,
 
         hard = bit_terminate_win | default_exit_code_win,
 
         soft =
             bit_close_windows_win |
-            bit_quit_event_loop_win | default_exit_code_win |
             bit_ctrl_break_win |
             hard, // Not 100% sure about falling back to a hard termination, but it's probably better than not sending anything.
+            // `bit_quit_event_loop_win` is excluded from this, since many apps don't allow it.
+
+        escalate =
+            soft | hard | bit_escalate |
+            // We can include this here. It's an unreliable method, but with the `bit_escalate` checks it's ok.
+            bit_quit_event_loop_win | default_exit_code_win,
 
         #else
+
+        // If any bit in this mask is set, we send this signal.
+        mask_signal_posix = (std::uint64_t(1) << 32) - 1,
+
+        // This is an alternative to storing `SIGKILL`.
+        // Only makes sense to specify both this and another signal if `bit_escalate` is also specified. Otherwise we'll just send that other signal and stop.
+        bit_sigkill_posix = std::uint64_t(1) << 32,
+
+        // If specified, we send the custom signal first (`mask_signal_posix`), then check if the process has terminated after some time, and if it doesn't, send SIGKILL if `bit_sigkill_posix` if specified.
+        bit_escalate = std::uint64_t(1) << 33,
+
         soft = SIGINT,
-        hard = SIGKILL,
+        hard = bit_sigkill_posix,
+        escalate = soft | hard | bit_escalate,
         #endif
     };
     DETAIL_EM_PROC_FLAG_ENUM(Terminate)
 
     // A single subprocess.
+    // For this class specifically, `HasError() == true` should normally imply that it doesn't own a process instance.
     class Process : public StoresErrorMessage
     {
       public:
@@ -5094,7 +5123,10 @@ namespace em::Proc
             //   because `CheckOrWait()` asserts on that. But it does nothing if `bool(*this) == true && !OwnsProcess()` anyway, so it doesn't matter which one we check.
 
             if (OwnsProcess())
+            {
+                Terminate(Terminate::escalate);
                 CheckOrWait(true);
+            }
         }
 
         // Returns true if this instance represents a successfully started process.
@@ -5159,6 +5191,7 @@ namespace em::Proc
         const Proc::ExitReason &WaitUntilExit()
         {
             CheckOrWait(true);
+            assert(ExitReason());
             return ExitReason().value();
         }
 
@@ -5169,30 +5202,20 @@ namespace em::Proc
             return state.exit_reason;
         }
 
-        // Tries to terminate the process. May or may not succeed. Doesn't block.
-        // Common arguments are `em::Proc::Terminate::soft` and `em::Proc::Terminate::hard`, but see the comments on `em::Proc::Terminate` for more options.
-        // Returns null if we think the request was sent successfully. It doesn't guarantee that the process will actually terminate (but if the mode is `hard`, then it should hopefully terminate).
+        // Tries to terminate the process. May or may not succeed.
+        // The common arguments are `soft`, `hard`, and `escalate`. See `em::Proc::Terminate` enum for more details.
+        // `soft` and `hard` don't block. `escalate` may block between trying different termination methods until it finds one that works.
+        // Returns null if we think the request was sent successfully.
+        //   On `soft`, it doesn't guarantee that the process will terminate.
+        //   On `hard` and `escalate`, it should terminate soon.
+        // Either way, it's your job to call `UpdateState()` or `WaitUntilExit()` after, if you want to check `ExitReason()`.
         // Returns empty string if the request failed gracefully (e.g. on Windows when trying to close windows of a program that has none).
         // Returns a non-empty string on error. Some errors are lost, since I'd rather try more different termination methods than stop to report it.
         // Doesn't update `ExitReason()`/etc, you must call `UpdateState()` or `WaitUntilExit()` yourself (use the latter only after `hard` termination requests or risk deadlocking).
-        // This function doesn't update the error state of the current `Process` object itself, for general sanity.
+        //   If `Terminate::bit_terminate` is specified, it may sometimes call `UpdateState(), but you can't rely on it.
         std::optional<std::string> Terminate(Proc::Terminate mode)
         {
-            // The default return value if no termination mode is specified is an empty string.
-            std::optional<std::string> ret = "";
-
-            if (!*this)
-                return ret; // Soft error.
-
-            if (IsDetached())
-            {
-                ret = "Can't terminate a detached process.";
-                return ret;
-            }
-
-            if (!OwnsProcess())
-                return ret; // Probably already known to be exited. Soft error.
-
+            // First the various termination method lambdas, so they can't touch `ret` by accident.
             #ifdef _WIN32
 
             // Post `WM_CLOSE` to all windows owned by this process.
@@ -5233,8 +5256,18 @@ namespace em::Proc
                 if (!PostThreadMessageW(MainThreadId_Win(), WM_QUIT, /*exit code:*/WPARAM(mode), 0))
                 {
                     auto error = GetLastError();
-                    if (error == ERROR_INVALID_THREAD_ID)
-                        return ""; // This thread doesn't have a message loop. This is a soft error.
+                    if (
+                        // This thread doesn't have a message loop.
+                        error == ERROR_INVALID_THREAD_ID ||
+                        // Appparently this means that the event queue is full? Hmm.
+                        error == ERROR_NOT_ENOUGH_QUOTA ||
+                        // Claude suggested this. Makes sense to me for this to be a soft error.
+                        error == ERROR_ACCESS_DENIED
+                    )
+                    {
+                        return "";
+                    }
+
                     // Otherwise a hard error.
                     return "`PostThreadMessageW()` failed: " + detail::WinApiErrorToString(error);
                 }
@@ -5330,22 +5363,126 @@ namespace em::Proc
                 return {};
             };
 
-            // This logic indeed replaces hard errors with return values from the latter methods. A bit annoying, but intended. Can't think of a better option.
-            if (ret && bool(mode & Proc::Terminate::bit_close_windows_win))
-                ret = CloseWindows();
-            if (ret && bool(mode & Proc::Terminate::bit_quit_event_loop_win))
-                ret = QuitEventLoop();
-            if (ret && bool(mode & Proc::Terminate::bit_ctrl_break_win))
-                ret = SendCtrlBreak();
-            if (ret && bool(mode & Proc::Terminate::bit_terminate_win))
-                ret = TerminateProc();
-
             #else
 
-            // Only run `kill()` if `mode != 0`, to match the Windows behavior.
-            if (mode != Proc::Terminate{} && kill(Pid(), int(mode)) < 0)
-                ret = std::string("`kill()` failed: ") + std::strerror(errno) + '.';
+            auto SendCustomSignal = [&]() -> std::optional<std::string>
+            {
+                // `& mask` here is currently a no-op. Just looks cleaner.
+                if (kill(Pid(), int(mode & Terminate::mask_signal_posix)) < 0)
+                    return std::string("`kill()` failed: ") + std::strerror(errno) + '.';
 
+                return {};
+            };
+
+            auto SendSigkill = [&]() -> std::optional<std::string>
+            {
+                if (kill(Pid(), SIGKILL) < 0)
+                    return std::string("`kill(SIGKILL)` failed: ") + std::strerror(errno) + '.';
+
+                return {};
+            };
+
+            #endif
+
+
+            // The default return value if no termination mode is specified is an empty string.
+            std::optional<std::string> ret = "";
+
+            if (!*this)
+                return ret; // Soft error.
+
+            if (IsDetached())
+            {
+                ret = "Can't terminate a detached process.";
+                return ret;
+            }
+
+            if (!OwnsProcess())
+                return ret; // Probably already known to be exited. Soft error.
+
+            assert(!HasError()); // Would be weird for an errored process to be non-null.
+
+            bool need_escalation_check = false;
+
+            // If any bits in `mode` match `mask`, runs `step_lambda` (which is `() -> std::optional<std::string>`).
+            // Has special treatment for `bit_escalate`.
+            auto TryMethod = [&](Proc::Terminate mask, auto &&step_lambda)
+            {
+                // Should we run this step?
+                if (!bool(mode & mask))
+                    return;
+
+                // If another step already ran (and we're in escalation mode), see if it actually worked.
+                if (need_escalation_check)
+                {
+                    need_escalation_check = false;
+
+                    assert(!ret);
+
+                    int wait_ms = 2; // First wait duration. There's a factor to increase it below.
+                    int total_wait_ms = 0;
+                    static constexpr int max_wait_ms = 1000; // Max combined wait duration.
+
+                    // Sleep for increasing power of two durations, until the combined time hits 1 second.
+                    // Check if the process has terminated between each sleep.
+                    // The first check is after a sleep. Probably won't terminate immediately anyway.
+                    while (true)
+                    {
+                        bool duration_passed = false;
+
+                        // Note `>=` here, this is to correctly set `duration_passed = true`.
+                        if (int remaining_ms = max_wait_ms - total_wait_ms; wait_ms >= remaining_ms)
+                        {
+                            duration_passed = true;
+                            wait_ms = remaining_ms;
+                        }
+
+                        std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
+
+                        // Did the process terminate by now?
+                        UpdateState();
+                        if (HasError())
+                        {
+                            // It's unlikely that this is from before `UpdateState()`, since errored processes normally should be null, so would be rejected earlier.
+                            ret = ErrorMessage();
+                            return;
+                        }
+
+                        if (ExitReason())
+                            return; // Terminated successfully.
+
+                        if (duration_passed)
+                        {
+                            // Not terminated yet, need to run this termination method.
+                            ret = "";
+                            break;
+                        }
+
+                        total_wait_ms += wait_ms;
+                        wait_ms *= 2; // Factor to increase duration.
+                    }
+                }
+
+                // If not known to be terminated, execute this termination method.
+                if (ret)
+                {
+                    ret = step_lambda();
+
+                    // In escalation mode, if the termination method reports success, we need to confirm it (unless this is the last method, then the flag will be ignored).
+                    if (bool(mode & Terminate::bit_escalate) && !ret)
+                        need_escalation_check = true;
+                }
+            };
+
+            // Try the different methods.
+            #ifdef _WIN32
+            TryMethod(Proc::Terminate::bit_close_windows_win, CloseWindows);
+            TryMethod(Proc::Terminate::bit_quit_event_loop_win, QuitEventLoop);
+            TryMethod(Proc::Terminate::bit_ctrl_break_win, SendCtrlBreak);
+            TryMethod(Proc::Terminate::bit_terminate_win, TerminateProc);
+            #else
+            TryMethod(Proc::Terminate::mask_signal_posix, SendCustomSignal);
+            TryMethod(Proc::Terminate::bit_sigkill_posix, SendSigkill);
             #endif
 
             return ret;
