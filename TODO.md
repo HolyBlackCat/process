@@ -1,13 +1,7 @@
-Investigate info from claude:
-
-* Sending WM_CLOSE as opposed to WM_QUIT via PostThreadMessage is indeed useless for most apps
 
 
 Function to apply all process settings at once, to be called at startup.
 Do we still want to remove the error messageboxes?
-
-
-Linux: Just need to implement group detach
 
 
 
@@ -17,7 +11,7 @@ Tests:
     environment
     chdir
 
-
+Test that `hidden` vs `none` console modes indeed do what we say they do (related to console functions erroring or not)
 
 
 Pipes on Windows:
@@ -28,7 +22,10 @@ Pipes on Windows:
     Use inline relaxed atomci as a counter, and also add the address of the atomic to the name in case there are multiple dlls.
   * `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS` to only signal IOCP if the op was delayed.
 
-* Windows: a flag to hide the console?
+  * Prevent cloning async handles? Claude says the IOCP attachment is per underlying file object, not per handle.
+    If we do this, do we still want the inheritable list use the true base class? Or the sync base?
+
+
 
 * Async/polling:
 
@@ -57,7 +54,7 @@ Maybe later:
 
   Reproc also creates an extra socket per process so that it can track when it exits by polling on that socket. We should be able to do this with a pipe./
 
-* Ability to pass true null IO handles.
+* Ability to pass true null IO handles?
 
 * Escaping strings:
 
@@ -65,4 +62,4 @@ Maybe later:
 
   * To print names of env variables in error messages on encoding failures.
 
-* `posix_spawn_file_actions_addopen` instead of having the user open the files for redirects. This requires putting all file parameters in structs to store in the redirect `variant`s.
+* Linux: Just need to implement group detach
